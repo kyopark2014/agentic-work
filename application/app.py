@@ -207,7 +207,6 @@ if clear_button or "messages" not in st.session_state:
     uploaded_file = None
     
     st.session_state.greetings = False
-    chat.initiate()
     st.rerun()    
 
 # Always show the chat input
