@@ -400,6 +400,7 @@ def sanitize_adaptive_thinking_messages(messages: list) -> list:
                 tool_calls=getattr(msg, "tool_calls", None) or [],
                 additional_kwargs=getattr(msg, "additional_kwargs", {}),
                 response_metadata=getattr(msg, "response_metadata", {}),
+                usage_metadata=getattr(msg, "usage_metadata", None),
                 id=getattr(msg, "id", None),
             )
         )
