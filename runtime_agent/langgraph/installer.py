@@ -391,12 +391,11 @@ def create_bedrock_agentcore_policy(config):
                 "Sid": "CloudWatchAccess",
                 "Effect": "Allow",
                 "Action": [
-                    'cloudwatch:ListMetrics', 
+                    'cloudwatch:ListMetrics',
                     'cloudwatch:GetMetricData',
                     'cloudwatch:GetMetricStatistics',
                     'cloudwatch:GetMetricWidgetImage',
-                    'cloudwatch:GetMetricData',
-                    'cloudwatch:GetMetricData',
+                    'cloudwatch:PutMetricData',
                     'xray:PutTraceSegments',
                     'xray:PutTelemetryRecords',
                     'xray:PutAttributes',
@@ -1348,6 +1347,74 @@ def create_agent_runtime():
         print(f"Error creating/updating agent runtime: {e}")
         return False
 
+
+def setup_agentcore_observability():
+    """Enable Transaction Search and trace delivery for AgentCore Observability."""
+    print(f"\n{'='*60}")
+    print("Configuring AgentCore Observability")
+    print(f"{'='*60}")
+
+    try:
+        from observability import setup_agentcore_observability as configure_observability
+
+        config = load_config()
+        region = config.get("region")
+        account_id = config.get("accountId")
+        runtime_arn = config.get("agent_runtime_arn")
+
+        if not region or not account_id:
+            print("Warning: region or accountId missing in config.json; skipping observability setup")
+            return True
+
+        result = configure_observability(runtime_arn, region, account_id)
+        warning = result.get("warning")
+        if warning:
+            print(f"Warning: {warning}")
+        else:
+            print("✓ AgentCore Observability configured")
+        return True
+    except Exception as e:
+        print(f"Warning: AgentCore Observability setup failed: {e}")
+        return True
+
+
+def create_monitoring_dashboard():
+    """Create or update CloudWatch dashboard for LangGraph AgentCore runtime."""
+    print(f"\n{'='*60}")
+    print("Creating CloudWatch monitoring dashboard")
+    print(f"{'='*60}")
+
+    try:
+        from cloudwatch_metrics import create_bedrock_usage_dashboard, create_cloudwatch_dashboard
+
+        config = load_config()
+        project_name = config.get("projectName", "langgraph-runtime")
+        region = config.get("region")
+        agent_runtime_arn = config.get("agent_runtime_arn")
+
+        if not region:
+            print("Error: region not found in config.json")
+            return False
+
+        bedrock_dashboard = create_bedrock_usage_dashboard(region)
+        if bedrock_dashboard:
+            update_config("bedrock_usage_dashboard_name", bedrock_dashboard)
+
+        dashboard = create_cloudwatch_dashboard(project_name, agent_runtime_arn, region)
+        if dashboard:
+            update_config("cloudwatch_dashboard_name", dashboard)
+            return True
+
+        if bedrock_dashboard:
+            return True
+
+        print("Warning: CloudWatch dashboard was not created")
+        return True
+
+    except Exception as e:
+        print(f"Error creating CloudWatch dashboard: {e}")
+        return False
+
 # ============================================================================
 # Main Function
 # ============================================================================
@@ -1372,6 +1439,8 @@ def main():
         ("Creating IAM policies and roles", create_iam_policies),
         ("Building Docker image and pushing to ECR", push_to_ecr),
         ("Creating/updating AgentCore runtime", create_agent_runtime),
+        ("Configuring AgentCore Observability", setup_agentcore_observability),
+        ("Creating CloudWatch monitoring dashboard", create_monitoring_dashboard),
     ]
     
     for step_name, step_func in steps:
@@ -1401,6 +1470,22 @@ def main():
         print(f"Created AgentCore Runtime Role ARN: {role_arn}")
     if arn:
         print(f"Created AgentCore Runtime ARN: {arn}")
+
+    dashboard_name = config.get("cloudwatch_dashboard_name")
+    bedrock_dashboard_name = config.get("bedrock_usage_dashboard_name")
+    region = config.get("region", "us-west-2")
+    if bedrock_dashboard_name:
+        print(f"Bedrock Usage Dashboard: {bedrock_dashboard_name}")
+        print(
+            f"  https://{region}.console.aws.amazon.com/cloudwatch/home"
+            f"?region={region}#dashboards/dashboard/{bedrock_dashboard_name}"
+        )
+    if dashboard_name:
+        print(f"CloudWatch Dashboard: {dashboard_name}")
+        print(
+            f"  https://{region}.console.aws.amazon.com/cloudwatch/home"
+            f"?region={region}#dashboards/dashboard/{dashboard_name}"
+        )
     
     if role_arn and arn:
         print("\nInstallation complete!")

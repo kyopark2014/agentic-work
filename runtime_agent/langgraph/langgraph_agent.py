@@ -685,6 +685,13 @@ async def call_model(state: State, config):
             response = chat.sanitize_adaptive_thinking_messages([response])[0]
         logger.info(f"response of call_model: {response}")
 
+        try:
+            import cloudwatch_metrics
+
+            cloudwatch_metrics.publish_token_metrics(chat.model_id, response)
+        except Exception as metric_err:
+            logger.warning(f"CloudWatch token metrics publish skipped: {metric_err}")
+
     except Exception:
         response = AIMessage(content="답변을 찾지 못하였습니다.")
 

@@ -6063,6 +6063,7 @@ def main():
         # separate runtime_mcp installers are not used in this repository).
         if install_agent_runtime("langgraph"):
             logger.info("Langgraph agent runtime installed...")
+            app_environment = _merge_runtime_agent_settings(app_environment)
         else:
             logger.warning("Langgraph agent runtime installation failed or was skipped.")
 

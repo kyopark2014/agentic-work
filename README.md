@@ -1282,6 +1282,64 @@ if __name__ == "__main__":
     app.run()
 ```
 
+## Dashboard
+
+LangGraph AgentCore Runtime의 운영 상태·토큰 사용량·예상 비용을 CloudWatch 대시보드에서 확인할 수 있습니다. [runtime_agent/langgraph/installer.py](./runtime_agent/langgraph/installer.py) 설치 마지막 단계에서 대시보드가 자동 생성되며, 이름은 `{projectName}-monitoring` 형식입니다.
+
+### 생성 방법
+
+루트 인프라 배포 후 LangGraph Runtime installer를 실행하면 대시보드가 함께 생성됩니다.
+
+```bash
+cd runtime_agent/langgraph
+python3 installer.py
+```
+
+설치가 완료되면 터미널에 CloudWatch 대시보드 URL이 출력됩니다. `config.json`의 `cloudwatch_dashboard_name`에도 대시보드 이름이 저장됩니다.
+
+```
+https://{region}.console.aws.amazon.com/cloudwatch/home?region={region}#dashboards/dashboard/{projectName}-monitoring
+```
+
+대시보드만 다시 만들려면 installer를 재실행하거나, `installer.py`의 `create_monitoring_dashboard()`를 호출합니다.
+
+### 구성 요소
+
+| 구분 | 메트릭 소스 | 주요 항목 |
+|------|-------------|-----------|
+| Runtime 운영 | `AWS/Bedrock-AgentCore` (AgentCore vended) | Invocations, Session Count, Latency, Errors, Throttles |
+| 리소스 사용 | `AWS/Bedrock-AgentCore` | CPUUsed-vCPUHours, MemoryUsed-GBHours |
+| 토큰·모델 비용 | `LangGraph/AgentCoreRuntime` (커스텀) | InputTokens, OutputTokens, TotalTokens, EstimatedModelCostUSD, LLMInvocations |
+
+**커스텀 토큰 메트릭**은 [runtime_agent/langgraph/langgraph_agent.py](./runtime_agent/langgraph/langgraph_agent.py)의 `call_model`에서 LLM 응답의 `usage_metadata`를 읽어 [runtime_agent/langgraph/cloudwatch_metrics.py](./runtime_agent/langgraph/cloudwatch_metrics.py)가 CloudWatch에 발행합니다. 대시보드 정의와 비용 추정 로직도 동일 모듈에 있습니다.
+
+### 대시보드 위젯
+
+- **Runtime**: 호출 수, 세션 수, 지연 시간(p99), 시스템/사용자 오류, 스로틀
+- **토큰**: Input/Output/Total Tokens, 모델별 Total Tokens, LLM 호출 수
+- **리소스**: Runtime CPU(vCPU-Hours), Memory(GB-Hours)
+- **예상 비용(USD)**: 모델 비용, Runtime CPU 비용, Runtime 메모리 비용, **총 예상 비용**(모델 + CPU + 메모리)
+- **24시간 요약**: Total Tokens, Model Cost, Invocations, Total Cost
+
+### 비용 추정 기준
+
+대시보드의 비용은 **추정치**이며, 실제 청구액은 AWS 청구서를 기준으로 합니다.
+
+| 항목 | 단가 (USD) |
+|------|------------|
+| Runtime CPU | $0.0895 / vCPU-hour |
+| Runtime Memory | $0.00945 / GB-hour |
+| 모델 토큰 | Bedrock on-demand 단가 (예: Claude Sonnet $3 / $15 per 1M input/output tokens) |
+
+모델별 단가는 `cloudwatch_metrics.py`의 `MODEL_PRICING_PER_MILLION`에 정의되어 있으며, 등록되지 않은 모델은 기본값(입력 $3, 출력 $15 / 1M tokens)으로 추정합니다.
+
+### IAM 및 주의사항
+
+- AgentCore Runtime IAM 역할에 `cloudwatch:PutMetricData` 권한이 포함되어야 토큰 메트릭이 발행됩니다. installer가 `AmazonBedrockAgentCoreRuntimePolicyFor{projectName}` 정책을 갱신합니다.
+- **토큰 메트릭**은 `cloudwatch_metrics.py`가 포함된 Docker 이미지를 배포한 뒤 LLM 호출부터 수집됩니다. 대시보드만 재생성한 경우에도 Runtime 이미지를 다시 빌드·배포해야 토큰 차트에 데이터가 표시됩니다.
+- AgentCore vended 메트릭(`CPUUsed-vCPUHours`, `MemoryUsed-GBHours` 등)은 최대 **60분** 지연될 수 있습니다.
+- GenAI Observability 콘솔에서 trace·span을 함께 보려면 [CloudWatch Transaction Search](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-configure.html)를 계정에서 한 번 활성화해야 합니다.
+
 ## 실행 결과
 
 "https://github.com/kyopark2014/strands-runtime/blob/main/README.md 을 정리해줘."와 같이 입력하면 웹의 정보를 편리하게 활용할 수 있습니다.
@@ -1318,6 +1376,8 @@ if __name__ == "__main__":
 [Amazon Bedrock AgentCore RuntCode Interpreter](https://github.com/awslabs/amazon-bedrock-agentcore-samples/tree/main/01-tutorials/05-AgentCore-tools/01-Agent-Core-code-interpreter)
 
 [Add observability to your Amazon Bedrock AgentCore resources](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-configure.html)
+
+[AgentCore generated runtime observability data](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-runtime-metrics.html)
 
 [Hosting Strands Agents with Amazon Bedrock models in Amazon Bedrock AgentCore Runtime](https://github.com/awslabs/amazon-bedrock-agentcore-samples/blob/main/01-tutorials%2F06-AgentCore-observability%2F01-Agentcore-runtime-hosted%2Fruntime_with_strands_and_bedrock_models.ipynb)
 

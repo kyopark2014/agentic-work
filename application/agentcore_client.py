@@ -51,9 +51,12 @@ def _runtime_id_from_arn(arn: str) -> str:
 def _candidate_runtime_names(agent_name: str, agent_type: str | None) -> list:
     names = [agent_name]
     if agent_type:
-        names.append(f"agent_runtime_{agent_type}")
-        names.append(f"{projectName.replace('-', '_')}_{agent_type}")
-    return names
+        normalized = agent_type.replace("-", "_")
+        names.append(f"agent_runtime_{normalized}")
+        names.append(f"runtime_{normalized}")
+        names.append(f"{projectName.replace('-', '_')}_{normalized}")
+    seen = set()
+    return [name for name in names if not (name in seen or seen.add(name))]
 
 
 def _lookup_runtime_by_name(agent_name: str, agent_type: str | None) -> str | None:
