@@ -155,15 +155,28 @@ async def agent_langgraph(payload):
         userId=user_id if user_id else chat.user_id,
         modelName=model_name if model_name else chat.model_name,
         debugMode=payload.get("debug_mode", chat.debug_mode),
+        guardrailEnabled=payload.get("guardrail_enabled"),
     )
 
     history_mode = payload.get("history_mode", "Disable")
     logger.info(f"history_mode: {history_mode}")
+    logger.info(f"guardrail_enabled: {chat.guardrail_enabled}")
 
     try:
         if auth_type == "iam":
             httpx.AsyncClient.__init__ = patched_init
             logger.info("Applied SigV4 monkey patch")
+
+        if query and chat.guardrail_enabled and not chat.uses_converse_guardrail():
+            blocked, blocked_message = chat.check_input_guardrail(query)
+            if blocked:
+                yield {
+                    "result": {
+                        "messages": [{"role": "assistant", "content": blocked_message}],
+                        "image_url": [],
+                    }
+                }
+                return
 
         try:
             app, config = await chat.create_agent(mcp_servers, skill_list, history_mode)

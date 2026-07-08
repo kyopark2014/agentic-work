@@ -20,6 +20,7 @@ from urllib import parse
 from io import BytesIO
 from PIL import Image
 from langchain_aws import ChatBedrock
+from langchain_aws import ChatBedrockConverse
 from langchain_openai import ChatOpenAI
 from botocore.config import Config
 from botocore.exceptions import ClientError
@@ -77,10 +78,11 @@ model_id = models[0]["model_id"]
 model_type = models[0]["model_type"]
 debug_mode = "Enable"
 user_id = "agent"
+guardrail_enabled = True
 
-def update(userId, modelName, debugMode):    
+def update(userId, modelName, debugMode, guardrailEnabled=None):    
     global model_name, model_id, model_type, debug_mode, reasoning_mode
-    global models, user_id
+    global models, user_id, guardrail_enabled
 
     if userId != user_id:
         user_id = userId
@@ -97,6 +99,59 @@ def update(userId, modelName, debugMode):
     if debug_mode != debugMode:
         debug_mode = debugMode        
         logger.info(f"debug_mode: {debug_mode}")
+
+    if guardrailEnabled is not None and guardrail_enabled != guardrailEnabled:
+        guardrail_enabled = guardrailEnabled
+        logger.info(f"guardrail_enabled: {guardrail_enabled}")
+
+def _guardrail_config() -> dict | None:
+    if not guardrail_enabled:
+        return None
+    runtime_config = config or utils.load_config()
+    guardrail_id = runtime_config.get("guardrail_id")
+    if not guardrail_id:
+        return None
+    return {
+        "guardrailIdentifier": guardrail_id,
+        "guardrailVersion": runtime_config.get("guardrail_version", "DRAFT"),
+        "trace": "enabled",
+    }
+
+
+def uses_converse_guardrail() -> bool:
+    return bool(_guardrail_config() and model_type in ("claude", "nova"))
+
+
+def check_input_guardrail(text: str) -> tuple[bool, str]:
+    """Return (blocked, message). When blocked, message is the guardrail response."""
+    guardrail_cfg = _guardrail_config()
+    if not guardrail_cfg or not text:
+        return False, text
+
+    try:
+        client = boto3.client("bedrock-runtime", region_name=bedrock_region)
+        response = client.apply_guardrail(
+            guardrailIdentifier=guardrail_cfg["guardrailIdentifier"],
+            guardrailVersion=guardrail_cfg["guardrailVersion"],
+            source="INPUT",
+            content=[{"text": {"text": text}}],
+        )
+        if response.get("action") == "GUARDRAIL_INTERVENED":
+            logger.info("Guardrail blocked user input")
+            for output in response.get("outputs", []):
+                text_output = output.get("text", {})
+                if text_output.get("text"):
+                    return True, text_output["text"]
+            return (
+                True,
+                "요청이 안전 정책에 의해 차단되었습니다. "
+                "성적 표현 또는 프롬프트 공격이 감지되었습니다.",
+            )
+    except ClientError as e:
+        logger.error(f"apply_guardrail failed: {e}")
+    except Exception as e:
+        logger.error(f"apply_guardrail failed: {e}")
+    return False, text
 
 SESSION_STORAGE_DIR = os.environ.get(
     "SESSION_STORAGE_DIR",
@@ -485,6 +540,30 @@ def get_chat():
 
     if profile["model_type"] == "openai":
         return _build_openai_chat(profile, maxOutputTokens)
+
+    guardrail_cfg = _guardrail_config()
+    if guardrail_cfg and profile["model_type"] in ("claude", "nova"):
+        boto3_bedrock = boto3.client(
+            service_name="bedrock-runtime",
+            region_name=bedrock_region,
+            config=Config(
+                retries={"max_attempts": 30},
+                read_timeout=300,
+            ),
+        )
+        converse_kwargs = {
+            "model_id": modelId,
+            "client": boto3_bedrock,
+            "max_tokens": maxOutputTokens,
+            "temperature": 0.1,
+            "region_name": bedrock_region,
+            "guardrail_config": guardrail_cfg,
+        }
+        if model_type == "claude":
+            converse_kwargs["provider"] = "anthropic"
+        converse_chat = ChatBedrockConverse(**converse_kwargs)
+        converse_chat.streaming = False
+        return converse_chat
 
     if profile['model_type'] == 'nova':
         STOP_SEQUENCE = '"\n\n<thinking>", "\n<thinking>", " <thinking>"'
@@ -1499,7 +1578,7 @@ async def create_agent(mcp_servers: list, skill_list: list, history_mode: str="D
 
     if history_mode == "Enable":
         app = langgraph_agent.buildChatAgentWithHistory(tools)
-        config = {
+        agent_config = {
             "recursion_limit": 100,
             "configurable": {
                 "thread_id": thread_id,
@@ -1510,7 +1589,7 @@ async def create_agent(mcp_servers: list, skill_list: list, history_mode: str="D
         }
     else:
         app = langgraph_agent.buildChatAgent(tools)
-        config = {
+        agent_config = {
             "recursion_limit": 100,
             "configurable": {
                 "thread_id": thread_id,
@@ -1520,15 +1599,16 @@ async def create_agent(mcp_servers: list, skill_list: list, history_mode: str="D
             "max_turns": langgraph_agent.MAX_CONTEXT_TURNS,
         }        
     
-    return app, config
+    return app, agent_config
 
-app = config = None
+app = None
+agent_config = None
 active_mcp_servers = []
 active_skills = []
 current_id = None
 
 async def run_langgraph_agent(query: str, mcp_servers: list, skill_list: list, history_mode: str):
-    global app, config, active_mcp_servers, active_skills, current_id
+    global app, agent_config, active_mcp_servers, active_skills, current_id
 
     artifacts = []
     references = []
@@ -1538,7 +1618,7 @@ async def run_langgraph_agent(query: str, mcp_servers: list, skill_list: list, h
         active_skills = skill_list
         current_id = user_id
 
-        app, config = await create_agent(mcp_servers, skill_list, history_mode)
+        app, agent_config = await create_agent(mcp_servers, skill_list, history_mode)
     
     if app is None:
         logger.error("Failed to create agent - app is None")
@@ -1551,7 +1631,7 @@ async def run_langgraph_agent(query: str, mcp_servers: list, skill_list: list, h
     result = ""
     tool_used = False  # Track if tool was used
     tool_name = toolUseId = ""
-    async for stream in app.astream(inputs, config, stream_mode="messages"):
+    async for stream in app.astream(inputs, agent_config, stream_mode="messages"):
         if isinstance(stream[0], AIMessageChunk):
             message = stream[0]    
             input = {}        

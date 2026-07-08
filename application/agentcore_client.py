@@ -520,7 +520,7 @@ def get_tool_info(tool_name, tool_content):
 
     return content, urls, tool_references
 
-def run_agent_in_docker(prompt, agent_type, history_mode, mcp_servers, model_name, notification_queue=None, skill_list=None):
+def run_agent_in_docker(prompt, agent_type, history_mode, mcp_servers, model_name, notification_queue=None, skill_list=None, guardrail_enabled=None):
     tool_info_list.clear()
     tool_result_list.clear()
     tool_name_list.clear()
@@ -540,6 +540,7 @@ def run_agent_in_docker(prompt, agent_type, history_mode, mcp_servers, model_nam
         "user_id": user_id,
         "history_mode": history_mode,
         "skill_list": skill_list or [],
+        "guardrail_enabled": guardrail_enabled if guardrail_enabled is not None else config.get("guardrail_enabled", True),
     })
 
     destination = f"http://localhost:8080/invocations"
@@ -794,7 +795,7 @@ def run_agent_in_docker(prompt, agent_type, history_mode, mcp_servers, model_nam
         logger.error(error_msg)
         return f"Error: {error_msg}", []
 
-def run_agent(prompt, user_id, history_mode, mcp_servers, model_name, notification_queue=None, skill_list=None):
+def run_agent(prompt, user_id, history_mode, mcp_servers, model_name, notification_queue=None, skill_list=None, guardrail_enabled=None):
     tool_info_list.clear()
     tool_result_list.clear()
     tool_name_list.clear()
@@ -813,6 +814,7 @@ def run_agent(prompt, user_id, history_mode, mcp_servers, model_name, notificati
         "user_id": user_id,
         "history_mode": history_mode,
         "skill_list": skill_list or [],
+        "guardrail_enabled": guardrail_enabled if guardrail_enabled is not None else config.get("guardrail_enabled", True),
     })
 
     agent_type = "langgraph"

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Unified installation script
-Sequentially executes: IAM policy creation -> Docker image build and ECR push -> AgentCore runtime creation/update
+Sequentially executes: IAM policy creation -> Bedrock Guardrail creation ->
+Docker image build and ECR push -> AgentCore runtime creation/update
 All functionality integrated into a single file
 """
 
@@ -409,6 +410,18 @@ def create_bedrock_agentcore_policy(config):
                 "Resource": "*"
             },
             {
+                "Sid": "BedrockGuardrailAccess",
+                "Effect": "Allow",
+                "Action": [
+                    "bedrock:GetGuardrail",
+                    "bedrock:ListGuardrails",
+                    "bedrock:ApplyGuardrail"
+                ],
+                "Resource": [
+                    f"arn:aws:bedrock:{region}:{accountId}:guardrail/*"
+                ]
+            },
+            {
                 "Sid": "S3Access",
                 "Effect": "Allow",
                 "Action": [
@@ -664,6 +677,134 @@ def create_iam_policies():
         
     except Exception as e:
         print(f"Error creating IAM policies: {e}")
+        return False
+
+# ============================================================================
+# Bedrock Guardrail Creation Functions
+# ============================================================================
+
+def guardrail_name(project_name: str) -> str:
+    """Return Bedrock Guardrail name for the project."""
+    safe_name = project_name.replace("_", "-").lower()
+    return f"guardrail-for-{safe_name}"
+
+
+def _bedrock_guardrail_content_policy() -> dict:
+    """Content filters: block sexual content and prompt attacks (jailbreak/injection)."""
+    return {
+        "filtersConfig": [
+            {
+                "type": "SEXUAL",
+                "inputStrength": "HIGH",
+                "outputStrength": "HIGH",
+                "inputAction": "BLOCK",
+                "outputAction": "BLOCK",
+                "inputModalities": ["TEXT"],
+                "outputModalities": ["TEXT"],
+            },
+            {
+                "type": "PROMPT_ATTACK",
+                "inputStrength": "HIGH",
+                "outputStrength": "NONE",
+                "inputAction": "BLOCK",
+                "outputAction": "NONE",
+                "inputModalities": ["TEXT"],
+            },
+        ]
+    }
+
+
+def _find_guardrail_by_name(bedrock_client, name: str) -> dict | None:
+    """Return guardrail summary matching name, or None."""
+    next_token = None
+    while True:
+        kwargs = {"maxResults": 100}
+        if next_token:
+            kwargs["nextToken"] = next_token
+        response = bedrock_client.list_guardrails(**kwargs)
+        for guardrail in response.get("guardrails", []):
+            if guardrail.get("name") == name:
+                return guardrail
+        next_token = response.get("nextToken")
+        if not next_token:
+            break
+    return None
+
+
+def create_bedrock_guardrail() -> bool:
+    """Create or update Amazon Bedrock Guardrail for input safety."""
+    print(f"\n{'='*60}")
+    print("Creating/updating Amazon Bedrock Guardrail")
+    print(f"{'='*60}")
+
+    try:
+        config = load_config()
+        region = config.get("region")
+        project_name = config.get("projectName", "langgraph-runtime")
+        if not region:
+            print("Error: region not found in config.json")
+            return False
+
+        name = guardrail_name(project_name)
+        description = (
+            f"Content safety guardrail for {project_name}: "
+            "blocks sexual content and prompt attacks in user input."
+        )
+        blocked_input_message = (
+            "요청이 안전 정책에 의해 차단되었습니다. "
+            "성적 표현 또는 프롬프트 공격이 감지되었습니다."
+        )
+        blocked_output_message = (
+            "응답이 안전 정책에 의해 차단되었습니다."
+        )
+        content_policy = _bedrock_guardrail_content_policy()
+
+        bedrock_client = boto3.client("bedrock", region_name=region)
+        existing = _find_guardrail_by_name(bedrock_client, name)
+
+        if existing:
+            guardrail_id = existing["id"]
+            print(f"Existing guardrail found: {name} ({guardrail_id})")
+            response = bedrock_client.update_guardrail(
+                guardrailIdentifier=guardrail_id,
+                name=name,
+                description=description,
+                contentPolicyConfig=content_policy,
+                blockedInputMessaging=blocked_input_message,
+                blockedOutputsMessaging=blocked_output_message,
+            )
+            print(f"✓ Guardrail updated: version {response.get('version', 'DRAFT')}")
+        else:
+            print(f"Creating guardrail: {name}")
+            response = bedrock_client.create_guardrail(
+                name=name,
+                description=description,
+                contentPolicyConfig=content_policy,
+                blockedInputMessaging=blocked_input_message,
+                blockedOutputsMessaging=blocked_output_message,
+            )
+            guardrail_id = response["guardrailId"]
+            print(f"✓ Guardrail created: {guardrail_id}")
+
+        guardrail_arn = response.get("guardrailArn") or existing.get("arn", "")
+        guardrail_version = "DRAFT"
+
+        update_config("guardrail_id", guardrail_id)
+        update_config("guardrail_version", guardrail_version)
+        update_config("guardrail_arn", guardrail_arn)
+        update_config("guardrail_name", name)
+
+        print(f"✓ Guardrail configuration saved to config.json")
+        print(f"  - guardrail_id: {guardrail_id}")
+        print(f"  - guardrail_version: {guardrail_version}")
+        print(f"  - guardrail_name: {name}")
+        print("  - filters: SEXUAL (HIGH), PROMPT_ATTACK (HIGH)")
+        return True
+    except ClientError as e:
+        print(f"Error creating/updating Bedrock Guardrail: {e}")
+        return False
+    except Exception as e:
+        print(f"Error creating/updating Bedrock Guardrail: {e}")
         return False
 
 # ============================================================================
@@ -1571,6 +1712,7 @@ def main():
     steps = [
         ("Updating Knowledge Base configuration", update_knowledge_base_config),
         ("Creating IAM policies and roles", create_iam_policies),
+        ("Creating/updating Amazon Bedrock Guardrail", create_bedrock_guardrail),
         ("Building Docker image and pushing to ECR", push_to_ecr),
         ("Creating/updating AgentCore runtime", create_agent_runtime),
         ("Configuring AgentCore Observability", setup_agentcore_observability),
@@ -1600,6 +1742,13 @@ def main():
         print(f"\nKnowledge Base Name: {knowledge_base_name}")
     if knowledge_base_id:
         print(f"Knowledge Base ID: {knowledge_base_id}")
+    guardrail_id = config.get("guardrail_id")
+    guardrail_name_value = config.get("guardrail_name")
+    if guardrail_name_value:
+        print(f"Bedrock Guardrail Name: {guardrail_name_value}")
+    if guardrail_id:
+        print(f"Bedrock Guardrail ID: {guardrail_id}")
+        print(f"Bedrock Guardrail Version: {config.get('guardrail_version', 'DRAFT')}")
     if role_arn:
         print(f"Created AgentCore Runtime Role ARN: {role_arn}")
     if arn:

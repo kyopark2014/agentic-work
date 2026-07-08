@@ -157,6 +157,22 @@ with st.sidebar:
     )
     chat.update(modelName)
 
+    st.subheader("🛡️ Guardrail")
+    default_guardrail_enabled = config.get("guardrail_enabled", True)
+    guardrail_enabled = st.toggle(
+        "Guardrail 사용",
+        value=default_guardrail_enabled,
+        help="성적 표현 및 프롬프트 공격(jailbreak, prompt injection)을 차단합니다.",
+    )
+    if guardrail_enabled != config.get("guardrail_enabled"):
+        config["guardrail_enabled"] = guardrail_enabled
+        with open(utils.config_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=4)
+    if guardrail_enabled:
+        st.caption("Guardrail이 활성화되었습니다.")
+    else:
+        st.caption("Guardrail이 비활성화되었습니다.")
+
     st.success(f"Connected to {modelName}", icon="💚")
     clear_button = st.button("대화 초기화", key="clear")
     # logger.info(f"clear_button: {clear_button}")
@@ -236,6 +252,7 @@ if prompt := st.chat_input("메시지를 입력하세요."):
                 response, image_url = agentcore_client.run_agent(
                     prompt, chat.user_id, history_mode, mcp_servers, modelName, notification_queue,
                     skill_list=skill_list,
+                    guardrail_enabled=guardrail_enabled,
                 )
 
             st.session_state.messages.append({
