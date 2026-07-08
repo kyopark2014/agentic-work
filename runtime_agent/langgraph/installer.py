@@ -1076,8 +1076,139 @@ def get_latest_image_tag(config):
         print(f"Error getting latest image tag: {e}")
         return None
 
+def _load_application_config_file() -> dict:
+    """Load application/config.json, returning {} when missing or invalid."""
+    app_config_path = os.path.join(_repo_root(), "application", "config.json")
+    try:
+        with open(app_config_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def sync_ecs_app_config(app_config: dict) -> bool:
+    """Push application config into the running ECS task as APP_CONFIG_JSON.
+
+    Runtime installer updates local config files, but ECS Streamlit containers read
+    APP_CONFIG_JSON from the task definition (via docker-entrypoint.sh). Without this
+    sync, ECS keeps a stale or missing agent_runtime_arn after runtime create/update.
+    """
+    print(f"\n{'='*60}")
+    print("Syncing ECS APP_CONFIG_JSON with agent_runtime_arn")
+    print(f"{'='*60}")
+
+    project_name = app_config.get("projectName") or ""
+    aws_region = app_config.get("region") or ""
+    agent_runtime_arn = app_config.get("agent_runtime_arn") or ""
+
+    if not project_name or not aws_region:
+        print("Warning: projectName/region missing; skipping ECS config sync")
+        return True
+    if not agent_runtime_arn:
+        print("Warning: agent_runtime_arn missing; skipping ECS config sync")
+        return True
+
+    cluster_name = f"cluster-for-{project_name}"
+    service_name = f"service-for-{project_name}"
+    container_name = "app"
+
+    try:
+        ecs = boto3.client("ecs", region_name=aws_region)
+        services = ecs.describe_services(cluster=cluster_name, services=[service_name])
+        service_list = services.get("services") or []
+        if not service_list or service_list[0].get("status") == "INACTIVE":
+            print(
+                f"  ECS service not found ({cluster_name}/{service_name}); "
+                "skipping sync (UI may not be deployed yet)"
+            )
+            return True
+
+        service = service_list[0]
+        task_definition_arn = service.get("taskDefinition")
+        if not task_definition_arn:
+            print("Warning: ECS service has no task definition; skipping sync")
+            return True
+
+        task_def = ecs.describe_task_definition(taskDefinition=task_definition_arn)
+        td = task_def["taskDefinition"]
+        containers = td.get("containerDefinitions") or []
+        if not containers:
+            print("Warning: task definition has no containers; skipping sync")
+            return True
+
+        target = None
+        for container in containers:
+            if container.get("name") == container_name:
+                target = container
+                break
+        if target is None:
+            target = containers[0]
+            print(
+                f"  Warning: container '{container_name}' not found; "
+                f"updating '{target.get('name')}' instead"
+            )
+
+        env_vars = list(target.get("environment") or [])
+        config_json = json.dumps(app_config, ensure_ascii=False)
+        updated = False
+        for item in env_vars:
+            if item.get("name") == "APP_CONFIG_JSON":
+                item["value"] = config_json
+                updated = True
+                break
+        if not updated:
+            env_vars.append({"name": "APP_CONFIG_JSON", "value": config_json})
+        target["environment"] = env_vars
+
+        register_kwargs = {
+            "family": td["family"],
+            "containerDefinitions": containers,
+            "requiresCompatibilities": td.get("requiresCompatibilities") or ["FARGATE"],
+            "networkMode": td.get("networkMode") or "awsvpc",
+            "cpu": td.get("cpu"),
+            "memory": td.get("memory"),
+        }
+        for optional_key in (
+            "executionRoleArn",
+            "taskRoleArn",
+            "volumes",
+            "placementConstraints",
+            "runtimePlatform",
+            "ephemeralStorage",
+            "proxyConfiguration",
+            "ipcMode",
+            "pidMode",
+        ):
+            if td.get(optional_key) is not None:
+                register_kwargs[optional_key] = td[optional_key]
+
+        response = ecs.register_task_definition(**register_kwargs)
+        new_task_def_arn = response["taskDefinition"]["taskDefinitionArn"]
+        print(f"  ✓ Registered task definition: {new_task_def_arn}")
+
+        ecs.update_service(
+            cluster=cluster_name,
+            service=service_name,
+            taskDefinition=new_task_def_arn,
+            forceNewDeployment=True,
+        )
+        print(
+            f"  ✓ Updated ECS service '{service_name}' with agent_runtime_arn "
+            f"and forced new deployment"
+        )
+        print(f"  agent_runtime_arn: {agent_runtime_arn}")
+        return True
+    except ClientError as e:
+        print(f"Warning: Failed to sync ECS APP_CONFIG_JSON: {e}")
+        print("  Local config was updated; redeploy ECS or rerun root installer to apply.")
+        return True
+    except Exception as e:
+        print(f"Warning: Failed to sync ECS APP_CONFIG_JSON: {e}")
+        return True
+
+
 def update_agentcore_json(agent_runtime_arn, image_tag=None):
-    """Update config.json with agent runtime ARN and sync application config."""
+    """Update config.json with agent runtime ARN and sync application + ECS config."""
     try:
         update_config('agent_runtime_arn', agent_runtime_arn)
         if image_tag:
@@ -1085,15 +1216,18 @@ def update_agentcore_json(agent_runtime_arn, image_tag=None):
         print(f"✓ config.json updated with agent_runtime_arn: {agent_runtime_arn}")
 
         app_config_path = os.path.join(_repo_root(), "application", "config.json")
+        app_config = _load_application_config_file()
         if os.path.isfile(app_config_path):
-            with open(app_config_path, "r", encoding="utf-8") as f:
-                app_config = json.load(f)
             app_config["agent_runtime_arn"] = agent_runtime_arn
             if image_tag:
                 app_config["agent_latest_image_tag"] = image_tag
             with open(app_config_path, "w", encoding="utf-8") as f:
                 json.dump(app_config, f, ensure_ascii=False, indent=2)
             print(f"✓ application/config.json synced (agent_latest_image_tag={image_tag})")
+
+            sync_ecs_app_config(app_config)
+        else:
+            print("Warning: application/config.json not found; skipping ECS sync")
         return True
     except Exception as e:
         print(f"Error updating config.json: {e}")

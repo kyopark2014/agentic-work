@@ -6064,6 +6064,11 @@ def main():
         if install_agent_runtime("langgraph"):
             logger.info("Langgraph agent runtime installed...")
             app_environment = _merge_runtime_agent_settings(app_environment)
+            if write_application_config(app_environment):
+                logger.info(
+                    "✓ Merged agent_runtime_arn into application config for ECS: "
+                    f"{app_environment.get('agent_runtime_arn', '')}"
+                )
         else:
             logger.warning("Langgraph agent runtime installation failed or was skipped.")
 
