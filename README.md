@@ -1537,6 +1537,11 @@ https://{region}.console.aws.amazon.com/cloudwatch/home?region={region}#dashboar
 - AgentCore vended 메트릭(`CPUUsed-vCPUHours`, `MemoryUsed-GBHours` 등)은 최대 **60분** 지연될 수 있습니다.
 - GenAI Observability 콘솔에서 trace·span을 함께 보려면 [CloudWatch Transaction Search](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-configure.html)를 계정에서 한 번 활성화해야 합니다.
 
+생성된 Dashboard는 아래와 같습니다.
+
+<img width="1000" alt="image" src="https://github.com/user-attachments/assets/88390975-6131-4c6a-9f17-5f01bc3400f4" />
+
+
 ## 실행 결과
 
 "https://github.com/kyopark2014/strands-runtime/blob/main/README.md 을 정리해줘."와 같이 입력하면 웹의 정보를 편리하게 활용할 수 있습니다.
