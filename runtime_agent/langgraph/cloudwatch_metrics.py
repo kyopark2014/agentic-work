@@ -513,6 +513,114 @@ def build_bedrock_usage_dashboard_body(region: str) -> str:
     return json.dumps({"widgets": widgets})
 
 
+def _estimated_cost_pie_metrics(
+    agent_runtime_arn: str,
+    project_name: str,
+    period: int = 86400,
+) -> list[Any]:
+    """Pie-chart cost slices: Model / Runtime CPU / Runtime Memory."""
+    return [
+        [
+            {
+                "expression": _round_cost_expression(
+                    f"m1 * {RUNTIME_CPU_COST_PER_VCPU_HOUR}"
+                ),
+                "label": "Runtime CPU",
+                "id": "e1",
+            }
+        ],
+        [
+            {
+                "expression": _round_cost_expression(
+                    f"m2 * {RUNTIME_MEMORY_COST_PER_GB_HOUR}"
+                ),
+                "label": "Runtime Memory",
+                "id": "e2",
+            }
+        ],
+        [{"expression": "m3", "label": "Model", "id": "e3"}],
+        _agentcore_resource_metric(
+            "CPUUsed-vCPUHours", agent_runtime_arn, id="m1", visible=False
+        ),
+        _agentcore_resource_metric(
+            "MemoryUsed-GBHours", agent_runtime_arn, id="m2", visible=False
+        ),
+        _custom_project_metric(
+            "EstimatedModelCostUSD",
+            project_name,
+            period=period,
+            id="m3",
+            visible=False,
+        ),
+    ]
+
+
+# Golden-ratio grid (φ ≈ 0.618) for asymmetric layouts on a 24-column dashboard.
+_DASHBOARD_GRID = 24
+_DASHBOARD_PHI_WIDE = 15
+_DASHBOARD_PHI_NARROW = 9
+
+
+def _dashboard_text_widget(
+    x: int, y: int, width: int, height: int, markdown: str
+) -> dict[str, Any]:
+    return {
+        "type": "text",
+        "x": x,
+        "y": y,
+        "width": width,
+        "height": height,
+        "properties": {"markdown": markdown},
+    }
+
+
+def _dashboard_metric_widget(
+    x: int, y: int, width: int, height: int, properties: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "type": "metric",
+        "x": x,
+        "y": y,
+        "width": width,
+        "height": height,
+        "properties": properties,
+    }
+
+
+def _dashboard_section_title(x: int, y: int, width: int, title: str, hint: str = "") -> dict[str, Any]:
+    markdown = f"### {title}"
+    if hint:
+        markdown += f"\n{hint}"
+    return _dashboard_text_widget(x, y, width, 1, markdown)
+
+
+def _dashboard_kpi_widget(
+    x: int,
+    y: int,
+    width: int,
+    title: str,
+    region: str,
+    metrics: list[Any],
+    *,
+    period: int = 86400,
+    cost: bool = False,
+) -> dict[str, Any]:
+    props: dict[str, Any] = {
+        "title": title,
+        "view": "singleValue",
+        "region": region,
+        "period": period,
+        "stat": "Sum",
+        "sparkline": True,
+        "setPeriodToTimeRange": True,
+        "metrics": metrics,
+    }
+    if cost:
+        props["yAxis"] = {"left": {"label": "USD", "showUnits": False}}
+        props.update(_summary_cost_widget_options())
+    return _dashboard_metric_widget(x, y, width, 5, props)
+
+
 def build_dashboard_body(
     project_name: str,
     agent_runtime_arn: str,
@@ -531,452 +639,421 @@ def build_dashboard_body(
     def custom(metric_name: str, period: int = 300, **options: Any) -> list[Any]:
         return _custom_project_metric(metric_name, project_name, period=period, **options)
 
-    widgets: list[dict[str, Any]] = [
-        {
-            "type": "text",
-            "x": 0,
-            "y": 0,
-            "width": 24,
-            "height": 2,
-            "properties": {
-                "markdown": (
-                    f"# {dash_name}\n"
-                    f"**Region:** `{region}` | **Runtime:** `{runtime_id}` | "
-                    f"**ARN:** `{agent_runtime_arn or 'N/A'}`\n\n"
-                    "토큰 사용량·모델 비용(추정)은 LangGraph 런타임이 발행하는 커스텀 메트릭이며, "
-                    "런타임 CPU/메모리 비용은 AgentCore vended 메트릭 기반 추정치입니다. "
-                    "실제 청구액은 AWS 청구서를 기준으로 하세요."
+    widgets: list[dict[str, Any]] = []
+    y = 0
+
+    widgets.append(
+        _dashboard_text_widget(
+            0,
+            y,
+            _DASHBOARD_GRID,
+            3,
+            (
+                f"# 🚀 {dash_name}\n"
+                f"**Region** `{region}` · **Runtime** `{runtime_id}` · "
+                f"**φ-layout** `{_DASHBOARD_PHI_WIDE}:{_DASHBOARD_PHI_NARROW}`\n\n"
+                "LangGraph AgentCore 런타임 **토큰 · 비용 · 성능** 통합 모니터링. "
+                "모델 비용은 커스텀 메트릭, CPU/메모리 비용은 AgentCore vended 메트릭 기반 **추정치**입니다."
+            ),
+        )
+    )
+    y += 3
+
+    kpi_specs: list[tuple[int, str, list[Any], bool]] = [
+        (0, "🪙 Total Tokens (24h)", [custom("TotalTokens", period=86400)], False),
+        (
+            4,
+            "💵 Model Cost (24h)",
+            [
+                [{"expression": _round_cost_expression("m1"), "id": "e1"}],
+                _custom_project_metric(
+                    "EstimatedModelCostUSD",
+                    project_name,
+                    period=86400,
+                    id="m1",
+                    visible=False,
                 ),
-            },
-        },
-        # Summary: 24h single values
-        {
-            "type": "metric",
-            "x": 0,
-            "y": 2,
-            "width": 4,
-            "height": 4,
-            "properties": {
-                "title": "Total Tokens (24h)",
-                "view": "singleValue",
-                "region": region,
-                "period": 86400,
-                "stat": "Sum",
-                "metrics": [custom("TotalTokens", period=86400)],
-            },
-        },
-        {
-            "type": "metric",
-            "x": 4,
-            "y": 2,
-            "width": 4,
-            "height": 4,
-            "properties": {
-                "title": "Model Cost (24h est.)",
-                "view": "singleValue",
-                "region": region,
-                "period": 86400,
-                "stat": "Sum",
-                "yAxis": {"left": {"label": "USD", "showUnits": False}},
-                **_summary_cost_widget_options(),
-                "metrics": [
-                    [{"expression": _round_cost_expression("m1"), "id": "e1"}],
-                    _custom_project_metric(
-                        "EstimatedModelCostUSD",
-                        project_name,
-                        period=86400,
-                        id="m1",
-                        visible=False,
-                    ),
+            ],
+            True,
+        ),
+        (8, "⚡ CPU Cost (24h)", _runtime_cpu_cost_summary_metrics(agent_runtime_arn), True),
+        (12, "🧠 Memory Cost (24h)", _runtime_memory_cost_summary_metrics(agent_runtime_arn), True),
+        (16, "📡 Invocations (24h)", [invoke("Invocations")], False),
+        (
+            20,
+            "💰 Total Cost (24h)",
+            [
+                [
+                    {
+                        "expression": _round_cost_expression(
+                            _estimated_total_cost_expression()
+                        ),
+                        "label": "Total",
+                        "id": "e1",
+                    }
                 ],
-            },
-        },
-        {
-            "type": "metric",
-            "x": 8,
-            "y": 2,
-            "width": 4,
-            "height": 4,
-            "properties": {
-                "title": "Runtime CPU Cost (24h est.)",
-                "view": "singleValue",
-                "region": region,
-                "period": 86400,
-                "stat": "Sum",
-                "yAxis": {"left": {"label": "USD", "showUnits": False}},
-                **_summary_cost_widget_options(),
-                "metrics": _runtime_cpu_cost_summary_metrics(agent_runtime_arn),
-            },
-        },
-        {
-            "type": "metric",
-            "x": 12,
-            "y": 2,
-            "width": 4,
-            "height": 4,
-            "properties": {
-                "title": "Runtime Memory Cost (24h est.)",
-                "view": "singleValue",
-                "region": region,
-                "period": 86400,
-                "stat": "Sum",
-                "yAxis": {"left": {"label": "USD", "showUnits": False}},
-                **_summary_cost_widget_options(),
-                "metrics": _runtime_memory_cost_summary_metrics(agent_runtime_arn),
-            },
-        },
-        {
-            "type": "metric",
-            "x": 16,
-            "y": 2,
-            "width": 4,
-            "height": 4,
-            "properties": {
-                "title": "Invocations (24h)",
-                "view": "singleValue",
-                "region": region,
-                "period": 86400,
-                "stat": "Sum",
-                "metrics": [invoke("Invocations")],
-            },
-        },
-        {
-            "type": "metric",
-            "x": 20,
-            "y": 2,
-            "width": 4,
-            "height": 4,
-            "properties": {
-                "title": "Total Cost (24h est.)",
-                "view": "singleValue",
-                "region": region,
-                "period": 86400,
-                "stat": "Sum",
-                "yAxis": {"left": {"label": "USD", "showUnits": False}},
-                **_summary_cost_widget_options(),
-                "metrics": [
-                    [
-                        {
-                            "expression": _round_cost_expression(
-                                _estimated_total_cost_expression()
-                            ),
-                            "label": "Total",
-                            "id": "e1",
-                        }
+                *_estimated_cost_source_metrics(
+                    agent_runtime_arn, project_name, period=86400
+                ),
+            ],
+            True,
+        ),
+    ]
+    for x, title, metrics, is_cost in kpi_specs:
+        widgets.append(_dashboard_kpi_widget(x, y, 4, title, region, metrics, cost=is_cost))
+    y += 5
+
+    widgets.append(
+        _dashboard_section_title(
+            0,
+            y,
+            _DASHBOARD_GRID,
+            "📊 Visual Analytics",
+            "24시간 기준 Pie · Bar · Gauge 차트",
+        )
+    )
+    y += 1
+
+    pie_base = {
+        "region": region,
+        "period": 86400,
+        "setPeriodToTimeRange": True,
+        "view": "pie",
+    }
+    widgets.extend(
+        [
+            _dashboard_metric_widget(
+                0,
+                y,
+                8,
+                8,
+                {
+                    **pie_base,
+                    "title": "🥧 Tokens by Model",
+                    "metrics": [
+                        [
+                            {
+                                "expression": _custom_metric_search_expression(
+                                    "TotalTokens", project_name, 86400
+                                ),
+                                "id": "e1",
+                            }
+                        ]
                     ],
-                    *_estimated_cost_source_metrics(
+                },
+            ),
+            _dashboard_metric_widget(
+                8,
+                y,
+                8,
+                8,
+                {
+                    **pie_base,
+                    "title": "🥧 Cost Mix (Model / CPU / Memory)",
+                    "metrics": _estimated_cost_pie_metrics(
                         agent_runtime_arn, project_name, period=86400
                     ),
-                ],
-            },
-        },
-        # Row 1: Invocations & Sessions
-        {
-            "type": "metric",
-            "x": 0,
-            "y": 6,
-            "width": 8,
-            "height": 6,
-            "properties": {
-                "title": "Runtime Invocations",
-                "view": "timeSeries",
-                "stacked": False,
-                "region": region,
-                "period": 300,
-                "stat": "Sum",
-                "metrics": [invoke("Invocations")],
-            },
-        },
-        {
-            "type": "metric",
-            "x": 8,
-            "y": 6,
-            "width": 8,
-            "height": 6,
-            "properties": {
-                "title": "Active Sessions",
-                "view": "timeSeries",
-                "stacked": False,
-                "region": region,
-                "period": 300,
-                "stat": "Average",
-                "metrics": [
-                    [
-                        AGENTCORE_NAMESPACE,
-                        "ActiveSessionCount",
-                        "Service",
-                        AGENTCORE_SERVICE,
-                    ]
-                ],
-            },
-        },
-        {
-            "type": "metric",
-            "x": 16,
-            "y": 6,
-            "width": 8,
-            "height": 6,
-            "properties": {
-                "title": "Runtime Latency (p99 ms)",
-                "view": "timeSeries",
-                "stacked": False,
-                "region": region,
-                "period": 300,
-                "stat": "p99",
-                "metrics": [invoke("Latency")],
-            },
-        },
-        # Row 2: Errors
-        {
-            "type": "metric",
-            "x": 0,
-            "y": 12,
-            "width": 12,
-            "height": 6,
-            "properties": {
-                "title": "Errors (System + User)",
-                "view": "timeSeries",
-                "stacked": True,
-                "region": region,
-                "period": 300,
-                "stat": "Sum",
-                "metrics": [
-                    invoke("SystemErrors", label="System Errors"),
-                    invoke("UserErrors", label="User Errors"),
-                ],
-            },
-        },
-        {
-            "type": "metric",
-            "x": 12,
-            "y": 12,
-            "width": 12,
-            "height": 6,
-            "properties": {
-                "title": "Throttles",
-                "view": "timeSeries",
-                "stacked": False,
-                "region": region,
-                "period": 300,
-                "stat": "Sum",
-                "metrics": [invoke("Throttles")],
-            },
-        },
-        # Row 3: Token usage
-        {
-            "type": "metric",
-            "x": 0,
-            "y": 18,
-            "width": 8,
-            "height": 6,
-            "properties": {
-                "title": "Input Tokens (Sum)",
-                "view": "timeSeries",
-                "stacked": False,
-                "region": region,
-                "period": 300,
-                "stat": "Sum",
-                "metrics": [custom("InputTokens")],
-            },
-        },
-        {
-            "type": "metric",
-            "x": 8,
-            "y": 18,
-            "width": 8,
-            "height": 6,
-            "properties": {
-                "title": "Output Tokens (Sum)",
-                "view": "timeSeries",
-                "stacked": False,
-                "region": region,
-                "period": 300,
-                "stat": "Sum",
-                "metrics": [custom("OutputTokens")],
-            },
-        },
-        {
-            "type": "metric",
-            "x": 16,
-            "y": 18,
-            "width": 8,
-            "height": 6,
-            "properties": {
-                "title": "Total Tokens (Sum)",
-                "view": "timeSeries",
-                "stacked": False,
-                "region": region,
-                "period": 300,
-                "stat": "Sum",
-                "metrics": [custom("TotalTokens")],
-            },
-        },
-        # Row 4: Token by model
-        {
-            "type": "metric",
-            "x": 0,
-            "y": 24,
-            "width": 12,
-            "height": 6,
-            "properties": {
-                "title": "Total Tokens by Model",
-                "view": "timeSeries",
-                "stacked": True,
-                "region": region,
-                "period": 300,
-                "metrics": [
-                    [
-                        {
-                            "expression": _custom_metric_search_expression(
-                                "TotalTokens", project_name, 300
-                            ),
-                            "id": "e1",
-                        }
-                    ]
-                ],
-            },
-        },
-        {
-            "type": "metric",
-            "x": 12,
-            "y": 24,
-            "width": 12,
-            "height": 6,
-            "properties": {
-                "title": "LLM Invocations",
-                "view": "timeSeries",
-                "stacked": False,
-                "region": region,
-                "period": 300,
-                "stat": "Sum",
-                "metrics": [custom("LLMInvocations")],
-            },
-        },
-        # Row 5: Resource usage
-        {
-            "type": "metric",
-            "x": 0,
-            "y": 30,
-            "width": 12,
-            "height": 6,
-            "properties": {
-                "title": "Runtime CPU (vCPU-Hours)",
-                "view": "timeSeries",
-                "stacked": False,
-                "region": region,
-                "period": 300,
-                "stat": "Sum",
-                "metrics": [resource("CPUUsed-vCPUHours")],
-            },
-        },
-        {
-            "type": "metric",
-            "x": 12,
-            "y": 30,
-            "width": 12,
-            "height": 6,
-            "properties": {
-                "title": "Runtime Memory (GB-Hours)",
-                "view": "timeSeries",
-                "stacked": False,
-                "region": region,
-                "period": 300,
-                "stat": "Sum",
-                "metrics": [resource("MemoryUsed-GBHours")],
-            },
-        },
-        # Row 6: Cost estimation
-        {
-            "type": "metric",
-            "x": 0,
-            "y": 36,
-            "width": 8,
-            "height": 6,
-            "properties": {
-                "title": "Estimated Model Cost (USD)",
-                "view": "timeSeries",
-                "stacked": False,
-                "region": region,
-                "period": 300,
-                "stat": "Sum",
-                "yAxis": {"left": {"label": "USD", "showUnits": False}},
-                "metrics": [custom("EstimatedModelCostUSD")],
-            },
-        },
-        {
-            "type": "metric",
-            "x": 8,
-            "y": 36,
-            "width": 8,
-            "height": 6,
-            "properties": {
-                "title": "Estimated Runtime CPU Cost (USD)",
-                "view": "timeSeries",
-                "stacked": False,
-                "region": region,
-                "period": 300,
-                "stat": "Sum",
-                "yAxis": {"left": {"label": "USD", "showUnits": False}},
-                "metrics": [
-                    [
-                        {
-                            "expression": f"m1 * {RUNTIME_CPU_COST_PER_VCPU_HOUR}",
-                            "label": "CPU Cost (est.)",
-                            "id": "e1",
-                        }
+                },
+            ),
+            _dashboard_metric_widget(
+                16,
+                y,
+                8,
+                8,
+                {
+                    **pie_base,
+                    "title": "🥧 Input vs Output Tokens",
+                    "metrics": [
+                        [
+                            {
+                                "expression": (
+                                    f"SUM({_custom_metric_search_expression('InputTokens', project_name, 86400)})"
+                                ),
+                                "label": "Input",
+                                "id": "e1",
+                            }
+                        ],
+                        [
+                            {
+                                "expression": (
+                                    f"SUM({_custom_metric_search_expression('OutputTokens', project_name, 86400)})"
+                                ),
+                                "label": "Output",
+                                "id": "e2",
+                            }
+                        ],
                     ],
-                    resource("CPUUsed-vCPUHours", id="m1", visible=False),
-                ],
-            },
-        },
-        {
-            "type": "metric",
-            "x": 16,
-            "y": 36,
-            "width": 8,
-            "height": 6,
-            "properties": {
-                "title": "Estimated Runtime Memory Cost (USD)",
-                "view": "timeSeries",
-                "stacked": False,
-                "region": region,
-                "period": 300,
-                "stat": "Sum",
-                "yAxis": {"left": {"label": "USD", "showUnits": False}},
-                "metrics": [
-                    [
-                        {
-                            "expression": f"m1 * {RUNTIME_MEMORY_COST_PER_GB_HOUR}",
-                            "label": "Memory Cost (est.)",
-                            "id": "e1",
-                        }
+                },
+            ),
+        ]
+    )
+    y += 8
+
+    widgets.append(
+        _dashboard_section_title(
+            0,
+            y,
+            _DASHBOARD_GRID,
+            "🩺 Runtime Health",
+            "Gauge · Bar · Stacked Area",
+        )
+    )
+    y += 1
+
+    widgets.extend(
+        [
+            _dashboard_metric_widget(
+                0,
+                y,
+                6,
+                7,
+                {
+                    "title": "⏱️ Latency p99 (ms)",
+                    "view": "gauge",
+                    "region": region,
+                    "period": 300,
+                    "stat": "p99",
+                    "metrics": [invoke("Latency")],
+                    "yAxis": {"left": {"min": 0, "max": 30000}},
+                    "annotations": {
+                        "horizontal": [
+                            {"color": "#2ca02c", "value": 0},
+                            {"color": "#ff9900", "value": 5000},
+                            {"color": "#d62728", "value": 15000},
+                        ]
+                    },
+                },
+            ),
+            _dashboard_metric_widget(
+                6,
+                y,
+                6,
+                7,
+                {
+                    "title": "👥 Active Sessions",
+                    "view": "gauge",
+                    "region": region,
+                    "period": 300,
+                    "stat": "Average",
+                    "metrics": [
+                        [
+                            AGENTCORE_NAMESPACE,
+                            "ActiveSessionCount",
+                            "Service",
+                            AGENTCORE_SERVICE,
+                        ]
                     ],
-                    resource("MemoryUsed-GBHours", id="m1", visible=False),
-                ],
-            },
-        },
-        # Row 7: Total estimated cost
-        {
-            "type": "metric",
-            "x": 0,
-            "y": 42,
-            "width": 24,
-            "height": 6,
-            "properties": {
-                "title": "Total Estimated Cost (USD) — Model + Runtime CPU + Runtime Memory",
-                "view": "timeSeries",
-                "stacked": True,
-                "region": region,
-                "period": 300,
-                "stat": "Sum",
-                "yAxis": {"left": {"label": "USD", "showUnits": False}},
-                "metrics": [
-                    *_estimated_cost_component_metrics(),
-                    *_estimated_cost_source_metrics(agent_runtime_arn, project_name),
-                ],
-            },
-        },
-    ]
+                    "yAxis": {"left": {"min": 0, "max": 50}},
+                    "annotations": {
+                        "horizontal": [
+                            {"color": "#2ca02c", "value": 0},
+                            {"color": "#ff9900", "value": 10},
+                            {"color": "#d62728", "value": 30},
+                        ]
+                    },
+                },
+            ),
+            _dashboard_metric_widget(
+                12,
+                y,
+                12,
+                7,
+                {
+                    "title": "📊 Errors & Throttles",
+                    "view": "bar",
+                    "stacked": True,
+                    "region": region,
+                    "period": 300,
+                    "stat": "Sum",
+                    "metrics": [
+                        invoke("SystemErrors", label="System Errors"),
+                        invoke("UserErrors", label="User Errors"),
+                        invoke("Throttles", label="Throttles"),
+                    ],
+                },
+            ),
+            _dashboard_metric_widget(
+                0,
+                y + 7,
+                _DASHBOARD_PHI_WIDE,
+                7,
+                {
+                    "title": "📈 Runtime Invocations (stacked area)",
+                    "view": "timeSeries",
+                    "stacked": True,
+                    "region": region,
+                    "period": 300,
+                    "stat": "Sum",
+                    "metrics": [
+                        invoke("Invocations", label="AgentCore Invocations"),
+                        custom("LLMInvocations", label="LLM Calls"),
+                    ],
+                },
+            ),
+            _dashboard_metric_widget(
+                _DASHBOARD_PHI_WIDE,
+                y + 7,
+                _DASHBOARD_PHI_NARROW,
+                7,
+                {
+                    "title": "🔥 Token Throughput",
+                    "view": "timeSeries",
+                    "stacked": True,
+                    "region": region,
+                    "period": 300,
+                    "stat": "Sum",
+                    "metrics": [
+                        custom("InputTokens", label="Input"),
+                        custom("OutputTokens", label="Output"),
+                    ],
+                },
+            ),
+        ]
+    )
+    y += 14
+
+    widgets.append(
+        _dashboard_section_title(
+            0,
+            y,
+            _DASHBOARD_GRID,
+            "🧩 Model & Resources",
+            "φ 비율 시계열 · 비용 추이",
+        )
+    )
+    y += 1
+
+    widgets.extend(
+        [
+            _dashboard_metric_widget(
+                0,
+                y,
+                _DASHBOARD_PHI_WIDE,
+                7,
+                {
+                    "title": "🤖 Total Tokens by Model",
+                    "view": "timeSeries",
+                    "stacked": True,
+                    "region": region,
+                    "period": 300,
+                    "metrics": [
+                        [
+                            {
+                                "expression": _custom_metric_search_expression(
+                                    "TotalTokens", project_name, 300
+                                ),
+                                "id": "e1",
+                            }
+                        ]
+                    ],
+                },
+            ),
+            _dashboard_metric_widget(
+                _DASHBOARD_PHI_WIDE,
+                y,
+                _DASHBOARD_PHI_NARROW,
+                7,
+                {
+                    "title": "🖥️ Runtime Resources",
+                    "view": "timeSeries",
+                    "stacked": True,
+                    "region": region,
+                    "period": 300,
+                    "stat": "Sum",
+                    "metrics": [
+                        resource("CPUUsed-vCPUHours", label="CPU vCPU-Hours"),
+                        resource("MemoryUsed-GBHours", label="Memory GB-Hours"),
+                    ],
+                },
+            ),
+            _dashboard_metric_widget(
+                0,
+                y + 7,
+                8,
+                7,
+                {
+                    "title": "💵 Model Cost Trend",
+                    "view": "bar",
+                    "region": region,
+                    "period": 300,
+                    "stat": "Sum",
+                    "yAxis": {"left": {"label": "USD", "showUnits": False}},
+                    "metrics": [custom("EstimatedModelCostUSD")],
+                },
+            ),
+            _dashboard_metric_widget(
+                8,
+                y + 7,
+                8,
+                7,
+                {
+                    "title": "⚡ CPU Cost Trend",
+                    "view": "bar",
+                    "region": region,
+                    "period": 300,
+                    "stat": "Sum",
+                    "yAxis": {"left": {"label": "USD", "showUnits": False}},
+                    "metrics": [
+                        [
+                            {
+                                "expression": _round_cost_expression(
+                                    f"m1 * {RUNTIME_CPU_COST_PER_VCPU_HOUR}"
+                                ),
+                                "label": "CPU Cost",
+                                "id": "e1",
+                            }
+                        ],
+                        resource("CPUUsed-vCPUHours", id="m1", visible=False),
+                    ],
+                },
+            ),
+            _dashboard_metric_widget(
+                16,
+                y + 7,
+                8,
+                7,
+                {
+                    "title": "🧠 Memory Cost Trend",
+                    "view": "bar",
+                    "region": region,
+                    "period": 300,
+                    "stat": "Sum",
+                    "yAxis": {"left": {"label": "USD", "showUnits": False}},
+                    "metrics": [
+                        [
+                            {
+                                "expression": _round_cost_expression(
+                                    f"m1 * {RUNTIME_MEMORY_COST_PER_GB_HOUR}"
+                                ),
+                                "label": "Memory Cost",
+                                "id": "e1",
+                            }
+                        ],
+                        resource("MemoryUsed-GBHours", id="m1", visible=False),
+                    ],
+                },
+            ),
+            _dashboard_metric_widget(
+                0,
+                y + 14,
+                _DASHBOARD_GRID,
+                8,
+                {
+                    "title": "💎 Total Estimated Cost — Model + CPU + Memory (stacked)",
+                    "view": "timeSeries",
+                    "stacked": True,
+                    "region": region,
+                    "period": 300,
+                    "stat": "Sum",
+                    "yAxis": {"left": {"label": "USD", "showUnits": False}},
+                    "metrics": [
+                        *_estimated_cost_component_metrics(),
+                        *_estimated_cost_source_metrics(agent_runtime_arn, project_name),
+                    ],
+                },
+            ),
+        ]
+    )
 
     return json.dumps({"widgets": widgets})
 
