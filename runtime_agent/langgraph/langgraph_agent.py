@@ -607,6 +607,8 @@ async def call_model(state: State, config):
     if system is None:
         system = BASE_SYSTEM_PROMPT
 
+    # Capture model id before concurrent requests mutate the shared chat module.
+    active_model_id = chat.model_id
     chatModel = chat.get_chat()
 
     model = chatModel.bind_tools(tools) if tools else chatModel
@@ -655,7 +657,7 @@ async def call_model(state: State, config):
             )
             messages = trimmed
 
-        if chat.uses_adaptive_thinking():
+        if chat.uses_adaptive_thinking(active_model_id):
             messages = chat.sanitize_adaptive_thinking_messages(messages)
 
         prompt = ChatPromptTemplate.from_messages(
@@ -681,14 +683,24 @@ async def call_model(state: State, config):
             response = merged if isinstance(merged, AIMessage) else AIMessage(
                 content=getattr(merged, "content", str(merged))
             )
-        if chat.uses_adaptive_thinking():
+        if chat.uses_adaptive_thinking(active_model_id):
             response = chat.sanitize_adaptive_thinking_messages([response])[0]
         logger.info(f"response of call_model: {response}")
 
         try:
             import cloudwatch_metrics
 
-            cloudwatch_metrics.publish_token_metrics(chat.model_id, response)
+            usage = cloudwatch_metrics.extract_token_usage(response)
+            if not usage:
+                logger.warning(
+                    "Token usage missing on response; CloudWatch metrics skipped "
+                    "(model=%s response_metadata=%s usage_metadata=%s)",
+                    active_model_id,
+                    getattr(response, "response_metadata", None),
+                    getattr(response, "usage_metadata", None),
+                )
+            else:
+                cloudwatch_metrics.publish_token_metrics(active_model_id, response)
         except Exception as metric_err:
             logger.warning(f"CloudWatch token metrics publish skipped: {metric_err}")
 

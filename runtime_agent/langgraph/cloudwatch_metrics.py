@@ -139,6 +139,10 @@ def publish_token_metrics(model_id: str, message: Any) -> None:
     """Publish token usage and estimated model cost to CloudWatch."""
     usage = extract_token_usage(message)
     if not usage:
+        logger.info(
+            "No token usage on message; skip CloudWatch publish (model=%s)",
+            model_id,
+        )
         return
 
     input_tokens = usage.get("input_tokens", 0)
