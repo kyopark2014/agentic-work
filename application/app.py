@@ -158,16 +158,12 @@ with st.sidebar:
     chat.update(modelName)
 
     st.subheader("🛡️ Guardrail")
-    default_guardrail_enabled = config.get("guardrail_enabled", True)
     guardrail_enabled = st.toggle(
         "Guardrail 사용",
-        value=default_guardrail_enabled,
+        value=False,
+        key="guardrail_enabled",
         help="성적 표현 및 프롬프트 공격(jailbreak, prompt injection)을 차단합니다.",
     )
-    if guardrail_enabled != config.get("guardrail_enabled"):
-        config["guardrail_enabled"] = guardrail_enabled
-        with open(utils.config_path, "w", encoding="utf-8") as f:
-            json.dump(config, f, ensure_ascii=False, indent=4)
     if guardrail_enabled:
         st.caption("Guardrail이 활성화되었습니다.")
     else:
