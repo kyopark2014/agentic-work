@@ -13,10 +13,12 @@ from botocore.awsrequest import AWSRequest
 
 from langchain_core.messages import HumanMessage, ToolMessage, AIMessageChunk, AIMessage
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
+from opentelemetry.instrumentation.langchain import LangchainInstrumentor
 
 import bedrock_stream_usage_patch
 
 bedrock_stream_usage_patch.apply_bedrock_stream_usage_patch()
+LangchainInstrumentor().instrument()
 
 logging.basicConfig(
     level=logging.INFO,  

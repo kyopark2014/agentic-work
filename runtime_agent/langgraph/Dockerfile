@@ -21,8 +21,9 @@ RUN pip install python-docx openpyxl reportlab matplotlib pandas finance-datarea
 RUN npm install docx pptxgenjs
 ENV NODE_PATH=/app/node_modules
 
-# OpenTelemetry
+# OpenTelemetry (ADOT + LangChain instrumentation for AgentCore Evaluations)
 RUN pip install aws-opentelemetry-distro>=0.10.0
+RUN pip install opentelemetry-instrumentation-langchain
 
 COPY . .
 
@@ -31,6 +32,10 @@ ENV PYTHONPATH=/app
 # Minimal config (MCP/LangGraph agent without full RAG keys in config.json)
 ENV ALLOW_MISSING_RAG_CONFIG=1
 ENV SESSION_STORAGE_DIR=/mnt/workspace
+ENV OTEL_PYTHON_DISTRO=aws_distro
+ENV OTEL_PYTHON_CONFIGURATOR=aws_configurator
+ENV OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true
+ENV OTEL_RESOURCE_ATTRIBUTES=service.name=runtime_langgraph.DEFAULT
 
 EXPOSE 8080
 

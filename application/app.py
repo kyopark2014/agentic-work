@@ -153,7 +153,7 @@ with st.sidebar:
             "OpenAI GPT 5.5",
             "OpenAI OSS 120B",
             "OpenAI OSS 20B",
-        ), index=0
+        ), index=1
     )
     chat.update(modelName)
 

@@ -1653,6 +1653,61 @@ def setup_agentcore_observability():
         return True
 
 
+def setup_agentcore_evaluations():
+    """Create evaluation IAM role and online evaluation configuration."""
+    print(f"\n{'='*60}")
+    print("Configuring AgentCore Evaluations")
+    print(f"{'='*60}")
+
+    try:
+        from evaluation import setup_agentcore_evaluation
+
+        config = load_config()
+        region = config.get("region")
+        account_id = config.get("accountId")
+        runtime_arn = config.get("agent_runtime_arn")
+        project_name = config.get("projectName", "langgraph-runtime")
+        runtime_type = os.path.basename(script_dir)
+
+        if not region or not account_id:
+            print("Warning: region or accountId missing in config.json; skipping evaluation setup")
+            return True
+
+        result = setup_agentcore_evaluation(
+            runtime_arn,
+            region,
+            account_id,
+            project_name,
+            runtime_type=runtime_type,
+        )
+        warning = result.get("warning")
+        role_arn = result.get("evaluation_execution_role_arn")
+        config_name = result.get("online_evaluation_config_name")
+
+        if role_arn:
+            update_config("evaluation_execution_role_arn", role_arn)
+        if config_name:
+            update_config("online_evaluation_config_name", config_name)
+        if result.get("service_name"):
+            update_config("evaluation_service_name", result["service_name"])
+        if result.get("log_group"):
+            update_config("evaluation_log_group", result["log_group"])
+        if result.get("session_timeout_minutes") is not None:
+            update_config(
+                "evaluation_session_timeout_minutes",
+                result["session_timeout_minutes"],
+            )
+
+        if warning:
+            print(f"Warning: {warning}")
+        elif result.get("status") != "skipped":
+            print("✓ AgentCore Evaluations configured")
+        return True
+    except Exception as e:
+        print(f"Warning: AgentCore Evaluations setup failed: {e}")
+        return True
+
+
 def create_monitoring_dashboard():
     """Create or update CloudWatch dashboard for LangGraph AgentCore runtime."""
     print(f"\n{'='*60}")
@@ -1716,6 +1771,7 @@ def main():
         ("Building Docker image and pushing to ECR", push_to_ecr),
         ("Creating/updating AgentCore runtime", create_agent_runtime),
         ("Configuring AgentCore Observability", setup_agentcore_observability),
+        ("Configuring AgentCore Evaluations", setup_agentcore_evaluations),
         ("Creating CloudWatch monitoring dashboard", create_monitoring_dashboard),
     ]
     

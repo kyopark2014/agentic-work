@@ -1479,6 +1479,204 @@ Guardrail 동작시 결과는 아래와 같습니다. "야한 얘기로 소설�
 <img width="717" height="543" alt="image" src="https://github.com/user-attachments/assets/2e66ae36-2c4f-4ead-a6c3-485414a12b86" />
 
 
+## Observability Setup
+
+AgentCore Evaluations는 CloudWatch에 수집된 OpenTelemetry span을 읽어 품질을 점수화합니다. 따라서 **Observability(트레이스 수집)가 Evaluation의 전제 조건**입니다.
+
+### 자동 설정 (installer)
+
+[runtime_agent/langgraph/installer.py](./runtime_agent/langgraph/installer.py) 설치 시 `setup_agentcore_observability()` 단계에서 아래를 자동 구성합니다.
+
+| 항목 | 모듈 | 설명 |
+|------|------|------|
+| CloudWatch Transaction Search | [observability.py](./runtime_agent/langgraph/observability.py) | `aws/spans` 로그 그룹, X-Ray trace destination |
+| Runtime trace delivery | `observability.py` | AgentCore Runtime → CloudWatch TRACES 전달 |
+| Telemetry evaluation | `observability.py` | CloudWatch Observability Admin 평가 시작 |
+
+```bash
+cd runtime_agent/langgraph
+python3 installer.py
+```
+
+설치 후 `config.json`에 `agent_runtime_arn`이 저장되며, GenAI Observability 콘솔에서 trace·span을 확인할 수 있습니다.
+
+### Runtime 컨테이너 계측
+
+[runtime_agent/langgraph/Dockerfile](./runtime_agent/langgraph/Dockerfile)과 [agent.py](./runtime_agent/langgraph/agent.py)에 아래가 포함되어 있습니다.
+
+| 구성 요소 | 역할 |
+|-----------|------|
+| `aws-opentelemetry-distro` | ADOT — CloudWatch로 span 전송 |
+| `opentelemetry-instrumentation-langchain` | LangGraph/LangChain 호환 span 생성 (Evaluation 필수 scope) |
+| `opentelemetry-instrument` (CMD) | uvicorn 프로세스 자동 계측 |
+| `LangchainInstrumentor().instrument()` | `opentelemetry.instrumentation.langchain` scope로 trace 발행 |
+| `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` | LLM 입·출력 내용을 span에 포함 (평가에 필요) |
+| `OTEL_RESOURCE_ATTRIBUTES=service.name=runtime_langgraph.DEFAULT` | Evaluation 데이터 소스의 service name |
+
+Evaluation이 인식하는 span scope:
+
+- `opentelemetry.instrumentation.langchain`
+- `openinference.instrumentation.langchain`
+
+ADOT만으로는 `starlette`, `httpx` span만 생성되므로 **LangChain instrumentation이 반드시 필요**합니다.
+
+### 수동 확인
+
+1. Agent를 1~2회 호출한 뒤 **2~5분** 대기 (span 수집 지연)
+2. CloudWatch 로그 그룹 확인:
+   - `/aws/bedrock-agentcore/runtimes/runtime_langgraph-<id>-DEFAULT`
+   - `aws/spans` (Transaction Search)
+3. [GenAI Observability 콘솔](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-configure.html)에서 trace 확인
+
+> Transaction Search가 계정에서 한 번도 활성화되지 않았다면 span export가 최대 10~15분 지연될 수 있습니다.
+
+## AgentCore Evaluations
+
+[Amazon Bedrock AgentCore Evaluations](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/evaluations.html)는 CloudWatch에 수집된 OpenTelemetry span을 LLM-as-a-Judge로 점수화합니다. LangGraph는 `opentelemetry-instrumentation-langchain`(또는 OpenInference)으로 계측해야 Evaluation이 인식하는 scope를 만듭니다.
+
+전제 조건은 [Observability Setup](#observability-setup)입니다. installer가 Observability → Evaluations 순으로 설정합니다.
+
+```bash
+cd runtime_agent/langgraph
+python3 installer.py
+```
+
+### 1. Online Evaluation 설정
+
+Observability 다음 단계로 [evaluation.py](./runtime_agent/langgraph/evaluation.py)의 `setup_agentcore_evaluations()`가 실행됩니다.
+
+| 항목 | 값 |
+|------|-----|
+| IAM 역할 | `AmazonBedrockAgentCoreEvaluationRoleFor{projectName}` |
+| Config 이름 | `{projectName}_langgraph_online_eval` (예: `langgraph_runtime_langgraph_online_eval`) |
+| Evaluator | `Builtin.Helpfulness`, `Builtin.GoalSuccessRate`, `Builtin.ToolSelectionAccuracy` |
+| Sampling | 10% |
+| `sessionTimeoutMinutes` | **5분** |
+| Data source | log group `/aws/bedrock-agentcore/runtimes/<runtime-id>-DEFAULT`, service `runtime_langgraph.DEFAULT` |
+| 결과 로그 | `/aws/bedrock-agentcore/evaluations/results/<config-id>` |
+
+`config.json`에 저장되는 키: `evaluation_execution_role_arn`, `online_evaluation_config_name`, `evaluation_service_name`, `evaluation_log_group`, `evaluation_session_timeout_minutes`.
+
+콘솔: **Amazon Bedrock AgentCore → Evaluation**.
+
+#### `sessionTimeoutMinutes`
+
+Online evaluation은 같은 `session.id`(대개 AgentCore `runtimeSessionId`)의 span을 모은 뒤, **마지막 활동 이후 N분 유휴**하면 세션이 끝난 것으로 보고 평가합니다.
+
+- 기본(서비스): 15분 → 이 프로젝트는 **5분**으로 설정
+- Chat 모드(`history_mode=Enable`)는 user별 `runtimeSessionId`가 고정이라 턴이 한 세션에 계속 쌓임
+- timeout이 길면 세션 span이 [한도](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/bedrock-agentcore-limits.html)(**1000 spans / 15 MB**)를 넘어 `ValidationException`이 납니다
+
+에이전트 대화 세션을 끊는 설정이 아니라, **평가용 세션 경계를 나누는 타이머**입니다. 값은 `evaluation.py`의 `DEFAULT_SESSION_TIMEOUT_MINUTES`에서 바꾸며, installer 재실행 시 기존 config를 `update_online_evaluation_config`로 갱신합니다.
+
+### 2. On-demand 평가 (개발·검증)
+
+에이전트 호출 후 **특정 세션의 span을 직접 넣어** 즉시 평가합니다. Online evaluation과 달리 sampling/idle timeout을 기다리지 않습니다.
+
+> Data-plane `Evaluate` API는 `sessionId`만 받는 API가 **아닙니다**. CloudWatch(`aws/spans`)에서 조회한 OTEL span JSON을 `evaluationInput.sessionSpans`로 전달해야 합니다 (세션당 **최대 1000 spans / 15 MB**).
+
+**AgentCore CLI** (프로젝트/`agentcore` 환경에 따라 span 수집을 대행할 수 있음):
+
+```bash
+agentcore run eval \
+  --runtime runtime_langgraph \
+  --session-id "<runtimeSessionId>" \
+  --evaluator Builtin.Helpfulness Builtin.GoalSuccessRate
+```
+
+**boto3** (span을 이미 수집한 경우):
+
+```python
+import boto3
+
+client = boto3.client("bedrock-agentcore", region_name="us-west-2")
+# session_spans: aws/spans에서 해당 session.id의 OTEL span 객체 리스트
+response = client.evaluate(
+    evaluatorId="Builtin.Helpfulness",
+    evaluationInput={"sessionSpans": session_spans},
+    # 선택: 특정 trace만 평가
+    # evaluationTarget={"traceIds": ["<traceId>"]},
+)
+```
+
+개발 중 품질 게이트·단일 세션 재현에 적합합니다. 장시간 Chat 세션은 span 한도를 넘기기 쉬우므로 **짧은 세션** 또는 `evaluationTarget.traceIds`로 범위를 줄여 호출하세요.
+
+### 3. Online 평가 (운영 모니터링)
+
+installer가 만든 online evaluation config가 `enableOnCreate=True`로 활성화되면, 샘플링된 운영 세션이 **자동으로** 평가됩니다. 결과는 `/aws/bedrock-agentcore/evaluations/results/<config-id>`에 JSON으로 저장됩니다.
+
+콘솔: **Amazon Bedrock AgentCore → Evaluation**
+
+운영 트래픽 모니터링용입니다. 이미 config가 있으면 installer/`evaluation.py`가 `update_online_evaluation_config`로 rule(sampling, `sessionTimeoutMinutes`)을 갱신합니다.
+
+수동 생성 예:
+
+```python
+import boto3
+
+client = boto3.client("bedrock-agentcore-control", region_name="us-west-2")
+client.create_online_evaluation_config(
+    onlineEvaluationConfigName="langgraph_runtime_langgraph_online_eval",
+    rule={
+        "samplingConfig": {"samplingPercentage": 10.0},
+        "sessionConfig": {"sessionTimeoutMinutes": 5},
+    },
+    dataSourceConfig={
+        "cloudWatchLogs": {
+            "logGroupNames": [
+                "/aws/bedrock-agentcore/runtimes/runtime_langgraph-<id>-DEFAULT"
+            ],
+            "serviceNames": ["runtime_langgraph.DEFAULT"],
+        }
+    },
+    evaluators=[
+        {"evaluatorId": "Builtin.Helpfulness"},
+        {"evaluatorId": "Builtin.GoalSuccessRate"},
+        {"evaluatorId": "Builtin.ToolSelectionAccuracy"},
+    ],
+    evaluationExecutionRoleArn=(
+        "arn:aws:iam::<account>:role/"
+        "AmazonBedrockAgentCoreEvaluationRoleFor<projectName>"
+    ),
+    enableOnCreate=True,
+)
+```
+
+| 구분 | On-demand | Online |
+|------|-----------|--------|
+| 용도 | 개발·재현·CI | 운영 연속 모니터링 |
+| 트리거 | API/CLI로 즉시 | sampling + session idle 후 자동 |
+| 입력 | `sessionSpans` 직접 전달 | CloudWatch log group + service name |
+| 이 프로젝트 | 수동 호출 | installer가 config 생성/갱신 |
+
+### 4. Built-in Evaluator
+
+| Evaluator | 레벨 | 용도 |
+|-----------|------|------|
+| `Builtin.Helpfulness` | Trace | 응답 유용성 |
+| `Builtin.GoalSuccessRate` | Session | 목표 달성 |
+| `Builtin.ToolSelectionAccuracy` | Tool call | 도구 선택 정확도 |
+| `Builtin.Correctness` | Trace | 사실 정확성 (ground truth 필요) |
+| `Builtin.InstructionFollowing` | Trace | 지시 준수 |
+| `Builtin.TrajectoryExactOrderMatch` | Session | 도구 호출 순서 검증 |
+
+### 5. 트러블슈팅
+
+| 증상 | 원인 | 해결 |
+|------|------|------|
+| Dashboard/결과가 비어 있음 | 샘플링(10%) 미포함, 또는 session idle(5분) 전 | 여러 세션 호출 후 5분+ 대기, 결과 로그 그룹 확인 |
+| `Session cannot be evaluated as the size of all spans... exceeds the maximum limit` | Chat 장시간 세션 + 메시지 content capture로 span이 1000개/15MB 초과 | `sessionTimeoutMinutes` 유지(5분), 짧은 세션으로 검증, 필요 시 content capture 축소 |
+| `no spans with supported scope` | LangChain instrumentation 미적용 | Dockerfile / `LangchainInstrumentor` 확인 후 이미지 재배포 |
+| span은 있으나 평가 없음 | Transaction Search 미활성 또는 수집 지연 | installer Observability 단계 재실행, 2~5분 대기 |
+| 메시지 내용이 평가에 없음 | GenAI content capture 비활성 | `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` |
+
+### 6. 적용 순서
+
+1. `python3 installer.py` — 이미지 배포 + Observability + Evaluations
+2. Agent 호출 → `aws/spans`에서 LangChain scope span 확인
+3. On-demand로 단일 세션 검증 (선택) → Online evaluation이 운영 트래픽 모니터링
+4. 5분 유휴 후 Evaluation 콘솔 / `/aws/bedrock-agentcore/evaluations/results/...` 에서 점수 확인
+
 ## Dashboard
 
 LangGraph AgentCore Runtime의 운영 상태·토큰 사용량·예상 비용을 CloudWatch 대시보드에서 확인할 수 있습니다. [runtime_agent/langgraph/installer.py](./runtime_agent/langgraph/installer.py) 설치 마지막 단계에서 대시보드가 자동 생성되며, 이름은 `{projectName}-monitoring` 형식입니다.
@@ -1580,6 +1778,12 @@ https://{region}.console.aws.amazon.com/cloudwatch/home?region={region}#dashboar
 [Add observability to your Amazon Bedrock AgentCore resources](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-configure.html)
 
 [AgentCore generated runtime observability data](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-runtime-metrics.html)
+
+[Evaluate agent performance with Amazon Bedrock AgentCore Evaluations](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/evaluations.html)
+
+[Create online evaluation - Amazon Bedrock AgentCore](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/create-online-evaluations.html)
+
+[AgentCore Evaluations prerequisites](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/evaluations-prerequisites.html)
 
 [Hosting Strands Agents with Amazon Bedrock models in Amazon Bedrock AgentCore Runtime](https://github.com/awslabs/amazon-bedrock-agentcore-samples/blob/main/01-tutorials%2F06-AgentCore-observability%2F01-Agentcore-runtime-hosted%2Fruntime_with_strands_and_bedrock_models.ipynb)
 
