@@ -4271,7 +4271,14 @@ def build_and_push_docker_image(
     logger.info(f"  Starting Docker build: {image_uri}")
     logger.info("  Build output streams below (this may take several minutes)...")
     _run_command_streaming(
-        ["docker", "build", "--platform", docker_platform, "-t", image_uri, "."],
+        [
+            "docker", "build",
+            "--platform", docker_platform,
+            "--provenance=false",
+            "--sbom=false",
+            "-t", image_uri,
+            ".",
+        ],
         cwd=project_root,
     )
     logger.info("  ✓ Docker build completed")

@@ -1065,6 +1065,8 @@ def build_and_push_arm64_image(
         "build",
         "--platform",
         "linux/arm64",
+        "--provenance=false",
+        "--sbom=false",
         "-f",
         dockerfile,
         "-t",
