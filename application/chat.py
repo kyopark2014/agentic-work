@@ -2,9 +2,12 @@ import boto3
 import uuid
 import logging
 import sys
-import info
-import utils
-import bedrock_data_retention
+try:
+    from application import info, utils, bedrock_data_retention
+except ImportError:
+    import info
+    import utils
+    import bedrock_data_retention
 
 from langchain_aws import ChatBedrock
 from langchain_openai import ChatOpenAI

@@ -1,0 +1,197 @@
+import json
+import logging
+import queue
+import re
+import threading
+from typing import Any, Generator
+
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel, Field
+
+from application.api.routes_auth import require_user_id
+from application import agentcore_client, task_store
+from application import chat
+from application.notification_queue import QueueNotificationSink
+
+logger = logging.getLogger("routes_chat")
+
+router = APIRouter(prefix="/api/tasks", tags=["chat"])
+
+HISTORY_MODE = "Enable"
+
+_TOOL_INPUT_RE = re.compile(r"^Tool: (.+?), Input: (.+)$", re.DOTALL)
+_TOOL_RESULT_RE = re.compile(r"^Tool Result: (.+)$", re.DOTALL)
+
+
+class ChatRequest(BaseModel):
+    prompt: str = Field(min_length=1)
+
+
+def _sse_event(payload: dict[str, Any]) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _map_sink_event(event: dict[str, Any]) -> dict[str, Any] | None:
+    event_type = event.get("type")
+    data = event.get("data", "")
+
+    if event_type == "markdown":
+        return {"type": "token", "data": data}
+
+    if event_type == "info":
+        tool_match = _TOOL_INPUT_RE.match(str(data))
+        if tool_match:
+            tool_name = tool_match.group(1)
+            raw_input = tool_match.group(2)
+            try:
+                tool_input = json.loads(raw_input)
+            except json.JSONDecodeError:
+                tool_input = raw_input
+            return {
+                "type": "tool",
+                "tool": tool_name,
+                "input": tool_input,
+                "toolUseId": event.get("toolUseId", tool_name),
+            }
+        result_match = _TOOL_RESULT_RE.match(str(data))
+        if result_match:
+            return {
+                "type": "tool_result",
+                "toolUseId": event.get("toolUseId", ""),
+                "data": result_match.group(1),
+            }
+        return {"type": "info", "data": data}
+
+    return event
+
+
+def _run_agent_thread(
+    *,
+    prompt: str,
+    user_id: str,
+    mcp_servers: list[str],
+    model_name: str,
+    skill_list: list[str],
+    guardrail_enabled: bool,
+    runtime_session_id: str,
+    message_queue: queue.Queue,
+    result_holder: dict[str, Any],
+) -> None:
+    sink = QueueNotificationSink(message_queue)
+
+    try:
+        logger.info("Using AgentCore runtime invoke_agent_runtime")
+        response, image_url = agentcore_client.run_agent(
+            prompt,
+            user_id,
+            HISTORY_MODE,
+            mcp_servers,
+            model_name,
+            notification_queue=sink,
+            skill_list=skill_list,
+            guardrail_enabled=guardrail_enabled,
+            runtime_session_id=runtime_session_id,
+        )
+        if not isinstance(response, str):
+            response = json.dumps(response, ensure_ascii=False)
+        result_holder["content"] = response
+        result_holder["images"] = image_url or []
+    except Exception as exc:
+        logger.exception("Agent run failed")
+        result_holder["error"] = str(exc)
+    finally:
+        message_queue.put(None)
+
+
+@router.post("/{task_id}/chat")
+def chat_stream(task_id: str, body: ChatRequest, request: Request):
+    user_id = require_user_id(request)
+    task = task_store.get_task(task_id, user_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    prompt = body.prompt.strip()
+    chat.user_id = user_id
+    chat.update(task["model_name"])
+
+    task_store.add_message(task_id, "user", prompt)
+
+    message_queue: queue.Queue = queue.Queue()
+    result_holder: dict[str, Any] = {"content": "", "images": []}
+
+    worker = threading.Thread(
+        target=_run_agent_thread,
+        kwargs={
+            "prompt": prompt,
+            "user_id": user_id,
+            "mcp_servers": task["mcp_servers"],
+            "model_name": task["model_name"],
+            "skill_list": task["skills"],
+            "guardrail_enabled": task["guardrail_enabled"],
+            "runtime_session_id": task["runtime_session_id"],
+            "message_queue": message_queue,
+            "result_holder": result_holder,
+        },
+        daemon=True,
+    )
+    worker.start()
+
+    def event_generator() -> Generator[str, None, None]:
+        tool_events: list[dict[str, Any]] = []
+        streamed_text = ""
+
+        while True:
+            try:
+                item = message_queue.get(timeout=300)
+            except queue.Empty:
+                yield _sse_event({"type": "error", "data": "Agent timeout"})
+                break
+
+            if item is None:
+                break
+
+            mapped = _map_sink_event(item)
+            if not mapped:
+                continue
+
+            if mapped["type"] == "token":
+                streamed_text = mapped["data"]
+            elif mapped["type"] in ("tool", "tool_result", "info"):
+                tool_events.append(mapped)
+
+            yield _sse_event(mapped)
+
+        if "error" in result_holder:
+            yield _sse_event({"type": "error", "data": result_holder["error"]})
+            return
+
+        final_content = result_holder.get("content") or streamed_text
+        images = result_holder.get("images") or []
+
+        task_store.add_message(
+            task_id,
+            "assistant",
+            final_content,
+            images=images,
+            tool_events=tool_events,
+        )
+
+        yield _sse_event(
+            {
+                "type": "done",
+                "content": final_content,
+                "images": images,
+            }
+        )
+
+    from fastapi.responses import StreamingResponse
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

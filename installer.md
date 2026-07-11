@@ -135,7 +135,7 @@ Runtime(`runtime_agent/langgraph/installer.py`)은 access point ARN이 있으면
 - **타입**: Internet-facing Application Load Balancer
 - **리스너**: HTTP 포트 80
 - **타겟 그룹**: ECS Fargate 태스크 (IP 타겟, 포트 8501)
-- **헬스체크**: `/_stcore/health`
+- **헬스체크**: `/api/health`
 
 ### 6. CloudFront 배포
 - **오리진**:
@@ -519,25 +519,23 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
-# ECS Streamlit app only; agent runs on AgentCore
-RUN pip install streamlit boto3 langchain_aws langchain-openai "openai>=2.41.0" \
+# ECS Web UI (FastAPI + React); agent runs on AgentCore
+RUN pip install fastapi uvicorn boto3 langchain_aws langchain-openai "openai>=2.41.0" \
     aws-bedrock-token-generator requests
 
-RUN mkdir -p /root/.streamlit
-COPY config.toml /root/.streamlit/
 COPY . .
 
 RUN chmod +x /app/docker-entrypoint.sh
 
 EXPOSE 8501
 
-HEALTHCHECK CMD curl --fail http://localhost:8501/_stcore/health
+HEALTHCHECK CMD curl --fail http://localhost:8501/api/health
 
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
-CMD ["python", "-m", "streamlit", "run", "application/app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+CMD ["uvicorn", "application.server:app", "--host", "0.0.0.0", "--port", "8501"]
 ```
 
-`docker-entrypoint.sh`는 `APP_CONFIG_JSON` 환경변수가 있으면 `/app/application/config.json`을 생성한 뒤 Streamlit을 실행합니다.
+`docker-entrypoint.sh`는 `APP_CONFIG_JSON` 환경변수가 있으면 `/app/application/config.json`을 생성한 뒤 FastAPI를 실행합니다.
 
 ### 주의사항
 - Docker 이미지 빌드와 ECS Fargate·AgentCore Runtime 모두 **ARM64** 전용입니다. x86 Mac/EC2에서는 `installer.py`와 `runtime_agent/langgraph/installer.py` 모두 실패하므로, t4g/m7g 등 ARM64 EC2에서 실행하세요.

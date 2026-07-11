@@ -1,3 +1,12 @@
+# Stage 1: frontend build
+FROM node:22-alpine AS frontend
+WORKDIR /web
+COPY application/web/package.json application/web/package-lock.json ./
+RUN npm ci
+COPY application/web/ .
+RUN npm run build
+
+# Stage 2: Python runtime
 FROM python:3.13-slim
 
 WORKDIR /app
@@ -5,19 +14,24 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python packages (ECS Streamlit app only; agent runs on AgentCore)
-RUN pip install streamlit boto3 langchain_aws langchain-openai "openai>=2.41.0" aws-bedrock-token-generator requests
-
-RUN mkdir -p /root/.streamlit
-COPY config.toml /root/.streamlit/
+RUN pip install \
+    fastapi \
+    uvicorn[standard] \
+    boto3 \
+    langchain_aws \
+    langchain-openai \
+    "openai>=2.41.0" \
+    aws-bedrock-token-generator \
+    requests
 
 COPY . .
+COPY --from=frontend /web/dist /app/application/web/dist
 
 RUN chmod +x /app/docker-entrypoint.sh
 
 EXPOSE 8501
 
-HEALTHCHECK CMD curl --fail http://localhost:8501/_stcore/health
+HEALTHCHECK CMD curl --fail http://localhost:8501/api/health
 
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
-CMD ["python", "-m", "streamlit", "run", "application/app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+CMD ["uvicorn", "application.server:app", "--host", "0.0.0.0", "--port", "8501"]

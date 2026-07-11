@@ -5,16 +5,14 @@ import json
 import os
 import logging
 import sys
-import requests
 import uuid
 
-# Import utils from application package
 try:
     from application import utils
+    from application import chat
 except ImportError:
     import utils
-
-import chat
+    import chat
 
 logging.basicConfig(
     level=logging.INFO,  # Default to INFO level
@@ -116,12 +114,19 @@ def load_agentcore_config(agent_name, agent_type=None):
 
     return _lookup_runtime_by_name(agent_name, agent_type)
 
-def runtime_session_id_for(user_id: str, history_mode: str) -> str:
+def runtime_session_id_for(
+    user_id: str,
+    history_mode: str,
+    runtime_session_id: str | None = None,
+) -> str:
     """AgentCore runtimeSessionId (min length 33).
 
-    Chat mode: deterministic per user_id so history survives client restarts.
+    Chat mode: use explicit runtime_session_id per task when provided.
+    Fallback: deterministic per user_id so history survives client restarts.
     Agent mode: ephemeral session per request.
     """
+    if runtime_session_id:
+        return runtime_session_id
     if history_mode == "Enable" and user_id:
         seed = f"agentcore-session-{user_id}"
         session_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
@@ -520,282 +525,7 @@ def get_tool_info(tool_name, tool_content):
 
     return content, urls, tool_references
 
-def run_agent_in_docker(prompt, agent_type, history_mode, mcp_servers, model_name, notification_queue=None, skill_list=None, guardrail_enabled=None):
-    tool_info_list.clear()
-    tool_result_list.clear()
-    tool_name_list.clear()
-    if notification_queue is not None:
-        notification_queue.reset()
-
-    references = []
-    image_url = []
-
-    user_id = chat.user_id or agent_type
-    logger.info(f"user_id: {user_id}")
-
-    payload = json.dumps({
-        "prompt": prompt,
-        "mcp_servers": mcp_servers,
-        "model_name": model_name,
-        "user_id": user_id,
-        "history_mode": history_mode,
-        "skill_list": skill_list or [],
-        "guardrail_enabled": bool(guardrail_enabled) if guardrail_enabled is not None else True,
-    })
-
-    destination = f"http://localhost:8080/invocations"
-
-    try:
-        logger.info(f"Sending request to Docker container at {destination}")
-        logger.info(f"Payload: {payload}")
-        
-        # Set headers for SSE connection
-        sse_headers = {
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive"
-        }
-        
-        # Connect using SSE client
-        response = requests.post(destination, headers=sse_headers, data=payload, timeout=300, stream=True)
-        
-        logger.info(f"response: {response}")
-        logger.info(f"Response status code: {response.status_code}")
-        logger.info(f"Response headers: {response.headers}")
-
-        result = current = ""
-        sse_line_count = 0
-
-        # Assemble lines from raw chunks. urllib3/requests iter_lines() often fails to yield
-        # lines incrementally for chunked text/event-stream, so the UI stays blank until EOF.
-        buffer = ""
-        for chunk in response.iter_content(chunk_size=4096):
-            if not chunk:
-                continue
-            if isinstance(chunk, bytes):
-                chunk = chunk.decode("utf-8", errors="replace")
-            buffer += chunk.replace("\r\n", "\n").replace("\r", "\n")
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                line = line.strip()
-                if not line or line.startswith(":"):
-                    continue
-                if not line.startswith("data:"):
-                    continue
-                # "data: " or "data:" + payload
-                data = line[5:].lstrip()
-                if not data:
-                    continue
-                sse_line_count += 1
-
-                try:
-                    data_json = json.loads(data)
-                except json.JSONDecodeError:
-                    logger.info(f"Not JSON: {data[:200]}")
-                    continue
-                except Exception as parse_err:
-                    logger.error(f"SSE JSON parse error: {parse_err}")
-                    continue
-
-                if isinstance(data_json, dict) and "error" in data_json and "error_type" in data_json:
-                    err = data_json.get("error", "")
-                    em = data_json.get("message", "streaming failed")
-                    logger.error(f"SSE runtime error event: {data_json}")
-                    result = f"Error: {em}: {err}"
-                    add_notification(notification_queue, str(result))
-                    continue
-
-                if agent_type == 'strands':
-                    if 'data' in data_json:
-                        text = normalize_bedrock_message_content(data_json['data'])
-                        logger.info(f"[data] {text}")
-                        current += text
-                        update_streaming_result(notification_queue, current)
-                    elif 'result' in data_json:
-                        final_output = data_json['result']
-                        logger.info(f"[result] {final_output}")
-
-                        if isinstance(final_output, dict):
-                            result = final_output.get('messages', [])
-                            if "image_url" in final_output:
-                                image_url = final_output.get('image_url', [])
-                                logger.info(f"image_url: {image_url}")
-                        elif isinstance(final_output, str):
-                            result = final_output
-                        else:
-                            result = final_output
-                        logger.info(f"result: {result}")
-
-                    elif 'tool' in data_json:
-                        tool = data_json['tool']
-                        input = data_json['input']
-                        toolUseId = data_json['toolUseId']
-                        logger.info(f"[tool] {tool}, [input] {input}, [toolUseId] {toolUseId}")
-
-                        tool_name_list[toolUseId] = tool
-                        if toolUseId not in tool_info_list:
-                            current = ""
-                            logger.info(f"new tool info: {toolUseId}")
-                            tool_info_list[toolUseId] = True
-                        else:
-                            logger.info(f"overwrite tool info: {toolUseId}")
-                        tool_slot_update(notification_queue, f"{toolUseId}:input", f"Tool: {tool}, Input: {input}")
-
-                    elif 'toolResult' in data_json:
-                        toolResult = data_json['toolResult']
-                        toolUseId = data_json['toolUseId']
-                        tool_name = tool_name_list[toolUseId]
-                        logger.info(f"[tool_result] {toolResult}")
-
-                        tool_slot_update(notification_queue, f"{toolUseId}:result", f"Tool Result: {str(toolResult)}")
-
-                        content, urls, refs = get_tool_info(tool_name, toolResult)
-                        if refs:
-                            for r in refs:
-                                references.append(r)
-                            logger.info(f"refs: {refs}")
-                        if urls:
-                            for url in urls:
-                                image_url.append(url)
-                            logger.info(f"urls: {urls}")
-
-                        if content:
-                            logger.info(f"content: {content}")
-
-                elif agent_type == 'langgraph':
-                    if 'data' in data_json:
-                        text = normalize_bedrock_message_content(data_json['data'])
-                        logger.info(f"[data] {text}")
-                        current += text
-                        update_streaming_result(notification_queue, current)
-                    elif 'result' in data_json:
-                        final_output = data_json['result']
-                        logger.info(f"[result] {final_output}")
-
-                        if isinstance(final_output, dict):
-                            messages = final_output.get('messages', [])
-                            raw_content = messages[-1].get('content') if messages else ""
-                            result = normalize_bedrock_message_content(raw_content)
-                            logger.info(f"result: {result}")
-
-                            if "image_url" in final_output:
-                                image_url = final_output.get('image_url', [])
-                                logger.info(f"image_url: {image_url}")
-                        elif isinstance(final_output, str):
-                            result = final_output
-                        else:
-                            result = str(final_output)
-
-                    elif 'tool' in data_json:
-                        tool = data_json['tool']
-                        input = data_json['input']
-                        toolUseId = data_json['toolUseId']
-                        tool_name_list[toolUseId] = tool
-                        logger.info(f"[tool] {tool}, [input] {input}, [toolUseId] {toolUseId}")
-
-                        if toolUseId not in tool_info_list:
-                            current = ""
-                            tool_info_list[toolUseId] = True
-                        logger.info(f"tool info: {toolUseId}")
-                        tool_slot_update(notification_queue, f"{toolUseId}:input", f"Tool: {tool}, Input: {input}")
-
-                    elif 'toolResult' in data_json:
-                        toolResult = data_json['toolResult']
-                        toolUseId = data_json['toolUseId']
-                        tool_name = tool_name_list[toolUseId]
-                        logger.info(f"[tool_result] {toolResult}")
-
-                        logger.info(f"tool result: {toolUseId}")
-                        tool_slot_update(notification_queue, f"{toolUseId}:result", f"Tool Result: {str(toolResult)}")
-
-                        content, urls, refs = get_tool_info(tool_name, toolResult)
-                        if refs:
-                            for r in refs:
-                                references.append(r)
-                            logger.info(f"refs: {refs}")
-                        if urls:
-                            for url in urls:
-                                image_url.append(url)
-                            logger.info(f"urls: {urls}")
-
-                        if content:
-                            logger.info(f"content: {content}")
-
-                else:
-                    tool_name = ""
-                    if 'TextBlock' in data_json:
-                        TextBlock = data_json['TextBlock']
-                        logger.info(f"TextBlock: {TextBlock}")
-                        update_streaming_result(notification_queue, TextBlock)
-
-                        result = TextBlock
-
-                    elif 'tools' in data_json:
-                        tools = data_json['tools']
-                        logger.info(f"[tools] {tools}")
-                        add_notification(notification_queue, f"Tools: {tools}")
-
-                    elif 'ToolUseBlock' in data_json:
-                        ToolUseBlock = data_json['ToolUseBlock']
-                        input = data_json['input']
-                        logger.info(f"tool: {ToolUseBlock}, input: {input}")
-                        add_notification(notification_queue, f"Tool: {ToolUseBlock}, Input: {input}")
-
-                    elif 'ToolResultBlock' in data_json:
-                        ToolResultBlock = data_json['ToolResultBlock']
-                        logger.info(f"ToolResult: {ToolResultBlock}")
-
-                        logger.info(f"tool result: {ToolResultBlock}")
-                        add_notification(notification_queue, f"Tool Result: {str(ToolResultBlock)}")
-
-                        content, urls, refs = get_tool_info(tool_name, ToolResultBlock)
-                        if refs:
-                            for r in refs:
-                                references.append(r)
-                            logger.info(f"refs: {refs}")
-                        if urls:
-                            for url in urls:
-                                image_url.append(url)
-                            logger.info(f"urls: {urls}")
-
-                        if content:
-                            logger.info(f"content: {content}")
-
-        if buffer.strip():
-            logger.warning(f"SSE stream ended with incomplete line in buffer: {buffer[:120]!r}")
-        logger.info(f"SSE data lines consumed: {sse_line_count}")
-
-        # If the runtime never sent a usable final payload, keep the streamed markdown.
-        if agent_type in ('strands', 'langgraph'):
-            _empty = (
-                result == "" or result == [] or result is None
-                or (isinstance(result, str) and not result.strip())
-            )
-            if _empty and current:
-                result = current
-
-        if references:
-            ref = "\n\n### Reference\n"
-            for i, reference in enumerate(references):
-                ref += f"{i+1}. [{reference['title']}]({reference['url']}), {reference['content']}...\n"
-            if isinstance(result, str):
-                result += ref
-
-        if notification_queue is not None:
-            _final = result
-            if not isinstance(_final, str):
-                _final = json.dumps(_final, ensure_ascii=False) if isinstance(_final, (list, dict)) else str(_final)
-            notification_queue.result(_final)
-
-        return result, image_url
-        
-    except Exception as e:
-        error_msg = f"Unexpected error: {str(e)}"
-        logger.error(error_msg)
-        return f"Error: {error_msg}", []
-
-def run_agent(prompt, user_id, history_mode, mcp_servers, model_name, notification_queue=None, skill_list=None, guardrail_enabled=None):
+def run_agent(prompt, user_id, history_mode, mcp_servers, model_name, notification_queue=None, skill_list=None, guardrail_enabled=None, runtime_session_id=None):
     tool_info_list.clear()
     tool_result_list.clear()
     tool_name_list.clear()
@@ -841,7 +571,7 @@ def run_agent(prompt, user_id, history_mode, mcp_servers, model_name, notificati
             region_name=bedrock_region,
             config=boto_config
         )
-        session_id = runtime_session_id_for(user_id, history_mode)
+        session_id = runtime_session_id_for(user_id, history_mode, runtime_session_id)
         response = agent_core_client.invoke_agent_runtime(
             agentRuntimeArn=agent_runtime_arn,
             runtimeSessionId=session_id,

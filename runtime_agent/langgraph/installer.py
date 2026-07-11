@@ -27,7 +27,7 @@ def load_config():
         print(f"Failed to parse config.json file: {e}")
         config = {}
         config["region"] = boto3.Session().region_name or "us-west-2"
-        config["projectName"] = "langgraph-runtime"
+        config["projectName"] = "agentic-work"
 
         sts = boto3.client("sts")
         response = sts.get_caller_identity()
