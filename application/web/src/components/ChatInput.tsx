@@ -172,27 +172,6 @@ export function ChatInput({ disabled, onSend, onRagUploadComplete }: Props) {
         </div>
       )}
       <form className="chat-input-wrap" onSubmit={onSubmit}>
-        <div className="chat-input-add-wrap" ref={addWrapRef}>
-          <button
-            ref={addBtnRef}
-            type="button"
-            className="chat-add-btn"
-            aria-label="추가"
-            aria-expanded={menuOpen}
-            disabled={inputDisabled}
-            onClick={() => setMenuOpen((open) => !open)}
-          >
-            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-              <path
-                d="M8 3v10M3 8h10"
-                stroke="currentColor"
-                strokeWidth="1.5"
-                strokeLinecap="round"
-              />
-            </svg>
-          </button>
-        </div>
-        {menu}
         <input
           ref={fileInputRef}
           type="file"
@@ -211,13 +190,46 @@ export function ChatInput({ disabled, onSend, onRagUploadComplete }: Props) {
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={onKeyDown}
         />
-        <button
-          className="send-btn"
-          type="submit"
-          disabled={inputDisabled || !value.trim()}
-        >
-          전송
-        </button>
+        <div className="chat-input-toolbar">
+          <div className="chat-input-add-wrap" ref={addWrapRef}>
+            <button
+              ref={addBtnRef}
+              type="button"
+              className="chat-add-btn"
+              aria-label="추가"
+              aria-expanded={menuOpen}
+              disabled={inputDisabled}
+              onClick={() => setMenuOpen((open) => !open)}
+            >
+              <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+                <path
+                  d="M8 3v10M3 8h10"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  strokeLinecap="round"
+                />
+              </svg>
+            </button>
+          </div>
+          {menu}
+          <button
+            className="chat-send-btn"
+            type="submit"
+            aria-label="전송"
+            disabled={inputDisabled || !value.trim()}
+          >
+            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+              <path
+                d="M8 12.5V3.5M4.5 7 8 3.5 11.5 7"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.6"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+          </button>
+        </div>
       </form>
     </div>
   );
