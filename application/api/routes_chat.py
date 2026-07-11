@@ -41,6 +41,57 @@ def _upsert_tool_event(tool_events: list[dict[str, Any]], mapped: dict[str, Any]
     tool_events.append(mapped)
 
 
+def _track_tool_event(
+    tool_events: list[dict[str, Any]],
+    tool_meta: dict[str, dict[str, Any]],
+    mapped: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Persist tool events and backfill tool call when only result arrives."""
+    events_to_emit = [mapped]
+    tool_use_id = mapped.get("toolUseId")
+
+    if mapped["type"] == "tool":
+        tool_meta[tool_use_id] = {
+            "tool": mapped.get("tool"),
+            "input": mapped.get("input", {}),
+        }
+        _upsert_tool_event(tool_events, mapped)
+        return events_to_emit
+
+    if mapped["type"] == "tool_result" and tool_use_id:
+        meta = tool_meta.get(tool_use_id, {})
+        has_tool_event = any(
+            event.get("type") == "tool" and event.get("toolUseId") == tool_use_id
+            for event in tool_events
+        )
+        if not has_tool_event:
+            tool_event = {
+                "type": "tool",
+                "tool": meta.get("tool", "unknown"),
+                "input": meta.get("input", {}),
+                "toolUseId": tool_use_id,
+            }
+            _upsert_tool_event(tool_events, tool_event)
+            events_to_emit.insert(0, tool_event)
+        if meta.get("tool"):
+            mapped = {**mapped, "tool": meta["tool"]}
+            events_to_emit[-1] = mapped
+        _upsert_tool_event(tool_events, mapped)
+        return events_to_emit
+
+    if mapped["type"] in ("tool", "tool_result", "info"):
+        _upsert_tool_event(tool_events, mapped)
+    return events_to_emit
+
+
+def _normalize_tool_use_id(tool_use_id: str) -> str:
+    if tool_use_id.endswith(":input"):
+        return tool_use_id[: -len(":input")]
+    if tool_use_id.endswith(":result"):
+        return tool_use_id[: -len(":result")]
+    return tool_use_id
+
+
 def _map_sink_event(event: dict[str, Any]) -> dict[str, Any] | None:
     event_type = event.get("type")
     data = event.get("data", "")
@@ -61,13 +112,13 @@ def _map_sink_event(event: dict[str, Any]) -> dict[str, Any] | None:
                 "type": "tool",
                 "tool": tool_name,
                 "input": tool_input,
-                "toolUseId": event.get("toolUseId", tool_name),
+                "toolUseId": _normalize_tool_use_id(event.get("toolUseId", tool_name)),
             }
         result_match = _TOOL_RESULT_RE.match(str(data))
         if result_match:
             return {
                 "type": "tool_result",
-                "toolUseId": event.get("toolUseId", ""),
+                "toolUseId": _normalize_tool_use_id(event.get("toolUseId", "")),
                 "data": result_match.group(1),
             }
         return {"type": "info", "data": data}
@@ -148,13 +199,19 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
 
     def event_generator() -> Generator[str, None, None]:
         tool_events: list[dict[str, Any]] = []
+        tool_meta: dict[str, dict[str, Any]] = {}
         streamed_text = ""
 
         while True:
             try:
                 item = message_queue.get(timeout=300)
             except queue.Empty:
-                yield _sse_event({"type": "error", "data": "Agent timeout"})
+                error_text = "Agent timeout"
+                task_store.add_message(task_id, "assistant", f"Error: {error_text}")
+                yield _sse_event({"type": "error", "data": error_text})
+                yield _sse_event(
+                    {"type": "done", "content": f"Error: {error_text}", "images": []}
+                )
                 break
 
             if item is None:
@@ -167,12 +224,17 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
             if mapped["type"] == "token":
                 streamed_text = mapped["data"]
             elif mapped["type"] in ("tool", "tool_result", "info"):
-                _upsert_tool_event(tool_events, mapped)
+                for tool_event in _track_tool_event(tool_events, tool_meta, mapped):
+                    yield _sse_event(tool_event)
+                continue
 
             yield _sse_event(mapped)
 
         if "error" in result_holder:
+            error_text = f"Error: {result_holder['error']}"
+            task_store.add_message(task_id, "assistant", error_text)
             yield _sse_event({"type": "error", "data": result_holder["error"]})
+            yield _sse_event({"type": "done", "content": error_text, "images": []})
             return
 
         final_content = result_holder.get("content") or streamed_text

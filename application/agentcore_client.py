@@ -1,6 +1,7 @@
 import boto3
 from botocore.config import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, ConnectionError as BotocoreConnectionError
+from botocore.exceptions import EndpointConnectionError, ProxyConnectionError
 import json
 import os
 import logging
@@ -81,6 +82,13 @@ def _lookup_runtime_by_name(agent_name: str, agent_type: str | None) -> str | No
     return None
 
 
+def _validation_unavailable(exc: Exception) -> bool:
+    if isinstance(exc, (ProxyConnectionError, EndpointConnectionError, BotocoreConnectionError)):
+        return True
+    message = str(exc).lower()
+    return "proxy" in message or "could not connect" in message or "connection" in message
+
+
 def _is_runtime_arn_valid(arn: str) -> bool:
     """Return True if the AgentCore runtime ARN still exists."""
     runtime_id = _runtime_id_from_arn(arn)
@@ -110,14 +118,37 @@ def load_agentcore_config(agent_name, agent_type=None):
             configured_arns.append((f"agent_runtime_arn_{agent_type}", typed_arn))
 
     for key, arn in configured_arns:
-        if _is_runtime_arn_valid(arn):
-            logger.info(f"Using {key} from config: {arn}")
-            return arn
+        try:
+            if _is_runtime_arn_valid(arn):
+                logger.info(f"Using {key} from config: {arn}")
+                return arn
+        except Exception as exc:
+            if _validation_unavailable(exc):
+                logger.warning(
+                    "Runtime ARN validation unavailable (%s); using %s from config: %s",
+                    exc,
+                    key,
+                    arn,
+                )
+                return arn
+            raise
         logger.warning(
             f"Configured {key} is missing or deleted; falling back to runtime name lookup: {arn}"
         )
 
-    return _lookup_runtime_by_name(agent_name, agent_type)
+    try:
+        return _lookup_runtime_by_name(agent_name, agent_type)
+    except Exception as exc:
+        if configured_arns and _validation_unavailable(exc):
+            key, arn = configured_arns[0]
+            logger.warning(
+                "Runtime lookup unavailable (%s); using %s from config: %s",
+                exc,
+                key,
+                arn,
+            )
+            return arn
+        raise
 
 def runtime_session_id_for(
     user_id: str,
@@ -586,6 +617,7 @@ def run_agent(prompt, user_id, history_mode, mcp_servers, model_name, notificati
         
         result = current = ""
         processed_data = set()  # Prevent duplicate data
+        tool_input_cache: dict[str, dict] = {}
         
         # stream response
         if "text/event-stream" in response.get("contentType", ""):
@@ -625,23 +657,21 @@ def run_agent(prompt, user_id, history_mode, mcp_servers, model_name, notificati
                                         image_url = final_output.get('image_url', [])
                                         logger.info(f"image_url: {image_url}")                
 
-                                elif 'tool' in data_json:
-                                    tool = data_json['tool']
-                                    input = data_json['input']
-                                    toolUseId = data_json['toolUseId']
-                                    # logger.info(f"[tool] {tool}, [input] {input}, [toolUseId] {toolUseId}")
-
-                                    tool_name_list[toolUseId] = tool
-                                    if toolUseId not in tool_info_list:
-                                        current = ""
-                                        tool_info_list[toolUseId] = True
-                                    tool_slot_update(notification_queue, f"{toolUseId}:input", f"Tool: {tool}, Input: {_format_tool_input(input)}")
-                                    
                                 elif 'toolResult' in data_json:
                                     toolResult = data_json['toolResult']
                                     toolUseId = data_json['toolUseId']
-                                    tool_name = tool_name_list[toolUseId]
+                                    if data_json.get('tool'):
+                                        tool_name_list[toolUseId] = data_json['tool']
+                                    tool_name = tool_name_list.get(toolUseId, data_json.get('tool', 'unknown'))
                                     logger.info(f"[tool_result] {toolResult}")
+
+                                    effective_input = tool_input_cache.get(toolUseId, {})
+                                    tool_info_list[toolUseId] = True
+                                    tool_slot_update(
+                                        notification_queue,
+                                        f"{toolUseId}:input",
+                                        f"Tool: {tool_name}, Input: {_format_tool_input(effective_input)}",
+                                    )
 
                                     tool_slot_update(notification_queue, f"{toolUseId}:result", f"Tool Result: {str(toolResult)}")
 
@@ -658,6 +688,27 @@ def run_agent(prompt, user_id, history_mode, mcp_servers, model_name, notificati
                                     if content:
                                         logger.info(f"content: {content}")    
 
+                                elif 'tool' in data_json:
+                                    tool = data_json['tool']
+                                    input = data_json.get('input', {})
+                                    toolUseId = data_json['toolUseId']
+                                    tool_name_list[toolUseId] = tool
+                                    if isinstance(input, dict) and input:
+                                        tool_input_cache[toolUseId] = input
+                                    effective_input = tool_input_cache.get(
+                                        toolUseId,
+                                        input if isinstance(input, dict) else {},
+                                    )
+                                    if effective_input:
+                                        if toolUseId not in tool_info_list:
+                                            current = ""
+                                        tool_info_list[toolUseId] = True
+                                        tool_slot_update(
+                                            notification_queue,
+                                            f"{toolUseId}:input",
+                                            f"Tool: {tool}, Input: {_format_tool_input(effective_input)}",
+                                        )
+                                    
                             elif agent_type == 'langgraph': # langgraph
                                 if 'data' in data_json:
                                     text = normalize_bedrock_message_content(data_json['data'])
@@ -677,26 +728,23 @@ def run_agent(prompt, user_id, history_mode, mcp_servers, model_name, notificati
                                         image_url = final_output.get('image_url', [])
                                         logger.info(f"image_url: {image_url}")                                        
 
-                                elif 'tool' in data_json:
-                                    tool = data_json['tool']
-                                    input = data_json['input']
-                                    toolUseId = data_json['toolUseId']
-                                    tool_name_list[toolUseId] = tool
-                                    logger.info(f"[tool] {tool}, [input] {input}, [toolUseId] {toolUseId}")
-
-                                    if toolUseId not in tool_info_list:
-                                        current = ""
-                                        tool_info_list[toolUseId] = True
-                                    logger.info(f"tool info: {toolUseId}")
-                                    tool_slot_update(notification_queue, f"{toolUseId}:input", f"Tool: {tool}, Input: {_format_tool_input(input)}")
-                                    
                                 elif 'toolResult' in data_json:
                                     toolResult = data_json['toolResult']
                                     toolUseId = data_json['toolUseId']
-                                    tool_name = tool_name_list[toolUseId]
+                                    if data_json.get('tool'):
+                                        tool_name_list[toolUseId] = data_json['tool']
+                                    tool_name = tool_name_list.get(toolUseId, data_json.get('tool', 'unknown'))
                                     logger.info(f"[tool_result] {toolResult}")
 
                                     logger.info(f"tool result: {toolUseId}")
+                                    effective_input = tool_input_cache.get(toolUseId, {})
+                                    tool_info_list[toolUseId] = True
+                                    tool_slot_update(
+                                        notification_queue,
+                                        f"{toolUseId}:input",
+                                        f"Tool: {tool_name}, Input: {_format_tool_input(effective_input)}",
+                                    )
+
                                     tool_slot_update(notification_queue, f"{toolUseId}:result", f"Tool Result: {str(toolResult)}")
 
                                     content, urls, refs = get_tool_info(tool_name, toolResult)
@@ -712,6 +760,29 @@ def run_agent(prompt, user_id, history_mode, mcp_servers, model_name, notificati
                                     if content:
                                         logger.info(f"content: {content}")      
 
+                                elif 'tool' in data_json:
+                                    tool = data_json['tool']
+                                    input = data_json.get('input', {})
+                                    toolUseId = data_json['toolUseId']
+                                    tool_name_list[toolUseId] = tool
+                                    logger.info(f"[tool] {tool}, [input] {input}, [toolUseId] {toolUseId}")
+                                    if isinstance(input, dict) and input:
+                                        tool_input_cache[toolUseId] = input
+                                    effective_input = tool_input_cache.get(
+                                        toolUseId,
+                                        input if isinstance(input, dict) else {},
+                                    )
+                                    if effective_input:
+                                        if toolUseId not in tool_info_list:
+                                            current = ""
+                                        tool_info_list[toolUseId] = True
+                                        logger.info(f"tool info: {toolUseId}")
+                                        tool_slot_update(
+                                            notification_queue,
+                                            f"{toolUseId}:input",
+                                            f"Tool: {tool}, Input: {_format_tool_input(effective_input)}",
+                                        )
+                                    
                             else: # claude
                                 if 'TextBlock' in data_json:
                                     TextBlock = data_json['TextBlock']
@@ -754,8 +825,8 @@ def run_agent(prompt, user_id, history_mode, mcp_servers, model_name, notificati
                         except json.JSONDecodeError:
                             logger.info(f"Not JSON: {data}")
                         except Exception as e:
-                            logger.error(f"Error processing data: {e}")
-                            break
+                            logger.error(f"Error processing data: {e}", exc_info=True)
+                            continue
         
         if references:
             ref = "\n\n### Reference\n"

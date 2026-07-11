@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "./api";
+import { uiError, uiLog } from "./debug";
 import { formatBrandTitle } from "./formatBrandTitle";
 import { useChatStream } from "./hooks/useChatStream";
 import type { AppConfig, Message, Task } from "./types";
@@ -31,7 +32,9 @@ export default function App() {
   const activeTask = tasks.find((t) => t.id === activeTaskId) ?? null;
 
   const loadMessages = useCallback(async (taskId: string) => {
+    uiLog("messages:load start", { taskId });
     const { messages: rows } = await api.getMessages(taskId);
+    uiLog("messages:load complete", { taskId, count: rows.length, roles: rows.map((m) => m.role) });
     setMessages(rows);
   }, []);
 
@@ -51,6 +54,7 @@ export default function App() {
         }
         setConfig(await api.getConfig());
       } catch (err) {
+        uiError("boot failed", err);
         setBootError(err instanceof Error ? err.message : String(err));
       } finally {
         setAuthReady(true);
@@ -59,9 +63,9 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!config?.projectName) return;
-    document.title = formatBrandTitle(config.projectName);
-  }, [config?.projectName]);
+    if (!config?.projectName || !userId) return;
+    document.title = formatBrandTitle(config.projectName, userId);
+  }, [config?.projectName, userId]);
 
   useEffect(() => {
     if (!userId) return;
@@ -144,8 +148,12 @@ export default function App() {
   }
 
   async function handleSend(prompt: string) {
-    if (!activeTaskId) return;
+    if (!activeTaskId) {
+      uiError("chat:send skipped — no active task");
+      return;
+    }
 
+    uiLog("chat:handleSend", { taskId: activeTaskId, prompt });
     const optimistic: Message = {
       id: `pending-${crypto.randomUUID()}`,
       task_id: activeTaskId,
@@ -170,6 +178,7 @@ export default function App() {
   return (
     <div className="app-shell">
       <Sidebar
+        userId={userId}
         tasks={tasks}
         activeTask={activeTask}
         config={config}

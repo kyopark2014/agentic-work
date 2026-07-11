@@ -7,6 +7,7 @@ import { GuardrailIcon, McpIcon, ModelIcon, NewTaskIcon, SkillIcon } from "./Sid
 type DrawerKind = "skill" | "mcp" | null;
 
 interface Props {
+  userId: string;
   tasks: Task[];
   activeTask: Task | null;
   config: AppConfig | null;
@@ -20,6 +21,7 @@ interface Props {
 }
 
 export function Sidebar({
+  userId,
   tasks,
   activeTask,
   config,
@@ -33,7 +35,7 @@ export function Sidebar({
 }: Props) {
   const skills = activeTask?.skills ?? config?.default_skills ?? [];
   const mcpServers = activeTask?.mcp_servers ?? config?.default_mcp_servers ?? [];
-  const brandTitle = formatBrandTitle(config?.projectName ?? "agent");
+  const brandTitle = formatBrandTitle(config?.projectName ?? "agent", userId);
 
   return (
     <>
