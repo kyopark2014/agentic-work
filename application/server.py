@@ -11,6 +11,7 @@ from application.api.routes_auth import router as auth_router
 from application.api.routes_config import router as config_router
 from application.api.routes_tasks import router as tasks_router
 from application.api.routes_chat import router as chat_router
+from application.api.routes_rag import router as rag_router
 from application.task_store import init_db
 
 logging.basicConfig(
@@ -20,9 +21,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("server")
 
-from application.runtime_mode import backend_mode_label
+from application.runtime_mode import backend_mode_label, ensure_agentcore_backend
 
-logger.info("Agent backend mode: %s", backend_mode_label())
+ensure_agentcore_backend()
+logger.info("Agent backend mode: %s (docker agent backend disabled)", backend_mode_label())
 
 _APPLICATION_DIR = os.path.dirname(os.path.abspath(__file__))
 _WEB_DIST = os.path.join(_APPLICATION_DIR, "web", "dist")
@@ -41,6 +43,7 @@ app.include_router(auth_router)
 app.include_router(config_router)
 app.include_router(tasks_router)
 app.include_router(chat_router)
+app.include_router(rag_router)
 
 
 @app.get("/api/health")

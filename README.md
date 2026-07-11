@@ -27,7 +27,6 @@ flowchart TB
 
   subgraph Client["agentcore_client.py"]
     RA[run_agent]
-    RD["run_agent_in_docker local"]
   end
 
   subgraph Runtime["AgentCore runtime_agent/langgraph"]
@@ -75,7 +74,6 @@ flowchart TB
 
   MODE --> RA
   SEL --> RA
-  RD -.-> AG
 
   RA --> AG
   AG --> CHAT
@@ -525,6 +523,8 @@ cd ../..
 
 #### 2) 백엔드 실행
 
+로컬 개발 시 Web UI 백엔드는 **Docker 없이 uvicorn**으로 실행하고, Agent 추론은 **항상 AgentCore Runtime**(`invoke_agent_runtime`)을 사용합니다. `run_agent_in_docker` / `localhost:8080` 로컬 Docker agent 경로는 사용하지 않습니다.
+
 `routes_chat.py`, `agentcore_client.py` 등 Python 코드를 수정했다면 서버를 **재시작**해야 반영됩니다.
 
 ```text
@@ -571,6 +571,8 @@ cd application/web && npm install && npm run build
 cd ../..
 uvicorn application.server:app --host 0.0.0.0 --port 8501
 ```
+
+브라우저: `http://localhost:8501` (프론트엔드 + API 동일 포트). Agent 추론은 AgentCore Runtime을 사용합니다.
 
 ### `runtime_agent/langgraph/` — LangGraph Agent (AgentCore Runtime)
 

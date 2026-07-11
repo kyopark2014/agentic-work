@@ -69,8 +69,8 @@ export function ChatThread({
           )}
           <div ref={bottomRef} />
         </div>
-        {footer}
       </div>
+      {footer}
     </>
   );
 }

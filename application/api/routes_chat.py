@@ -9,9 +9,10 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from application.api.routes_auth import require_user_id
-from application import agentcore_client, task_store
+from application import task_store
 from application import chat
 from application.notification_queue import QueueNotificationSink
+from application.runtime_mode import run_agent
 
 logger = logging.getLogger("routes_chat")
 
@@ -228,7 +229,7 @@ def _run_agent_thread(
 
     try:
         logger.info("Using AgentCore runtime invoke_agent_runtime")
-        response, image_url = agentcore_client.run_agent(
+        response, image_url = run_agent(
             prompt,
             user_id,
             mcp_servers,
