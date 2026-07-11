@@ -21,9 +21,9 @@ AGENTCORE_GATEWAY_REGION = "us-east-1"
 AGENTCORE_WEBSEARCH_GATEWAY_NAME = "gateway-websearch"
 
 
-def agent_runtime_name(runtime_type: str) -> str:
-    """Return Bedrock AgentCore runtime name (e.g. runtime_langgraph)."""
-    return f"runtime_{runtime_type.replace('-', '_')}"
+def agent_runtime_name(project_name: str) -> str:
+    """Return Bedrock AgentCore runtime name (e.g. agentic_work)."""
+    return project_name.replace("-", "_")
 
 
 sts_client = boto3.client("sts", region_name=region)
@@ -2038,7 +2038,19 @@ def delete_local_config_files() -> None:
 def uninstall_agent_runtime(runtime_type: str = "langgraph") -> bool:
     """Uninstall Agent Runtime by running the appropriate uninstaller.py script."""
     logger.info(f"[10/10] Uninstalling Agent Runtime: {runtime_type}")
-    logger.info(f"  Agent runtime name: {agent_runtime_name(runtime_type)}")
+    runtime_config_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "runtime_agent",
+        runtime_type,
+        "config.json",
+    )
+    runtime_project_name = "agentic-work"
+    try:
+        with open(runtime_config_path, "r", encoding="utf-8") as f:
+            runtime_project_name = json.load(f).get("projectName", "agentic-work")
+    except (OSError, json.JSONDecodeError):
+        pass
+    logger.info(f"  Agent runtime name: {agent_runtime_name(runtime_project_name)}")
     
     # Determine uninstaller path based on runtime type
     script_dir = os.path.dirname(os.path.abspath(__file__))

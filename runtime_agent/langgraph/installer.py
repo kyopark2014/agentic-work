@@ -1046,7 +1046,12 @@ def _host_is_arm64() -> bool:
     return os.uname().machine.lower() in ("aarch64", "arm64")
 
 
-def build_and_push_arm64_image(local_tag: str, ecr_uri: str, build_context: str) -> bool:
+def build_and_push_arm64_image(
+    local_tag: str,
+    ecr_uri: str,
+    build_context: str,
+    build_args: dict[str, str] | None = None,
+) -> bool:
     """Build an ARM64 image and push it to ECR (native build on ARM64 hosts only)."""
     if not _host_is_arm64():
         print("Error: AgentCore requires linux/arm64 images.", flush=True)
@@ -1055,18 +1060,22 @@ def build_and_push_arm64_image(local_tag: str, ecr_uri: str, build_context: str)
         return False
 
     dockerfile = os.path.join(build_context, "Dockerfile")
+    build_command = [
+        "docker",
+        "build",
+        "--platform",
+        "linux/arm64",
+        "-f",
+        dockerfile,
+        "-t",
+        local_tag,
+        build_context,
+    ]
+    if build_args:
+        for key, value in build_args.items():
+            build_command.extend(["--build-arg", f"{key}={value}"])
     if not run_docker_command(
-        [
-            "docker",
-            "build",
-            "--platform",
-            "linux/arm64",
-            "-f",
-            dockerfile,
-            "-t",
-            local_tag,
-            build_context,
-        ],
+        build_command,
         "Building Docker Image",
     ):
         return False
@@ -1177,7 +1186,13 @@ def push_to_ecr():
         # Build Docker image
         print("Build output streams below (this may take several minutes)...", flush=True)
         local_tag = f"{ecr_repository}:{image_tag}"
-        if not build_and_push_arm64_image(local_tag, ecr_uri, build_context):
+        otel_service_name = f"{agent_runtime_name(project_name)}.DEFAULT"
+        if not build_and_push_arm64_image(
+            local_tag,
+            ecr_uri,
+            build_context,
+            build_args={"OTEL_SERVICE_NAME": otel_service_name},
+        ):
             return False
         
         # Complete
@@ -1201,9 +1216,9 @@ def push_to_ecr():
 # Agent Runtime Creation/Update Functions
 # ============================================================================
 
-def agent_runtime_name(runtime_type: str) -> str:
-    """Return Bedrock AgentCore runtime name (e.g. runtime_langgraph)."""
-    return f"runtime_{runtime_type.replace('-', '_')}"
+def agent_runtime_name(project_name: str) -> str:
+    """Return Bedrock AgentCore runtime name (e.g. agentic_work)."""
+    return project_name.replace("-", "_")
 
 
 def get_latest_image_tag(config):
@@ -1484,9 +1499,13 @@ def create_agent_runtime_func(config, repository_name, image_tag):
     if not agent_runtime_role:
         print("Error: agent_runtime_role not found in config.json")
         return None
-    
-    runtime_type = repository_name.rsplit("_", 1)[-1]
-    runtime_name = agent_runtime_name(runtime_type)
+
+    project_name = config.get("projectName")
+    if not project_name:
+        print("Error: projectName not found in config.json")
+        return None
+
+    runtime_name = agent_runtime_name(project_name)
     print(f"Creating agent runtime: {runtime_name}")
     
     try:
@@ -1572,7 +1591,7 @@ def create_agent_runtime():
         project_name = config.get('projectName')
         
         repository_name = ecr_repository_name(config)
-        runtime_name = agent_runtime_name(RUNTIME_TYPE)
+        runtime_name = agent_runtime_name(project_name)
         
         print(f"Repository name: {repository_name}")
         print(f"Runtime name: {runtime_name}")
@@ -1684,7 +1703,6 @@ def setup_agentcore_evaluations():
         account_id = config.get("accountId")
         runtime_arn = config.get("agent_runtime_arn")
         project_name = config.get("projectName", "langgraph-runtime")
-        runtime_type = os.path.basename(script_dir)
 
         if not region or not account_id:
             print("Warning: region or accountId missing in config.json; skipping evaluation setup")
@@ -1695,7 +1713,6 @@ def setup_agentcore_evaluations():
             region,
             account_id,
             project_name,
-            runtime_type=runtime_type,
         )
         warning = result.get("warning")
         role_arn = result.get("evaluation_execution_role_arn")
@@ -1705,6 +1722,9 @@ def setup_agentcore_evaluations():
             update_config("evaluation_execution_role_arn", role_arn)
         if config_name:
             update_config("online_evaluation_config_name", config_name)
+        config_id = result.get("online_evaluation_config_id")
+        if config_id:
+            update_config("online_evaluation_config_id", config_id)
         if result.get("service_name"):
             update_config("evaluation_service_name", result["service_name"])
         if result.get("log_group"):

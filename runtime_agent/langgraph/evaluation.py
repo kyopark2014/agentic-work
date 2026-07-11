@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 from typing import Any
 
 import boto3
@@ -19,6 +18,13 @@ DEFAULT_SAMPLING_PERCENTAGE = 10.0
 # Keep short so Chat-mode long-lived runtimeSessionId sessions stay under
 # the 1000-span / 15 MB evaluation quota.
 DEFAULT_SESSION_TIMEOUT_MINUTES = 5
+# Agent runtime names previously used runtime_type (e.g. langgraph) instead of projectName.
+LEGACY_AGENT_RUNTIME_TYPE = "langgraph"
+
+
+def agent_runtime_name(project_name: str) -> str:
+    """Return Bedrock AgentCore runtime name (e.g. agentic_work)."""
+    return project_name.replace("-", "_")
 
 
 def evaluation_role_name(project_name: str) -> str:
@@ -30,9 +36,8 @@ def online_evaluation_config_name(project_name: str) -> str:
     return f"{safe_name}_langgraph_online_eval"
 
 
-def runtime_service_name(runtime_type: str, qualifier: str = "DEFAULT") -> str:
-    runtime_name = f"runtime_{runtime_type.replace('-', '_')}"
-    return f"{runtime_name}.{qualifier}"
+def runtime_service_name(project_name: str, qualifier: str = "DEFAULT") -> str:
+    return f"{agent_runtime_name(project_name)}.{qualifier}"
 
 
 def runtime_traces_log_group(runtime_id: str, qualifier: str = "DEFAULT") -> str:
@@ -217,25 +222,79 @@ def _evaluation_rule(
     }
 
 
+def _cloudwatch_data_source_config(
+    log_group: str,
+    service_name: str,
+) -> dict[str, Any]:
+    return {
+        "cloudWatchLogs": {
+            "logGroupNames": [log_group],
+            "serviceNames": [service_name],
+        }
+    }
+
+
+def _legacy_runtime_names(project_name: str) -> set[str]:
+    """Return superseded AgentCore runtime names for this project."""
+    safe_project = project_name.replace("-", "_")
+    current_name = agent_runtime_name(project_name)
+    stale = {
+        f"runtime_{LEGACY_AGENT_RUNTIME_TYPE}",
+        f"runtime_{safe_project}",
+        f"{safe_project}_{LEGACY_AGENT_RUNTIME_TYPE}",
+    }
+    stale.discard(current_name)
+    return stale
+
+
+def cleanup_stale_agent_runtimes(
+    region: str,
+    active_runtime_arn: str | None,
+    project_name: str,
+) -> list[str]:
+    """Delete legacy AgentCore runtimes that are no longer used by this project."""
+    if not active_runtime_arn:
+        return []
+
+    active_id = active_runtime_arn.rsplit("/", 1)[-1]
+    stale_names = _legacy_runtime_names(project_name)
+    if not stale_names:
+        return []
+
+    client = boto3.client("bedrock-agentcore-control", region_name=region)
+    deleted: list[str] = []
+    for runtime in client.list_agent_runtimes().get("agentRuntimes", []):
+        runtime_id = runtime.get("agentRuntimeId", "")
+        runtime_name = runtime.get("agentRuntimeName", "")
+        if runtime_id == active_id or runtime_name not in stale_names:
+            continue
+        try:
+            client.delete_agent_runtime(agentRuntimeId=runtime_id)
+            deleted.append(f"{runtime_name} ({runtime_id})")
+            print(f"  Deleted stale agent runtime: {runtime_name} ({runtime_id})")
+        except ClientError as error:
+            print(f"  Warning: failed to delete stale runtime {runtime_name}: {error}")
+    return deleted
+
+
 def ensure_online_evaluation_config(
     runtime_arn: str,
     region: str,
     account_id: str,
     project_name: str,
     execution_role_arn: str,
-    runtime_type: str | None = None,
     sampling_percentage: float = DEFAULT_SAMPLING_PERCENTAGE,
     session_timeout_minutes: int = DEFAULT_SESSION_TIMEOUT_MINUTES,
     evaluators: list[str] | None = None,
 ) -> dict[str, Any]:
     """Create or update an online evaluation config for the LangGraph AgentCore runtime."""
-    runtime_type = runtime_type or os.path.basename(os.getcwd())
     config_name = online_evaluation_config_name(project_name)
     runtime_id = runtime_arn.rsplit("/", 1)[-1]
-    service_name = runtime_service_name(runtime_type)
+    service_name = runtime_service_name(project_name)
     log_group = runtime_traces_log_group(runtime_id)
     evaluator_ids = evaluators or DEFAULT_EVALUATORS
     rule = _evaluation_rule(sampling_percentage, session_timeout_minutes)
+    data_source_config = _cloudwatch_data_source_config(log_group, service_name)
 
     client = boto3.client("bedrock-agentcore-control", region_name=region)
     existing = _find_online_evaluation_config(client, config_name)
@@ -244,12 +303,14 @@ def ensure_online_evaluation_config(
         client.update_online_evaluation_config(
             onlineEvaluationConfigId=config_id,
             rule=rule,
+            dataSourceConfig=data_source_config,
             evaluationExecutionRoleArn=execution_role_arn,
             evaluators=[{"evaluatorId": evaluator_id} for evaluator_id in evaluator_ids],
         )
         print(
             f"  Updated online evaluation config: {config_name} "
-            f"(sessionTimeoutMinutes={session_timeout_minutes})"
+            f"(sessionTimeoutMinutes={session_timeout_minutes}, "
+            f"logGroup={log_group}, serviceName={service_name})"
         )
         return {
             "status": "success",
@@ -267,12 +328,7 @@ def ensure_online_evaluation_config(
         onlineEvaluationConfigName=config_name,
         description=f"Online evaluation for LangGraph runtime ({project_name})",
         rule=rule,
-        dataSourceConfig={
-            "cloudWatchLogs": {
-                "logGroupNames": [log_group],
-                "serviceNames": [service_name],
-            }
-        },
+        dataSourceConfig=data_source_config,
         evaluators=[{"evaluatorId": evaluator_id} for evaluator_id in evaluator_ids],
         evaluationExecutionRoleArn=execution_role_arn,
         enableOnCreate=True,
@@ -299,7 +355,6 @@ def setup_agentcore_evaluation(
     region: str,
     account_id: str,
     project_name: str,
-    runtime_type: str | None = None,
 ) -> dict[str, Any]:
     """Create evaluation IAM role and online evaluation configuration."""
     result: dict[str, Any] = {"status": "success"}
@@ -313,6 +368,15 @@ def setup_agentcore_evaluation(
     execution_role_arn = ensure_evaluation_execution_role(region, account_id, project_name)
     result["evaluation_execution_role_arn"] = execution_role_arn
 
+    print("  Cleaning up stale agent runtimes...")
+    deleted_runtimes = cleanup_stale_agent_runtimes(
+        region=region,
+        active_runtime_arn=runtime_arn,
+        project_name=project_name,
+    )
+    if deleted_runtimes:
+        result["deleted_stale_runtimes"] = deleted_runtimes
+
     print("  Creating online evaluation configuration...")
     evaluation = ensure_online_evaluation_config(
         runtime_arn=runtime_arn,
@@ -320,7 +384,6 @@ def setup_agentcore_evaluation(
         account_id=account_id,
         project_name=project_name,
         execution_role_arn=execution_role_arn,
-        runtime_type=runtime_type,
     )
     result.update(evaluation)
     return result

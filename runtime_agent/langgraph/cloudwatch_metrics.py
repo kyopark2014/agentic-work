@@ -56,9 +56,13 @@ def _get_cloudwatch_client():
     return _cloudwatch_client
 
 
+def _agent_runtime_name(project_name: str) -> str:
+    return project_name.replace("-", "_")
+
+
 def _load_runtime_context() -> dict[str, str]:
     project_name = "langgraph-runtime"
-    runtime_name = "runtime_langgraph"
+    runtime_name = _agent_runtime_name("agentic-work")
     region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-west-2"
 
     try:
@@ -68,6 +72,7 @@ def _load_runtime_context() -> dict[str, str]:
             config = json.load(f)
         project_name = config.get("projectName", project_name)
         region = config.get("region", region)
+        runtime_name = _agent_runtime_name(project_name)
         arn = config.get("agent_runtime_arn", "")
         if arn:
             runtime_name = arn.rsplit("/", 1)[-1]
