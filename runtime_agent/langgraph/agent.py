@@ -160,8 +160,6 @@ async def agent_langgraph(payload):
         guardrailEnabled=payload.get("guardrail_enabled"),
     )
 
-    history_mode = payload.get("history_mode", "Disable")
-    logger.info(f"history_mode: {history_mode}")
     logger.info(f"guardrail_enabled: {chat.guardrail_enabled}")
 
     try:
@@ -181,7 +179,7 @@ async def agent_langgraph(payload):
                 return
 
         try:
-            app, config = await chat.create_agent(mcp_servers, skill_list, history_mode)
+            app, config = await chat.create_agent(mcp_servers, skill_list)
         except Exception as e:
             logger.error(f"Failed to create agent: {traceback.format_exc()}")
             yield {
@@ -407,8 +405,7 @@ async def agent_langgraph(payload):
         logger.info(f"final_output: {result_text[:200]!r}...")
         yield {"result": final_output}
     finally:
-        if history_mode == "Enable":
-            await chat.persist_checkpoint_to_session_storage()
+        await chat.persist_checkpoint_to_session_storage()
 
 if __name__ == "__main__":
     app.run()

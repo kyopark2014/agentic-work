@@ -37,6 +37,11 @@ def get_session(request: Request) -> SessionResponse | None:
     return SessionResponse(user_id=user_id)
 
 
+@router.delete("", status_code=204)
+def clear_session(response: Response) -> None:
+    response.delete_cookie(key=SESSION_COOKIE, samesite="lax")
+
+
 def require_user_id(request: Request) -> str:
     user_id = request.cookies.get(SESSION_COOKIE)
     if not user_id:

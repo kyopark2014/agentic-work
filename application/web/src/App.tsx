@@ -104,6 +104,23 @@ export default function App() {
     }
   }
 
+  async function handleLogout() {
+    setBootError(null);
+    try {
+      await api.clearSession();
+    } catch (err) {
+      uiError("logout failed", err);
+    }
+    setUserId(null);
+    setTasks([]);
+    setActiveTaskId(null);
+    setMessages([]);
+    setDrawer(null);
+    if (config?.projectName) {
+      document.title = formatBrandTitle(config.projectName);
+    }
+  }
+
   async function handleNewTask() {
     if (!config) return;
     const task = await api.createTask({
@@ -189,6 +206,7 @@ export default function App() {
         onCloseDrawer={() => setDrawer(null)}
         onPatchTask={handlePatchTask}
         onDeleteTask={handleDeleteTask}
+        onLogout={handleLogout}
       />
       <div className="main-panel">
         <ChatThread

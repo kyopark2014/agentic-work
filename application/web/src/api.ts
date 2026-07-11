@@ -38,6 +38,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ user_id }),
     }),
+  clearSession: () => request<void>("/api/session", { method: "DELETE" }),
   getConfig: () => request<AppConfig>("/api/config"),
   patchDefaults: (body: {
     default_skills?: string[];

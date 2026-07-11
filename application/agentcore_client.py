@@ -6,7 +6,6 @@ import json
 import os
 import logging
 import sys
-import uuid
 
 try:
     from application import utils
@@ -149,27 +148,6 @@ def load_agentcore_config(agent_name, agent_type=None):
             )
             return arn
         raise
-
-def runtime_session_id_for(
-    user_id: str,
-    history_mode: str,
-    runtime_session_id: str | None = None,
-) -> str:
-    """AgentCore runtimeSessionId (min length 33).
-
-    Chat mode: use explicit runtime_session_id per task when provided.
-    Fallback: deterministic per user_id so history survives client restarts.
-    Agent mode: ephemeral session per request.
-    """
-    if runtime_session_id:
-        return runtime_session_id
-    if history_mode == "Enable" and user_id:
-        seed = f"agentcore-session-{user_id}"
-        session_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
-    else:
-        session_id = str(uuid.uuid4())
-    logger.info(f"runtime_session_id: {session_id} (history_mode={history_mode})")
-    return session_id
 
 tool_info_list = dict()
 tool_result_list = dict()
@@ -561,7 +539,7 @@ def get_tool_info(tool_name, tool_content):
 
     return content, urls, tool_references
 
-def run_agent(prompt, user_id, history_mode, mcp_servers, model_name, notification_queue=None, skill_list=None, guardrail_enabled=None, runtime_session_id=None):
+def run_agent(prompt, user_id, mcp_servers, model_name, runtime_session_id, notification_queue=None, skill_list=None, guardrail_enabled=None):
     tool_info_list.clear()
     tool_result_list.clear()
     tool_name_list.clear()
@@ -578,7 +556,6 @@ def run_agent(prompt, user_id, history_mode, mcp_servers, model_name, notificati
         "mcp_servers": mcp_servers,
         "model_name": model_name,
         "user_id": user_id,
-        "history_mode": history_mode,
         "skill_list": skill_list or [],
         "guardrail_enabled": bool(guardrail_enabled) if guardrail_enabled is not None else True,
     })
@@ -607,10 +584,10 @@ def run_agent(prompt, user_id, history_mode, mcp_servers, model_name, notificati
             region_name=bedrock_region,
             config=boto_config
         )
-        session_id = runtime_session_id_for(user_id, history_mode, runtime_session_id)
+        logger.info(f"runtime_session_id: {runtime_session_id}")
         response = agent_core_client.invoke_agent_runtime(
             agentRuntimeArn=agent_runtime_arn,
-            runtimeSessionId=session_id,
+            runtimeSessionId=runtime_session_id,
             payload=payload,
             qualifier="DEFAULT" # DEFAULT or LATEST
         )

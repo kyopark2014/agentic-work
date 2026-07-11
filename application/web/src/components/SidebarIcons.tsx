@@ -72,3 +72,22 @@ export function GuardrailIcon({ className }: IconProps) {
     </svg>
   );
 }
+
+export function LogoutIcon({ className }: IconProps) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 16 16"
+      aria-hidden="true"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.15"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M6 2.5H3A1 1 0 0 0 2 3.5v9a1 1 0 0 0 1 1h3" />
+      <path d="M10.5 11.5 14 8l-3.5-3.5" />
+      <path d="M14 8H6" />
+    </svg>
+  );
+}

@@ -17,8 +17,6 @@ logger = logging.getLogger("routes_chat")
 
 router = APIRouter(prefix="/api/tasks", tags=["chat"])
 
-HISTORY_MODE = "Enable"
-
 _TOOL_INPUT_RE = re.compile(r"^Tool: (.+?), Input: (.+)$", re.DOTALL)
 _TOOL_RESULT_RE = re.compile(r"^Tool Result: (.+)$", re.DOTALL)
 
@@ -145,13 +143,12 @@ def _run_agent_thread(
         response, image_url = agentcore_client.run_agent(
             prompt,
             user_id,
-            HISTORY_MODE,
             mcp_servers,
             model_name,
+            runtime_session_id,
             notification_queue=sink,
             skill_list=skill_list,
             guardrail_enabled=guardrail_enabled,
-            runtime_session_id=runtime_session_id,
         )
         if not isinstance(response, str):
             response = json.dumps(response, ensure_ascii=False)

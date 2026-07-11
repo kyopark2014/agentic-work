@@ -2,7 +2,7 @@ import { formatBrandTitle } from "../formatBrandTitle";
 import type { AppConfig, Task } from "../types";
 import { ConfigDrawer } from "./ConfigDrawer";
 import { TaskListItem } from "./TaskListItem";
-import { GuardrailIcon, McpIcon, ModelIcon, NewTaskIcon, SkillIcon } from "./SidebarIcons";
+import { GuardrailIcon, LogoutIcon, McpIcon, ModelIcon, NewTaskIcon, SkillIcon } from "./SidebarIcons";
 
 type DrawerKind = "skill" | "mcp" | null;
 
@@ -18,6 +18,7 @@ interface Props {
   onCloseDrawer: () => void;
   onPatchTask: (taskId: string, patch: Partial<Task>) => void;
   onDeleteTask: (taskId: string) => void;
+  onLogout: () => void;
 }
 
 export function Sidebar({
@@ -32,6 +33,7 @@ export function Sidebar({
   onCloseDrawer,
   onPatchTask,
   onDeleteTask,
+  onLogout,
 }: Props) {
   const skills = activeTask?.skills ?? config?.default_skills ?? [];
   const mcpServers = activeTask?.mcp_servers ?? config?.default_mcp_servers ?? [];
@@ -41,7 +43,18 @@ export function Sidebar({
     <>
       <aside className="sidebar">
         <div className="sidebar-header">
-          <div className="brand">{brandTitle}</div>
+          <div className="brand-row">
+            <div className="brand">{brandTitle}</div>
+            <button
+              type="button"
+              className="brand-logout-btn"
+              aria-label="나가기"
+              title="나가기"
+              onClick={onLogout}
+            >
+              <LogoutIcon className="sidebar-icon" />
+            </button>
+          </div>
         </div>
 
         <button type="button" className="sidebar-menu-btn" onClick={onNewTask}>

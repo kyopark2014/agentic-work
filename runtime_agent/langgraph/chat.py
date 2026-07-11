@@ -1527,11 +1527,10 @@ def get_tool_info(tool_name, tool_content):
 
     return content, urls, tool_references
 
-async def create_agent(mcp_servers: list, skill_list: list, history_mode: str="Disable") -> tuple[str, list]:
+async def create_agent(mcp_servers: list, skill_list: list) -> tuple[str, list]:
     thread_scope = _thread_scope(mcp_servers, skill_list)
 
-    if history_mode == "Enable":
-        await ensure_checkpointer()
+    await ensure_checkpointer()
 
     # builtin tools
     tools = langgraph_agent.get_builtin_tools()
@@ -1574,30 +1573,18 @@ async def create_agent(mcp_servers: list, skill_list: list, history_mode: str="D
         logger.warning("No tools available, using general conversation mode")
         return None, None
     
-    thread_id = thread_scope if history_mode == "Enable" else user_id
+    thread_id = thread_scope
 
-    if history_mode == "Enable":
-        app = langgraph_agent.buildChatAgentWithHistory(tools)
-        agent_config = {
-            "recursion_limit": 100,
-            "configurable": {
-                "thread_id": thread_id,
-                "tools": tools,
-                "system_prompt": system_prompt,
-            },
-            "max_turns": langgraph_agent.MAX_CONTEXT_TURNS,
-        }
-    else:
-        app = langgraph_agent.buildChatAgent(tools)
-        agent_config = {
-            "recursion_limit": 100,
-            "configurable": {
-                "thread_id": thread_id,
-                "tools": tools,
-                "system_prompt": system_prompt,
-            },
-            "max_turns": langgraph_agent.MAX_CONTEXT_TURNS,
-        }        
+    app = langgraph_agent.buildChatAgentWithHistory(tools)
+    agent_config = {
+        "recursion_limit": 100,
+        "configurable": {
+            "thread_id": thread_id,
+            "tools": tools,
+            "system_prompt": system_prompt,
+        },
+        "max_turns": langgraph_agent.MAX_CONTEXT_TURNS,
+    }
     
     return app, agent_config
 
@@ -1607,7 +1594,7 @@ active_mcp_servers = []
 active_skills = []
 current_id = None
 
-async def run_langgraph_agent(query: str, mcp_servers: list, skill_list: list, history_mode: str):
+async def run_langgraph_agent(query: str, mcp_servers: list, skill_list: list):
     global app, agent_config, active_mcp_servers, active_skills, current_id
 
     artifacts = []
@@ -1618,7 +1605,7 @@ async def run_langgraph_agent(query: str, mcp_servers: list, skill_list: list, h
         active_skills = skill_list
         current_id = user_id
 
-        app, agent_config = await create_agent(mcp_servers, skill_list, history_mode)
+        app, agent_config = await create_agent(mcp_servers, skill_list)
     
     if app is None:
         logger.error("Failed to create agent - app is None")
