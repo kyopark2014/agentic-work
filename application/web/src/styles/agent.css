@@ -802,6 +802,7 @@ select {
   resize: none;
   min-height: 24px;
   max-height: 160px;
+  overflow-y: auto;
   line-height: 1.5;
   outline: none;
   padding: 2px 2px 0;

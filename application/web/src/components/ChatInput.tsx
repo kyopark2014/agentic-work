@@ -2,6 +2,7 @@ import {
   FormEvent,
   KeyboardEvent,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
@@ -15,6 +16,8 @@ interface Props {
 }
 
 const RAG_ACCEPT = ".pdf,.txt,.md,.csv,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.html,.htm,.json,.py,.js";
+const MIN_INPUT_HEIGHT = 24;
+const MAX_INPUT_HEIGHT = 160;
 
 export function ChatInput({ disabled, onSend, onRagUploadComplete }: Props) {
   const [value, setValue] = useState("");
@@ -31,6 +34,22 @@ export function ChatInput({ disabled, onSend, onRagUploadComplete }: Props) {
   const addBtnRef = useRef<HTMLButtonElement>(null);
   const inputWrapRef = useRef<HTMLFormElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  function adjustInputHeight() {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    const next = Math.min(
+      Math.max(el.scrollHeight, MIN_INPUT_HEIGHT),
+      MAX_INPUT_HEIGHT,
+    );
+    el.style.height = `${next}px`;
+  }
+
+  useLayoutEffect(() => {
+    adjustInputHeight();
+  }, [value]);
 
   function updateMenuPosition() {
     const rect = inputWrapRef.current?.getBoundingClientRect();
@@ -187,6 +206,7 @@ export function ChatInput({ disabled, onSend, onRagUploadComplete }: Props) {
           aria-hidden="true"
         />
         <textarea
+          ref={textareaRef}
           className="chat-input"
           rows={1}
           placeholder="메시지를 입력하세요..."
