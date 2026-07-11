@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 Unified uninstallation script
-Sequentially deletes: AgentCore runtime -> ECR repository -> IAM role -> IAM policy
+Sequentially deletes:
+  Online evaluation -> Guardrail -> CloudWatch dashboards ->
+  AgentCore runtime -> ECR repository -> IAM role -> IAM policy
 All functionality integrated into a single file
 """
 
@@ -35,6 +37,288 @@ def load_config():
 def agent_runtime_name(runtime_type: str) -> str:
     """Return Bedrock AgentCore runtime name (e.g. runtime_langgraph)."""
     return f"runtime_{runtime_type.replace('-', '_')}"
+
+
+def _resolve_region(config: dict) -> str:
+    return (
+        config.get("region")
+        or os.environ.get("AWS_DEFAULT_REGION")
+        or os.environ.get("AWS_REGION")
+        or "us-west-2"
+    )
+
+
+def _project_name(config: dict) -> str:
+    return config.get("projectName") or "agentic-work"
+
+
+def _online_evaluation_config_name(project_name: str) -> str:
+    return f"{project_name.replace('-', '_')}_langgraph_online_eval"
+
+
+def _evaluation_role_name(project_name: str) -> str:
+    return f"AmazonBedrockAgentCoreEvaluationRoleFor{project_name}"
+
+
+def _guardrail_name(project_name: str) -> str:
+    return f"guardrail-for-{project_name.replace('_', '-').lower()}"
+
+
+def _monitoring_dashboard_name(config: dict) -> str:
+    name = config.get("cloudwatch_dashboard_name")
+    if name:
+        return name
+    project_name = _project_name(config)
+    try:
+        from cloudwatch_metrics import dashboard_name
+
+        return dashboard_name(project_name)
+    except Exception:
+        return f"{str(project_name).replace(' ', '-')}-monitoring"
+
+
+def _find_online_evaluation_config(client, config_name: str) -> dict | None:
+    next_token = None
+    while True:
+        params = {}
+        if next_token:
+            params["nextToken"] = next_token
+        response = client.list_online_evaluation_configs(**params)
+        for item in response.get("onlineEvaluationConfigs", []):
+            if item.get("onlineEvaluationConfigName") == config_name:
+                return item
+        next_token = response.get("nextToken")
+        if not next_token:
+            return None
+
+
+def _find_guardrail_by_name(bedrock_client, name: str) -> dict | None:
+    next_token = None
+    while True:
+        kwargs = {}
+        if next_token:
+            kwargs["nextToken"] = next_token
+        response = bedrock_client.list_guardrails(**kwargs)
+        for guardrail in response.get("guardrails", []):
+            if guardrail.get("name") == name:
+                return guardrail
+        next_token = response.get("nextToken")
+        if not next_token:
+            return None
+
+
+def _delete_managed_policy(iam_client, policy_arn: str, policy_label: str) -> bool:
+    try:
+        versions = iam_client.list_policy_versions(PolicyArn=policy_arn)["Versions"]
+        for version in versions:
+            if not version["IsDefaultVersion"]:
+                try:
+                    iam_client.delete_policy_version(
+                        PolicyArn=policy_arn,
+                        VersionId=version["VersionId"],
+                    )
+                except Exception as e:
+                    print(f"Warning: Failed to delete policy version {version['VersionId']}: {e}")
+        iam_client.delete_policy(PolicyArn=policy_arn)
+        print(f"✓ Deleted IAM policy: {policy_label}")
+        return True
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("NoSuchEntity", "NoSuchEntityException"):
+            print(f"IAM policy not found (may already be deleted): {policy_label}")
+            return True
+        print(f"Warning: Failed to delete IAM policy {policy_label}: {e}")
+        return False
+    except Exception as e:
+        print(f"Warning: Failed to delete IAM policy {policy_label}: {e}")
+        return False
+
+
+def delete_online_evaluation():
+    """Delete online evaluation config and its evaluation IAM role/policy."""
+    print(f"\n{'='*60}")
+    print("Deleting AgentCore online evaluation")
+    print(f"{'='*60}")
+
+    try:
+        config = load_config()
+        if not config:
+            return False
+
+        region = _resolve_region(config)
+        project_name = _project_name(config)
+        account_id = config.get("accountId")
+        config_name = (
+            config.get("online_evaluation_config_name")
+            or _online_evaluation_config_name(project_name)
+        )
+        config_id = config.get("online_evaluation_config_id")
+
+        client = boto3.client("bedrock-agentcore-control", region_name=region)
+
+        if not config_id:
+            existing = _find_online_evaluation_config(client, config_name)
+            if existing:
+                config_id = existing.get("onlineEvaluationConfigId")
+
+        if config_id:
+            try:
+                client.delete_online_evaluation_config(onlineEvaluationConfigId=config_id)
+                print(f"✓ Deleted online evaluation config: {config_name} ({config_id})")
+            except ClientError as e:
+                if e.response["Error"]["Code"] in (
+                    "ResourceNotFoundException",
+                    "ResourceNotFound",
+                ):
+                    print(
+                        f"Online evaluation config not found "
+                        f"(may already be deleted): {config_name}"
+                    )
+                else:
+                    print(f"Warning: Failed to delete online evaluation config: {e}")
+        else:
+            print(
+                f"Online evaluation config not found "
+                f"(may already be deleted): {config_name}"
+            )
+
+        role_name = _evaluation_role_name(project_name)
+        policy_name = f"{role_name}Policy"
+        iam_client = boto3.client("iam")
+
+        try:
+            attached = iam_client.list_attached_role_policies(RoleName=role_name)
+            for policy in attached.get("AttachedPolicies", []):
+                try:
+                    iam_client.detach_role_policy(
+                        RoleName=role_name,
+                        PolicyArn=policy["PolicyArn"],
+                    )
+                    print(f"✓ Detached policy from evaluation role: {policy['PolicyArn']}")
+                except ClientError as e:
+                    if e.response["Error"]["Code"] not in ("NoSuchEntity", "NoSuchEntityException"):
+                        print(f"Warning: Failed to detach {policy['PolicyArn']}: {e}")
+
+            inline = iam_client.list_role_policies(RoleName=role_name)
+            for inline_name in inline.get("PolicyNames", []):
+                try:
+                    iam_client.delete_role_policy(RoleName=role_name, PolicyName=inline_name)
+                    print(f"✓ Deleted inline policy: {inline_name}")
+                except Exception as e:
+                    print(f"Warning: Failed to delete inline policy {inline_name}: {e}")
+
+            iam_client.delete_role(RoleName=role_name)
+            print(f"✓ Deleted evaluation IAM role: {role_name}")
+        except ClientError as e:
+            if e.response["Error"]["Code"] in ("NoSuchEntity", "NoSuchEntityException"):
+                print(f"Evaluation IAM role not found (may already be deleted): {role_name}")
+            else:
+                print(f"Warning: Failed to delete evaluation IAM role: {e}")
+
+        if account_id:
+            policy_arn = f"arn:aws:iam::{account_id}:policy/{policy_name}"
+            _delete_managed_policy(iam_client, policy_arn, policy_name)
+        else:
+            print("Warning: accountId missing; skipped evaluation IAM policy deletion")
+
+        print("\n✓ Online evaluation deletion completed")
+        return True
+    except Exception as e:
+        print(f"Warning: Error deleting online evaluation: {e}")
+        return True
+
+
+def delete_bedrock_guardrail():
+    """Delete Bedrock Guardrail created by the LangGraph runtime installer."""
+    print(f"\n{'='*60}")
+    print("Deleting Bedrock Guardrail")
+    print(f"{'='*60}")
+
+    try:
+        config = load_config()
+        if not config:
+            return False
+
+        region = _resolve_region(config)
+        project_name = _project_name(config)
+        name = config.get("guardrail_name") or _guardrail_name(project_name)
+        guardrail_id = config.get("guardrail_id")
+        bedrock_client = boto3.client("bedrock", region_name=region)
+
+        if not guardrail_id:
+            existing = _find_guardrail_by_name(bedrock_client, name)
+            if existing:
+                guardrail_id = existing.get("id")
+
+        if not guardrail_id:
+            print(f"Guardrail not found (may already be deleted): {name}")
+            return True
+
+        try:
+            bedrock_client.delete_guardrail(guardrailIdentifier=guardrail_id)
+            print(f"✓ Deleted Bedrock Guardrail: {name} ({guardrail_id})")
+        except ClientError as e:
+            if e.response["Error"]["Code"] in (
+                "ResourceNotFoundException",
+                "ResourceNotFound",
+            ):
+                print(f"Guardrail not found (may already be deleted): {name}")
+            else:
+                print(f"Warning: Failed to delete guardrail: {e}")
+                return True
+
+        print("\n✓ Bedrock Guardrail deletion completed")
+        return True
+    except Exception as e:
+        print(f"Warning: Error deleting Bedrock Guardrail: {e}")
+        return True
+
+
+def _delete_dashboard(client, name: str) -> bool:
+    """Delete a single CloudWatch dashboard. Returns True if deleted or already gone."""
+    if not name:
+        return True
+    try:
+        client.delete_dashboards(DashboardNames=[name])
+        print(f"✓ Deleted CloudWatch dashboard: {name}")
+        return True
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("ResourceNotFound", "ResourceNotFoundException"):
+            print(f"CloudWatch dashboard not found (already deleted): {name}")
+            return True
+        print(f"Warning: Failed to delete dashboard '{name}': {e}")
+        return False
+    except Exception as e:
+        print(f"Warning: Failed to delete dashboard '{name}': {e}")
+        return False
+
+
+def delete_cloudwatch_dashboards():
+    """Delete CloudWatch monitoring dashboard created by the LangGraph runtime installer.
+
+    Only removes the project-specific dashboard ({projectName}-monitoring).
+    Bedrock-Usage-Dashboard is shared across runtimes and is left intact.
+    """
+    print(f"\n{'='*60}")
+    print("Deleting CloudWatch dashboards")
+    print(f"{'='*60}")
+
+    try:
+        config = load_config()
+        if not config:
+            print("Warning: config.json not found; skipping dashboard deletion")
+            return True
+
+        region = _resolve_region(config)
+        client = boto3.client("cloudwatch", region_name=region)
+        project_dashboard = _monitoring_dashboard_name(config)
+        _delete_dashboard(client, project_dashboard)
+
+        print("\n✓ CloudWatch dashboard deletion completed")
+        return True
+    except Exception as e:
+        print(f"Warning: Error deleting CloudWatch dashboards: {e}")
+        return True
 
 
 def delete_agent_runtime():
@@ -497,8 +781,11 @@ def main():
             print("Uninstallation cancelled.")
             sys.exit(0)
     
-    # Execute each step in reverse order
+    # Execute each step in reverse order of installer creation
     steps = [
+        ("Deleting AgentCore online evaluation", delete_online_evaluation),
+        ("Deleting Bedrock Guardrail", delete_bedrock_guardrail),
+        ("Deleting CloudWatch dashboards", delete_cloudwatch_dashboards),
         ("Deleting AgentCore runtime", delete_agent_runtime),
         ("Deleting ECR repository", delete_ecr_repository),
         ("Deleting IAM role and policy", delete_iam_resources),
