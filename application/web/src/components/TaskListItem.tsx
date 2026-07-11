@@ -4,6 +4,7 @@ import type { Task } from "../types";
 interface Props {
   task: Task;
   active: boolean;
+  hidePinBadge?: boolean;
   onSelect: () => void;
   onDelete: () => void;
   onRename: (title: string) => void;
@@ -13,6 +14,7 @@ interface Props {
 export function TaskListItem({
   task,
   active,
+  hidePinBadge = false,
   onSelect,
   onDelete,
   onRename,
@@ -70,7 +72,7 @@ export function TaskListItem({
   return (
     <div className={`task-row ${active ? "active" : ""}`}>
       <button type="button" className="task-item" onClick={onSelect} title={task.title}>
-        {task.pinned && (
+        {task.pinned && !hidePinBadge && (
           <svg className="task-pin-icon" viewBox="0 0 16 16" aria-hidden="true">
             <path
               fill="currentColor"

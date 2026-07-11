@@ -32,7 +32,7 @@ flowchart TB
 
   subgraph Runtime["AgentCore runtime_agent/langgraph"]
     AG["agent.py BedrockAgentCoreApp"]
-    CHAT["chat.py AsyncSqliteSaver bind_memory"]
+    CHAT["chat.py AsyncSqliteSaver restore/persist"]
     LGA["langgraph_agent.py StateGraph astream"]
   end
 
@@ -495,24 +495,84 @@ application/web/
 
 채팅 요청은 `agentcore_client.run_agent` → AgentCore Runtime으로 전달되며, 태스크마다 고유한 `runtime_session_id`로 checkpoint가 격리됩니다.
 
-### 로컬 개발
+### Local 빌드
+
+로컬에서 `application/`(Web UI + FastAPI)을 수정한 뒤 빌드·실행하는 방법입니다. 프로덕션과 동일하게 **빌드된 React 정적 파일**(`application/web/dist/`)을 `application/server.py`가 함께 서빙합니다.
+
+#### 사전 준비
+
+- **Python 3** + 가상환경(권장)
+- **Node.js 18+** 및 `npm` (프론트엔드 빌드)
+- AgentCore Runtime 호출을 위한 **AWS 자격 증명** (`aws configure` 또는 환경 변수). 상세는 [Local에서 실행하기](#local에서-실행하기) 참조.
 
 ```text
-# 1) 프론트엔드 빌드 (최초 1회 또는 UI 변경 후)
-cd application/web
-npm install
-npm run build
+# 저장소 루트에서
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
 
-# 2) 백엔드 실행
+#### 1) 프론트엔드 빌드 (UI 수정 후)
+
+`application/web/src/` 등 React·CSS를 변경했다면 **반드시** 다시 빌드합니다. 빌드 결과는 `application/web/dist/`에 생성되며, `server.py`가 이 경로를 읽습니다.
+
+```text
+cd application/web
+npm install          # 최초 1회 또는 package.json 변경 시
+npm run build        # tsc + vite build → dist/
 cd ../..
+```
+
+빌드만 다시 하고 서버는 그대로 두는 경우에도, 브라우저에서 **강력 새로고침**(캐시 무시)을 하거나 시크릿 창으로 확인하는 것이 좋습니다.
+
+#### 2) 백엔드 실행
+
+`routes_chat.py`, `agentcore_client.py` 등 Python 코드를 수정했다면 서버를 **재시작**해야 반영됩니다.
+
+```text
+# 저장소 루트에서 (venv 활성화 상태)
 uvicorn application.server:app --host 0.0.0.0 --port 8501
 ```
 
-프론트엔드 핫 리로드 개발 시 Vite dev server(`5173`)를 사용합니다. `/api`는 `vite.config.ts`에서 `8501`로 프록시됩니다.
+브라우저에서 [http://localhost:8501](http://localhost:8501) 로 접속합니다. 최초 진입 시 User ID를 입력하면 HttpOnly 쿠키로 세션이 유지됩니다.
+
+| 확인 항목 | URL / 방법 |
+|-----------|------------|
+| 헬스체크 | `GET http://localhost:8501/api/health` |
+| UI 미빌드 시 | `Frontend not built` — 위 1) 단계 실행 후 서버 재시작 |
+| 태스크·메시지 DB | `application/data/tasks.db` (SQLite) |
+
+#### 3) (선택) 프론트엔드만 핫 리로드
+
+UI만 빠르게 볼 때는 Vite 개발 서버를 쓸 수 있습니다. `/api`는 `vite.config.ts`에서 `8501`로 프록시되므로 **백엔드는 별도 터미널에서 실행**해야 합니다.
 
 ```text
+# 터미널 1 — API
+uvicorn application.server:app --host 0.0.0.0 --port 8501
+
+# 터미널 2 — UI (소스 수정 시 자동 반영)
 cd application/web
 npm run dev
+```
+
+개발 서버 주소: [http://localhost:5173](http://localhost:5173)
+
+#### 수정 범위별 체크리스트
+
+| 수정 위치 | 필요 작업 |
+|-----------|-----------|
+| `application/web/src/**` | `npm run build` (또는 `npm run dev`) |
+| `application/api/**`, `application/*.py` | `uvicorn` **재시작** |
+| `application/web/dist/`만 배포·확인 | 빌드 후 서버 재시작 불필요(정적 파일만 갱신 시 재시작 권장) |
+| `runtime_agent/langgraph/**` (에이전트 로직) | Docker 이미지 재빌드 + AgentCore Runtime 재배포 ([LangGraph Agent](#runtime_agentlanggraph--langgraph-agent-agentcore-runtime) 참조). Web UI만으로는 반영되지 않음 |
+
+#### 한 번에 빌드 후 실행 (요약)
+
+```text
+cd application/web && npm install && npm run build
+cd ../..
+source .venv/bin/activate
+uvicorn application.server:app --host 0.0.0.0 --port 8501
 ```
 
 ### `runtime_agent/langgraph/` — LangGraph Agent (AgentCore Runtime)
@@ -523,7 +583,7 @@ npm run dev
 runtime_agent/langgraph/
 ├── agent.py                # BedrockAgentCoreApp 엔트리포인트, payload 파싱·스트리밍 응답
 ├── langgraph_agent.py      # LangGraph StateGraph, LLM 호출, 도구 바인딩
-├── chat.py                 # LLM 빌드(Bedrock/Mantle), MCP 클라이언트, AsyncSqliteSaver checkpoint
+├── chat.py                 # LLM 빌드(Bedrock/Mantle), MCP 클라이언트, AsyncSqliteSaver checkpoint (working + persist)
 ├── info.py                 # Runtime 모델 ID·리전·mantle_api 매핑 (application/info.py와 동일)
 ├── skill.py                # SkillManager, get_skill_instructions 도구
 ├── mcp_config.py           # 선택된 MCP → stdio subprocess / Gateway URL 매핑
@@ -558,7 +618,7 @@ runtime_agent/langgraph/
 | 구분 | 모듈 | 설명 |
 |------|------|------|
 | **엔트리포인트** | `agent.py` | AgentCore 요청 수신 → `chat.update`로 모델·user_id 반영 → `langgraph_agent` 실행 |
-| **추론·메모리** | `langgraph_agent.py`, `chat.py` | StateGraph agent/tool 루프, Bedrock·Mantle LLM, `/mnt/workspace` SQLite checkpoint |
+| **추론·메모리** | `langgraph_agent.py`, `chat.py` | StateGraph agent/tool 루프, Bedrock·Mantle LLM, working `/tmp` + persistent `/mnt/workspace/checkpoints/` checkpoint |
 | **MCP** | `mcp_config.py`, `mcp_server_*.py` | UI에서 선택된 MCP를 stdio subprocess 또는 AgentCore Gateway로 기동 |
 | **Skill** | `skill.py`, `skills/` | `SKILL.md` 기반 지침. `get_skill_instructions` 도구로 로드 |
 | **인증·모델** | `agentcore_sigv4_auth.py`, `bedrock_data_retention.py`, `info.py` | Gateway SigV4, Mantle bearer token, 모델 프로필 |
@@ -729,7 +789,9 @@ async def agent_langgraph(payload):
 
 ## Session Storage
 
-AgentCore Runtime에서 대화 context를 유지하려면 **Session Storage**를 사용합니다. 이 프로젝트는 배포 후에도 checkpoint를 유지하기 위해 **Amazon S3 Files**를 `/mnt/workspace`에 마운트하고, LangGraph **AsyncSqliteSaver**가 `langgraph_checkpoints.sqlite`에 대화 이력을 저장합니다. (`s3_files_access_point_arn`이 없으면 managed `sessionStorage` + `PUBLIC` 모드로 fallback합니다.)
+AgentCore Runtime에서 대화 context를 유지하려면 **Session Storage**를 사용합니다. 이 프로젝트는 배포 후에도 checkpoint를 유지하기 위해 **Amazon S3 Files**를 `/mnt/workspace`에 마운트하고, LangGraph **AsyncSqliteSaver**가 태스크(`runtime_session_id`)별 SQLite 파일에 대화 이력을 저장합니다. (`s3_files_access_point_arn`이 없으면 managed `sessionStorage` + `PUBLIC` 모드로 fallback합니다.)
+
+런타임 중에는 NFS/S3 Files 잠금을 피하기 위해 **로컬 working DB**(`/tmp/langgraph-checkpoints/{runtime_session_id}/`)에서 읽고 쓰고, 요청 종료 시 **영속 경로**(`/mnt/workspace/checkpoints/{runtime_session_id}/`)로 복사합니다.
 
 ### Runtime 생성 시 filesystem 설정
 
@@ -808,29 +870,58 @@ response = client.create_agent_runtime(
 
 기존 `MemorySaver`는 프로세스 메모리에만 저장되어 컨테이너가 재시작되면 history가 사라집니다. [runtime_agent/langgraph/chat.py](./runtime_agent/langgraph/chat.py)의 `ensure_checkpointer()`가 **AsyncSqliteSaver**를 초기화하고, `buildChatAgentWithHistory()`가 이를 checkpointer로 사용합니다.
 
+#### 2-tier checkpoint (working + persistent)
+
+S3 Files·managed `sessionStorage`는 NFS 기반이라 **요청 처리 중 SQLite를 직접 열면 lock 오류**가 날 수 있습니다. 그래서 아래처럼 **로컬 working DB**와 **session storage 영속 DB**를 분리합니다.
+
+| 구분 | 경로 | 역할 |
+|------|------|------|
+| **Working (런타임)** | `/tmp/langgraph-checkpoints/{runtime_session_id}/langgraph_checkpoints.sqlite` | invoke 처리 중 LangGraph가 읽고 쓰는 DB |
+| **Persistent (영속)** | `/mnt/workspace/checkpoints/{runtime_session_id}/langgraph_checkpoints.sqlite` | microVM stop/resume·cold start 후 복원용 |
+| **Legacy (session_id 없음)** | `/mnt/workspace/langgraph_checkpoints.sqlite` | `runtime_session_id` 미전달 시 폴백 |
+
 | 구분 | Strands (참고) | LangGraph (본 프로젝트) |
 |------|----------------|-------------------------|
-| 저장소 | `FileSessionManager(storage_dir="/mnt/workspace")` | `AsyncSqliteSaver` → `/mnt/workspace/langgraph_checkpoints.sqlite` |
-| 세션 키 | `session_id` | `config["configurable"]["thread_id"]` |
+| 저장소 | `FileSessionManager(storage_dir="/mnt/workspace")` | AsyncSqliteSaver (working `/tmp/...` + persistent `/mnt/workspace/checkpoints/...`) |
+| 세션 키 | `session_id` | `config["configurable"]["thread_id"]` = 태스크 `runtime_session_id` |
 
 ```python
 # chat.py — 요약
 SESSION_STORAGE_DIR = os.environ.get("SESSION_STORAGE_DIR", "/mnt/workspace")
-CHECKPOINT_DB = os.path.join(SESSION_STORAGE_DIR, "langgraph_checkpoints.sqlite")
+
+def get_checkpoint_db_path() -> str:
+    # 런타임 working DB (로컬 디스크)
+    return f"/tmp/langgraph-checkpoints/{session_id}/langgraph_checkpoints.sqlite"
+
+def get_persistent_checkpoint_db_path() -> str:
+    # session storage 영속 DB (태스크별)
+    return f"{SESSION_STORAGE_DIR}/checkpoints/{session_id}/langgraph_checkpoints.sqlite"
 
 async def ensure_checkpointer():
-    saver = AsyncSqliteSaver.from_conn_string(CHECKPOINT_DB)
-    checkpointer = await saver.__aenter__()
-    await checkpointer.setup()
-    return checkpointer
+    _restore_from_session_storage(working_db)  # 영속 → working 복원
+    # 기존 DB 있으면 open, 없으면 setup 후 initialize
+
+async def persist_checkpoint_to_session_storage():
+    # WAL flush 후 working → persistent 복사 (요청 종료 시)
 ```
 
-`buildChatAgentWithHistory()`는 아래와 같이 checkpointer를 compile 시 전달합니다.
+[runtime_agent/langgraph/agent.py](./runtime_agent/langgraph/agent.py)는 요청 시작 시 payload의 `runtime_session_id`로 세션을 바인딩하고, `finally`에서 영속화합니다.
 
 ```python
-return workflow.compile(
-    checkpointer=chat.checkpointer
-)
+# agent.py — 요청 처리
+chat.set_checkpoint_session_id(runtime_session_id)
+app, config = await chat.create_agent(..., runtime_session_id=runtime_session_id)
+try:
+    async for stream in app.astream(inputs, config, stream_mode="messages"):
+        ...
+finally:
+    await chat.persist_checkpoint_to_session_storage()
+```
+
+`buildChatAgentWithHistory()`는 compile 시 checkpointer를 전달합니다.
+
+```python
+return workflow.compile(checkpointer=chat.checkpointer)
 ```
 
 
@@ -854,8 +945,12 @@ sequenceDiagram
     UI->>Client: task.runtime_session_id, user_id
     Client->>AC: invoke(runtimeSessionId=task.runtime_session_id)
     Note over AC: /mnt/workspace 마운트
-    AC->>LG: astream(..., thread_id=scope)
-    LG->>LG: AsyncSqliteSaver → langgraph_checkpoints.sqlite
+    AC->>LG: set_checkpoint_session_id + ensure_checkpointer
+    LG->>LG: persistent → /tmp working DB 복원
+    AC->>LG: astream(..., thread_id=runtime_session_id)
+    LG->>LG: AsyncSqliteSaver (working DB)
+    AC->>LG: persist_checkpoint_to_session_storage
+    LG->>LG: working → /mnt/workspace/checkpoints/{id}/ 복사
     Client->>AC: 다음 턴 (동일 runtimeSessionId)
     LG->>LG: thread_id로 이전 checkpoint 로드
 ```
@@ -864,23 +959,24 @@ sequenceDiagram
 
 | 변수 | 기본값 | 설명 |
 |------|--------|------|
-| `SESSION_STORAGE_DIR` | `/mnt/workspace` | checkpoint SQLite 디렉터리 |
-| `SESSION_STORAGE_ENABLED` | `true` | `false`이면 `MemorySaver`로 폴백 |
+| `SESSION_STORAGE_DIR` | `/mnt/workspace` (마운트 시) | 영속 checkpoint 디렉터리 루트 (`checkpoints/{session_id}/` 하위) |
 
-로컬에서 session storage 없이 실행할 때는 `SESSION_STORAGE_DIR`이 없으면 `runtime_agent/langgraph/.session_storage`를 사용합니다.
+로컬에서 session storage 없이 실행할 때는 `/mnt/workspace`가 없으면 `runtime_agent/langgraph/.session_storage`를 사용합니다. working DB는 여전히 `/tmp/langgraph-checkpoints/{session_id}/`에 생성됩니다.
 
 ### 주의사항
 
 - **세션 범위**: Managed `sessionStorage`는 14일 idle·Version 업데이트 시 초기화될 수 있습니다. 이 프로젝트는 **S3 Files**로 `/mnt/workspace`를 영속화하므로 배포 후에도 checkpoint가 유지됩니다. ([S3 Files 활용](#s3-files-활용) 참조)
-- **요청마다 agent 재생성**: `agent.py`는 매 요청 `create_agent()`를 호출하지만, checkpointer가 파일에 있으면 `thread_id`만 같으면 history를 복원합니다.
-- **`InMemoryStore`는 휘발성**: `store=chat.memorystore`는 LangGraph Store API용이며 메모리에만 있습니다. 대화 history만 필요하면 checkpointer만으로 충분합니다.
+- **태스크별 격리**: Web UI 태스크마다 `runtime_session_id`(UUID)가 다르므로 checkpoint 파일도 `checkpoints/{runtime_session_id}/` 아래로 분리됩니다.
+- **요청마다 agent 재생성**: `agent.py`는 매 요청 `create_agent()`를 호출하지만, `ensure_checkpointer()`가 working DB를 열고 `thread_id`가 같으면 history를 복원합니다.
+- **요청 종료 시 persist 필수**: `persist_checkpoint_to_session_storage()`가 호출되어야 cold start 후 `/mnt/workspace`에서 복원됩니다. `agent.py`의 `finally` 블록에서 자동 호출합니다.
+- **SQLite lock 대응**: `busy_timeout`, 재시도, working/persistent 분리로 NFS lock을 회피합니다. 실패 시 `MemorySaver`로 폴백합니다.
 - **의존성**: [runtime_agent/langgraph/Dockerfile](./runtime_agent/langgraph/Dockerfile)에 `langgraph-checkpoint-sqlite`, `aiosqlite`가 포함되어 있습니다.
 
 
 
 ### S3 Files 활용
 
-Managed `sessionStorage`는 Runtime **Version 업데이트 시 `/mnt/workspace` 데이터가 초기화**됩니다. LangGraph checkpoint(`langgraph_checkpoints.sqlite`)를 배포 후에도 유지하려면, 이 프로젝트는 **Amazon S3 Files**를 bring-your-own 파일시스템으로 마운트합니다.
+Managed `sessionStorage`는 Runtime **Version 업데이트 시 `/mnt/workspace` 데이터가 초기화**됩니다. LangGraph checkpoint를 배포 후에도 유지하려면, 이 프로젝트는 **Amazon S3 Files**를 bring-your-own 파일시스템으로 마운트합니다.
 
 | 항목 | Managed `sessionStorage` | S3 Files `s3FilesAccessPoint` (현재 기본) |
 |------|--------------------------|-------------------------------------------|
@@ -888,7 +984,7 @@ Managed `sessionStorage`는 Runtime **Version 업데이트 시 `/mnt/workspace` 
 | Network | `PUBLIC` | `VPC` (private subnet 필수) |
 | Version 업데이트 후 | checkpoint 삭제 | **유지** |
 | 실제 저장소 | AgentCore managed | S3 bucket `agentcore-sessions/` prefix |
-| LangGraph 코드 | `SESSION_STORAGE_DIR=/mnt/workspace` | 동일 (변경 없음) |
+| LangGraph 영속 경로 | `SESSION_STORAGE_DIR/checkpoints/{runtime_session_id}/` | 동일 |
 
 #### 전체 아키텍처
 
@@ -911,8 +1007,9 @@ flowchart TB
         I["networkMode: VPC"]
     end
 
-    subgraph runtime_agent ["chat.py / langgraph_agent.py"]
-        J["AsyncSqliteSaver → langgraph_checkpoints.sqlite"]
+    subgraph runtime_agent ["chat.py / agent.py"]
+        J["working: /tmp/langgraph-checkpoints/{id}/"]
+        K["persist: /mnt/workspace/checkpoints/{id}/"]
     end
 
     B --> D
@@ -922,7 +1019,8 @@ flowchart TB
     G --> H
     G --> I
     H --> J
-    F --> J
+    H --> K
+    F --> K
 ```
 
 #### 배포 흐름 (`installer.py`)
@@ -1031,15 +1129,20 @@ Session storage: S3 Files access point at /mnt/workspace (VPC mode)
 
 #### LangGraph checkpointer 연동
 
-Runtime Agent 코드는 마운트 경로만 `/mnt/workspace`이면 되므로 **변경하지 않습니다**.
+Runtime Agent는 `SESSION_STORAGE_DIR`(기본 `/mnt/workspace`) 아래 **`checkpoints/{runtime_session_id}/`** 에 영속 checkpoint를 저장합니다. 요청 처리 중에는 `/tmp/langgraph-checkpoints/{runtime_session_id}/` working DB를 사용하고, [agent.py](./runtime_agent/langgraph/agent.py) `finally`에서 `persist_checkpoint_to_session_storage()`로 영속 경로에 복사합니다.
 
 ```python
 # runtime_agent/langgraph/chat.py
 SESSION_STORAGE_DIR = os.environ.get("SESSION_STORAGE_DIR", "/mnt/workspace")
-CHECKPOINT_DB = os.path.join(SESSION_STORAGE_DIR, "langgraph_checkpoints.sqlite")
+
+# 영속 (session storage)
+# /mnt/workspace/checkpoints/{runtime_session_id}/langgraph_checkpoints.sqlite
+
+# working (로컬, 런타임 중)
+# /tmp/langgraph-checkpoints/{runtime_session_id}/langgraph_checkpoints.sqlite
 ```
 
-S3 측 경로: `s3://{bucket}/agentcore-sessions/` (예: `langgraph_checkpoints.sqlite`가 이 prefix 아래에 동기화됨. NFS → S3 동기화 지연 ~60초).
+S3 측 경로: `s3://{bucket}/agentcore-sessions/checkpoints/{runtime_session_id}/` (NFS → S3 동기화 지연 ~60초). 레거시 단일 파일 `/mnt/workspace/langgraph_checkpoints.sqlite`는 `runtime_session_id` 없을 때만 사용됩니다.
 
 #### 적용·재배포
 
@@ -1062,7 +1165,7 @@ python3 runtime_agent/langgraph/installer.py
 - Managed `sessionStorage`는 Version 업데이트·14일 idle 시 checkpoint가 사라질 수 있습니다. 운영 환경에서는 S3 Files 사용을 권장합니다.
 - S3 Files는 NFS 기반이므로 S3 API로 즉시 읽어야 하는 downstream에는 동기화 지연(~60초)을 고려해야 합니다.
 - access point POSIX UID/GID는 컨테이너 실행 사용자와 일치해야 합니다. 현재 구현은 `uid/gid: 0/0`(root)입니다.
-- checkpoint·세션 파일은 버킷 루트가 아니라 **`agentcore-sessions/`** prefix 아래에 동기화됩니다. 콘솔에서 prefix로 확인하세요.
+- checkpoint·세션 파일은 버킷 루트가 아니라 **`agentcore-sessions/checkpoints/{runtime_session_id}/`** prefix 아래에 동기화됩니다. 콘솔에서 prefix로 확인하세요.
 - **트러블슈팅**
   - S3 bucket이 비어 있고 Runtime이 `PUBLIC` + `sessionStorage`이면 S3 Files 마운트가 적용되지 않은 것입니다. `python3 runtime_agent/langgraph/installer.py`로 Runtime을 재배포하세요.
   - `update_agent_runtime` 시 `Ensure the role has s3files:GetAccessPoint` → 실행 역할 IAM에서 `GetAccessPoint` Resource를 access point ARN으로 분리했는지 확인하세요.
@@ -1075,7 +1178,7 @@ python3 runtime_agent/langgraph/installer.py
 
 ### 세션 관리
 
-AgentCore Runtime에서 대화 history를 유지하려면 **`/mnt/workspace` 영속 마운트**(S3 Files 또는 managed `sessionStorage`), **동일한 `runtimeSessionId`**, LangGraph **checkpointer**(SQLite)가 함께 동작해야 합니다. 상세 구현은 위 [Session Storage](#session-storage) 및 [S3 Files 활용](#s3-files-활용) 절을 참조합니다.
+AgentCore Runtime에서 대화 history를 유지하려면 **`/mnt/workspace` 영속 마운트**(S3 Files 또는 managed `sessionStorage`), **동일한 `runtimeSessionId`**, LangGraph **checkpointer**(working `/tmp` + persistent SQLite)가 함께 동작해야 합니다. 상세 구현은 위 [Session Storage](#session-storage) 및 [S3 Files 활용](#s3-files-활용) 절을 참조합니다.
 
 #### sessionStorage (managed session storage)
 
@@ -1097,9 +1200,9 @@ AgentCore Runtime에서 대화 history를 유지하려면 **`/mnt/workspace` 영
 3. session stop — microVM 종료, 미 flush 데이터는 graceful shutdown 시 flush
 4. 같은 session resume — 새 microVM에 storage 복원
 
-본 프로젝트는 `/mnt/workspace/langgraph_checkpoints.sqlite`에 LangGraph checkpoint를 저장합니다. cold start 후 `ensure_checkpointer()` 로그가 `opened (existing)`이면 복원 성공, `initialized`이면 **새 DB 생성(이전 history 없음)** 입니다.
+본 프로젝트는 태스크별로 `/mnt/workspace/checkpoints/{runtime_session_id}/langgraph_checkpoints.sqlite`에 LangGraph checkpoint를 영속 저장합니다. cold start 후 `ensure_checkpointer()` 로그가 `SQLite checkpointer opened (existing)`이면 복원 성공, `SQLite checkpointer initialized`이면 **새 DB 생성(이전 history 없음)** 입니다. 요청 종료 시 `Checkpoint persisted to session storage` 로그로 working → persistent 복사 여부를 확인합니다.
 
-> **중요:** Dockerfile의 `ENV SESSION_STORAGE_DIR=/mnt/workspace`만으로는 영속 storage가 활성화되지 않습니다. **반드시** runtime API에 `filesystemConfigurations.sessionStorage`를 설정해야 합니다. `create_agent_runtime`뿐 아니라 **`update_agent_runtime`에도 동일하게 포함**해야 합니다. update 시 누락하면 `get-agent-runtime` 응답에 `filesystemConfigurations`가 없고, cold start마다 checkpoint가 사라집니다.
+> **중요:** Dockerfile의 `ENV SESSION_STORAGE_DIR=/mnt/workspace`만으로는 영속 storage가 활성화되지 않습니다. **반드시** runtime API에 `filesystemConfigurations`(`sessionStorage` 또는 `s3FilesAccessPoint`)를 설정해야 합니다. `create_agent_runtime`뿐 아니라 **`update_agent_runtime`에도 동일하게 포함**해야 합니다. update 시 누락하면 `get-agent-runtime` 응답에 `filesystemConfigurations`가 없고, cold start마다 checkpoint가 사라집니다.
 
 #### maxLifetime · idleRuntimeSessionTimeout (lifecycle)
 
@@ -1122,11 +1225,14 @@ AgentCore Runtime에서 대화 history를 유지하려면 **`/mnt/workspace` 영
 
 #### 배포·운영 체크리스트
 
-1. `get-agent-runtime`으로 `filesystemConfigurations`에 `sessionStorage` 존재 확인
+1. `get-agent-runtime`으로 `filesystemConfigurations`에 `sessionStorage` 또는 `s3FilesAccessPoint` 존재 확인
 2. create/update 모두 `/mnt/workspace` mount path 포함
-3. 태스크별 `runtimeSessionId`가 create/invoke 전 구간에서 동일한지 확인
-4. runtime **version 업데이트 직후**에는 session data가 wipe됨 (정상 동작)
-5. CloudWatch(`/aws/bedrock-agentcore/runtimes/...`)에서 `checkpointer` 로그로 `initialized` vs `opened (existing)` 확인
+3. 태스크별 `runtimeSessionId`가 create/invoke·payload `runtime_session_id` 전 구간에서 동일한지 확인
+4. runtime **version 업데이트 직후**에는 session data가 wipe됨 (정상 동작, S3 Files 사용 시 완화)
+5. CloudWatch(`/aws/bedrock-agentcore/runtimes/...`)에서 checkpointer 로그 확인
+   - `Restored checkpoint DB from session storage` — cold start 후 영속 → working 복원
+   - `SQLite checkpointer opened (existing)` / `initialized` — DB 존재 여부
+   - `Checkpoint persisted to session storage` — 요청 종료 시 영속화 성공
 
 #### 참고 문서
 
@@ -1239,7 +1345,7 @@ Human(Q2) → AI(A2) → Human(Q3) → AI(tool_calls) → ToolMessage → AI(A3)
 
 **Session Storage와의 관계**
 
-- checkpointer(SQLite)에는 **전체 대화 이력**이 저장됩니다.
+- checkpointer(SQLite)에는 **전체 대화 이력**이 저장됩니다 (working DB + `/mnt/workspace/checkpoints/{runtime_session_id}/` 영속화).
 - trim은 LLM 컨텍스트 윈도우 관리용이며, 저장된 history를 삭제하지 않습니다.
 - CloudWatch 로그에서 `trimmed messages from X to Y (max_turns=5)`로 trim 여부를 확인할 수 있습니다.
 
@@ -1337,7 +1443,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-이후 아래와 같은 명령어로 Web UI를 실행합니다. UI 변경 후에는 `application/web`에서 `npm run build`를 먼저 실행해야 합니다. ([App UI](#app-ui) 참조)
+이후 아래와 같은 명령어로 Web UI를 실행합니다. UI 변경 후에는 [Local 빌드](#local-빌드)의 프론트엔드 빌드 단계를 먼저 실행해야 합니다.
 
 ```text
 cd application/web && npm install && npm run build

@@ -38,6 +38,23 @@ export function Sidebar({
   const skills = activeTask?.skills ?? config?.default_skills ?? [];
   const mcpServers = activeTask?.mcp_servers ?? config?.default_mcp_servers ?? [];
   const brandTitle = formatBrandTitle(config?.projectName ?? "agent", userId);
+  const pinnedTasks = tasks.filter((task) => task.pinned);
+  const regularTasks = tasks.filter((task) => !task.pinned);
+
+  function renderTask(task: Task, hidePinBadge = false) {
+    return (
+      <TaskListItem
+        key={task.id}
+        task={task}
+        active={activeTask?.id === task.id}
+        hidePinBadge={hidePinBadge}
+        onSelect={() => onSelectTask(task.id)}
+        onDelete={() => onDeleteTask(task.id)}
+        onRename={(title) => onPatchTask(task.id, { title })}
+        onTogglePin={() => onPatchTask(task.id, { pinned: !task.pinned })}
+      />
+    );
+  }
 
   return (
     <>
@@ -63,17 +80,18 @@ export function Sidebar({
         </button>
 
         <div className="task-list">
-          {tasks.map((task) => (
-            <TaskListItem
-              key={task.id}
-              task={task}
-              active={activeTask?.id === task.id}
-              onSelect={() => onSelectTask(task.id)}
-              onDelete={() => onDeleteTask(task.id)}
-              onRename={(title) => onPatchTask(task.id, { title })}
-              onTogglePin={() => onPatchTask(task.id, { pinned: !task.pinned })}
-            />
-          ))}
+          {pinnedTasks.length > 0 && (
+            <div className="task-list-section">
+              <div className="section-label">Pinned</div>
+              {pinnedTasks.map((task) => renderTask(task, true))}
+            </div>
+          )}
+          {regularTasks.length > 0 && (
+            <div className="task-list-section">
+              {pinnedTasks.length > 0 && <div className="section-label">Tasks</div>}
+              {regularTasks.map((task) => renderTask(task))}
+            </div>
+          )}
         </div>
 
         <div className="sidebar-section">

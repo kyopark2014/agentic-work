@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import type { ToolEvent } from "../types";
 import { api } from "../api";
 import { uiError, uiLog, uiWarn } from "../debug";
@@ -17,55 +17,123 @@ function upsertToolEvent(prev: ToolEvent[], event: ToolEvent): ToolEvent[] {
   return [...prev, event];
 }
 
+function appendTextSegment(prev: ToolEvent[], text: string): ToolEvent[] {
+  const trimmed = text.trim();
+  if (!trimmed) return prev;
+  const last = prev[prev.length - 1];
+  if (last?.type === "text" && last.data === trimmed) return prev;
+  return [...prev, { type: "text", data: trimmed }];
+}
+
+function isSegmentReset(previous: string, next: string): boolean {
+  if (!previous.trim()) return false;
+  if (!next) return true;
+  return !next.startsWith(previous);
+}
+
+export interface ChatFinalMessage {
+  content: string;
+  images: string[];
+  tool_events: ToolEvent[];
+}
+
 export function useChatStream() {
   const [streaming, setStreaming] = useState(false);
   const [streamText, setStreamText] = useState("");
-  const [streamTools, setStreamTools] = useState<ToolEvent[]>([]);
+  const [streamEvents, setStreamEvents] = useState<ToolEvent[]>([]);
+  const streamTextRef = useRef("");
 
   const sendMessage = useCallback(
-    async (taskId: string, prompt: string, onDone: () => void | Promise<void>) => {
+    async (
+      taskId: string,
+      prompt: string,
+      onDone: (final?: ChatFinalMessage) => void | Promise<void>,
+    ) => {
       uiLog("chat:send start", { taskId, prompt });
       setStreaming(true);
+      streamTextRef.current = "";
       setStreamText("");
-      setStreamTools([]);
+      setStreamEvents([]);
+
+      let finalMessage: ChatFinalMessage | undefined;
+
+      const flushTextSegment = () => {
+        const text = streamTextRef.current.trim();
+        if (!text) return;
+        setStreamEvents((prev) => appendTextSegment(prev, text));
+        streamTextRef.current = "";
+        setStreamText("");
+      };
+
+      const clearStreaming = () => {
+        flushTextSegment();
+        setStreaming(false);
+        streamTextRef.current = "";
+        setStreamText("");
+        setStreamEvents([]);
+      };
 
       try {
         for await (const event of api.streamChat(taskId, prompt)) {
           if (event.type === "token" && event.data !== undefined) {
-            setStreamText(event.data);
-          } else if (
-            event.type === "tool" ||
-            event.type === "tool_result" ||
-            event.type === "info"
-          ) {
-            setStreamTools((prev) => upsertToolEvent(prev, event as ToolEvent));
+            const previous = streamTextRef.current;
+            const next = event.data;
+            if (isSegmentReset(previous, next)) {
+              flushTextSegment();
+            }
+            streamTextRef.current = next;
+            setStreamText(next);
+          } else if (event.type === "text" && event.data) {
+            setStreamEvents((prev) => appendTextSegment(prev, event.data!));
+            streamTextRef.current = "";
+            setStreamText("");
+          } else if (event.type === "tool") {
+            flushTextSegment();
+            setStreamEvents((prev) => upsertToolEvent(prev, event as ToolEvent));
+          } else if (event.type === "tool_result" || event.type === "info") {
+            setStreamEvents((prev) => upsertToolEvent(prev, event as ToolEvent));
           } else if (event.type === "error") {
             const msg = event.data ?? "Unknown error";
             uiError("chat:send stream error", msg);
-            setStreamText(msg.startsWith("Error:") ? msg : `Error: ${msg}`);
+            finalMessage = {
+              content: msg.startsWith("Error:") ? msg : `Error: ${msg}`,
+              images: [],
+              tool_events: [],
+            };
+            clearStreaming();
           } else if (event.type === "done") {
             uiLog("chat:send done event", {
               contentLength: event.content?.length ?? 0,
               images: event.images?.length ?? 0,
+              toolEvents: event.tool_events?.length ?? 0,
             });
+            finalMessage = {
+              content: event.content ?? "",
+              images: event.images ?? [],
+              tool_events: event.tool_events ?? [],
+            };
+            setStreaming(false);
+            streamTextRef.current = "";
+            setStreamText("");
           }
         }
       } catch (err) {
         uiError("chat:send failed", err);
-        setStreamText(
-          `Error: ${err instanceof Error ? err.message : String(err)}`,
-        );
+        finalMessage = {
+          content: `Error: ${err instanceof Error ? err.message : String(err)}`,
+          images: [],
+          tool_events: [],
+        };
+        clearStreaming();
       } finally {
         try {
           uiLog("chat:send refreshing messages");
-          await onDone();
+          await onDone(finalMessage);
           uiLog("chat:send refresh complete");
         } catch (err) {
           uiWarn("chat:send refresh failed", err);
         } finally {
-          setStreaming(false);
-          setStreamText("");
-          setStreamTools([]);
+          setStreamEvents([]);
           uiLog("chat:send finished", { taskId });
         }
       }
@@ -73,5 +141,5 @@ export function useChatStream() {
     [],
   );
 
-  return { streaming, streamText, streamTools, sendMessage };
+  return { streaming, streamText, streamEvents, sendMessage };
 }

@@ -163,6 +163,7 @@ checkpointer = MemorySaver()
 _sqlite_checkpointer = None
 _sqlite_checkpointer_cm = None
 _active_checkpoint_session = None
+_current_checkpoint_session_id: str | None = None
 _checkpointer_init_lock = asyncio.Lock()
 SQLITE_BUSY_TIMEOUT_MS = 5000
 _SETUP_MAX_ATTEMPTS = 5
@@ -178,9 +179,22 @@ def _runtime_session_id() -> str | None:
         return None
 
 
+def set_checkpoint_session_id(session_id: str | None) -> None:
+    """Bind the current request to a task's runtime_session_id."""
+    global _current_checkpoint_session_id
+    _current_checkpoint_session_id = session_id.strip() if session_id else None
+
+
+def _checkpoint_session_id() -> str | None:
+    """Resolve the active task session for checkpoint DB and thread_id."""
+    if _current_checkpoint_session_id:
+        return _current_checkpoint_session_id
+    return _runtime_session_id()
+
+
 def get_checkpoint_db_path() -> str:
     """Working SQLite path on local disk (avoids session-storage locking during runtime)."""
-    session_id = _runtime_session_id()
+    session_id = _checkpoint_session_id()
     if session_id:
         local_dir = os.path.join("/tmp", "langgraph-checkpoints", session_id)
         os.makedirs(local_dir, exist_ok=True)
@@ -189,7 +203,12 @@ def get_checkpoint_db_path() -> str:
 
 
 def get_persistent_checkpoint_db_path() -> str:
-    """Durable checkpoint path on AgentCore session storage (/mnt/workspace)."""
+    """Durable checkpoint path on AgentCore session storage (/mnt/workspace), per task."""
+    session_id = _checkpoint_session_id()
+    if session_id:
+        checkpoint_dir = os.path.join(SESSION_STORAGE_DIR, "checkpoints", session_id)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        return os.path.join(checkpoint_dir, "langgraph_checkpoints.sqlite")
     return LEGACY_CHECKPOINT_DB
 
 
@@ -344,11 +363,28 @@ async def _create_sqlite_checkpointer(checkpoint_db: str):
             await asyncio.sleep(delay)
 
 
+async def _close_sqlite_checkpointer() -> None:
+    global _sqlite_checkpointer, _sqlite_checkpointer_cm
+
+    if _sqlite_checkpointer is None:
+        return
+
+    conn = getattr(_sqlite_checkpointer, "conn", None)
+    if conn is not None:
+        try:
+            await conn.close()
+        except Exception as exc:
+            logger.warning(f"Failed to close sqlite checkpointer connection: {exc}")
+
+    _sqlite_checkpointer = None
+    _sqlite_checkpointer_cm = None
+
+
 async def ensure_checkpointer():
-    """Initialize AsyncSqliteSaver on local disk (per AgentCore session)."""
+    """Initialize AsyncSqliteSaver on local disk (per task runtime_session_id)."""
     global checkpointer, _sqlite_checkpointer, _sqlite_checkpointer_cm, _active_checkpoint_session
 
-    session_id = _runtime_session_id()
+    session_id = _checkpoint_session_id()
     checkpoint_db = get_checkpoint_db_path()
 
     if _sqlite_checkpointer is not None and _active_checkpoint_session == session_id:
@@ -365,18 +401,32 @@ async def ensure_checkpointer():
             checkpointer = _sqlite_checkpointer
             return checkpointer
 
-        _sqlite_checkpointer = None
-        _sqlite_checkpointer_cm = None
+        if _sqlite_checkpointer is not None and _active_checkpoint_session != session_id:
+            logger.info(
+                "Switching checkpointer session: %s -> %s",
+                _active_checkpoint_session,
+                session_id,
+            )
+            await _close_sqlite_checkpointer()
+
         _active_checkpoint_session = session_id
 
         try:
             _restore_from_session_storage(checkpoint_db)
             if _checkpoint_db_ready(checkpoint_db):
                 _sqlite_checkpointer = await _open_existing_sqlite_checkpointer(checkpoint_db)
-                logger.info(f"SQLite checkpointer opened (existing): {checkpoint_db}")
+                logger.info(
+                    "SQLite checkpointer opened (existing): session=%s path=%s",
+                    session_id,
+                    checkpoint_db,
+                )
             else:
                 _sqlite_checkpointer = await _create_sqlite_checkpointer(checkpoint_db)
-                logger.info(f"SQLite checkpointer initialized: {checkpoint_db}")
+                logger.info(
+                    "SQLite checkpointer initialized: session=%s path=%s",
+                    session_id,
+                    checkpoint_db,
+                )
         except Exception as exc:
             logger.error(
                 f"SQLite checkpointer unavailable ({exc}); falling back to MemorySaver"
@@ -388,19 +438,20 @@ async def ensure_checkpointer():
         return checkpointer
 
 
-def _thread_scope(mcp_servers: list, skill_list: list) -> str:
-    """Isolate checkpoint threads per user and tool/skill configuration."""
+def _thread_scope(runtime_session_id: str | None) -> str:
+    """Isolate LangGraph checkpoint threads per application task."""
+    if runtime_session_id:
+        return runtime_session_id
+
     import hashlib
 
-    payload = json.dumps(
-        {
-            "mcp": sorted(mcp_servers or []),
-            "skills": sorted(skill_list or []),
-        },
-        sort_keys=True,
-    )
+    payload = json.dumps({"user_id": user_id}, sort_keys=True)
     digest = hashlib.sha256(payload.encode()).hexdigest()[:12]
-    return f"{user_id}:{digest}"
+    logger.warning(
+        "runtime_session_id missing; falling back to shared thread scope for user %s",
+        user_id,
+    )
+    return f"{user_id}:{digest}:default"
 
 
 selected_chat = 0
@@ -1527,8 +1578,14 @@ def get_tool_info(tool_name, tool_content):
 
     return content, urls, tool_references
 
-async def create_agent(mcp_servers: list, skill_list: list) -> tuple[str, list]:
-    thread_scope = _thread_scope(mcp_servers, skill_list)
+async def create_agent(
+    mcp_servers: list,
+    skill_list: list,
+    runtime_session_id: str | None = None,
+) -> tuple[str, list]:
+    session_id = runtime_session_id or _checkpoint_session_id()
+    set_checkpoint_session_id(session_id)
+    thread_scope = _thread_scope(session_id)
 
     await ensure_checkpointer()
 

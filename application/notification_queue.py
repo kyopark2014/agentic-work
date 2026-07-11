@@ -32,9 +32,19 @@ class QueueNotificationSink:
             self._streaming_slot = object()
         self._q.put({"type": "markdown", "data": message})
 
-    def result(self, message: str):
+    def commit_text_segment(self, message: str):
+        """Persist a completed assistant text segment before tool events."""
+        stripped = message.strip()
+        if not stripped:
+            return
         self._streaming_slot = None
-        self._q.put({"type": "markdown", "data": message})
+        self._q.put({"type": "text_segment", "data": stripped})
+
+    def result(self, message: str):
+        was_streaming = self._streaming_slot is not None
+        self._streaming_slot = None
+        if not was_streaming:
+            self._q.put({"type": "markdown", "data": message})
 
     def tool_update(self, tool_use_id: str, message: str):
         self._streaming_slot = None

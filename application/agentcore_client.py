@@ -37,6 +37,23 @@ def update_streaming_result(notification_queue, message):
     if notification_queue is not None:
         notification_queue.stream(message)
 
+def commit_streaming_segment(notification_queue, message: str):
+    if notification_queue is not None:
+        notification_queue.commit_text_segment(message)
+
+def on_tool_use_started(
+    notification_queue,
+    current: str,
+    tool_use_id: str,
+    tool_info_list: dict,
+) -> str:
+    """Commit pre-tool assistant text when a new tool call starts."""
+    if not tool_use_id or tool_use_id in tool_info_list:
+        return current
+    commit_streaming_segment(notification_queue, current)
+    tool_info_list[tool_use_id] = True
+    return ""
+
 def tool_slot_update(notification_queue, slot_key: str, message: str):
     if notification_queue is not None:
         notification_queue.tool_update(slot_key, message)
@@ -558,6 +575,7 @@ def run_agent(prompt, user_id, mcp_servers, model_name, runtime_session_id, noti
         "user_id": user_id,
         "skill_list": skill_list or [],
         "guardrail_enabled": bool(guardrail_enabled) if guardrail_enabled is not None else True,
+        "runtime_session_id": runtime_session_id,
     })
 
     agent_type = "langgraph"
@@ -643,7 +661,9 @@ def run_agent(prompt, user_id, mcp_servers, model_name, runtime_session_id, noti
                                     logger.info(f"[tool_result] {toolResult}")
 
                                     effective_input = tool_input_cache.get(toolUseId, {})
-                                    tool_info_list[toolUseId] = True
+                                    current = on_tool_use_started(
+                                        notification_queue, current, toolUseId, tool_info_list
+                                    )
                                     tool_slot_update(
                                         notification_queue,
                                         f"{toolUseId}:input",
@@ -676,10 +696,10 @@ def run_agent(prompt, user_id, mcp_servers, model_name, runtime_session_id, noti
                                         toolUseId,
                                         input if isinstance(input, dict) else {},
                                     )
+                                    current = on_tool_use_started(
+                                        notification_queue, current, toolUseId, tool_info_list
+                                    )
                                     if effective_input:
-                                        if toolUseId not in tool_info_list:
-                                            current = ""
-                                        tool_info_list[toolUseId] = True
                                         tool_slot_update(
                                             notification_queue,
                                             f"{toolUseId}:input",
@@ -715,7 +735,9 @@ def run_agent(prompt, user_id, mcp_servers, model_name, runtime_session_id, noti
 
                                     logger.info(f"tool result: {toolUseId}")
                                     effective_input = tool_input_cache.get(toolUseId, {})
-                                    tool_info_list[toolUseId] = True
+                                    current = on_tool_use_started(
+                                        notification_queue, current, toolUseId, tool_info_list
+                                    )
                                     tool_slot_update(
                                         notification_queue,
                                         f"{toolUseId}:input",
@@ -749,10 +771,10 @@ def run_agent(prompt, user_id, mcp_servers, model_name, runtime_session_id, noti
                                         toolUseId,
                                         input if isinstance(input, dict) else {},
                                     )
+                                    current = on_tool_use_started(
+                                        notification_queue, current, toolUseId, tool_info_list
+                                    )
                                     if effective_input:
-                                        if toolUseId not in tool_info_list:
-                                            current = ""
-                                        tool_info_list[toolUseId] = True
                                         logger.info(f"tool info: {toolUseId}")
                                         tool_slot_update(
                                             notification_queue,

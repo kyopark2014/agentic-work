@@ -13,7 +13,7 @@ export interface Task {
 }
 
 export interface ToolEvent {
-  type: "tool" | "tool_result" | "info";
+  type: "text" | "tool" | "tool_result" | "info";
   tool?: string;
   input?: unknown;
   toolUseId?: string;
@@ -41,10 +41,11 @@ export interface AppConfig {
 }
 
 export interface StreamEvent {
-  type: "token" | "tool" | "tool_result" | "info" | "done" | "error";
+  type: "token" | "text" | "tool" | "tool_result" | "info" | "done" | "error";
   data?: string;
   content?: string;
   images?: string[];
+  tool_events?: ToolEvent[];
   tool?: string;
   input?: unknown;
   toolUseId?: string;

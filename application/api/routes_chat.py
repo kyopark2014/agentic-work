@@ -29,6 +29,67 @@ def _sse_event(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+def _is_segment_reset(previous: str, new: str) -> bool:
+    if not previous.strip():
+        return False
+    if not new:
+        return True
+    return not new.startswith(previous)
+
+
+def _handle_token(
+    tool_events: list[dict[str, Any]],
+    streamed_text: str,
+    new_text: str,
+) -> tuple[str, dict[str, Any] | None]:
+    if new_text == streamed_text:
+        return streamed_text, None
+    committed = None
+    if _is_segment_reset(streamed_text, new_text):
+        committed = _flush_text_segment(tool_events, streamed_text)
+    return new_text, committed
+
+
+def _flush_text_segment(timeline: list[dict[str, Any]], text: str) -> dict[str, Any] | None:
+    stripped = text.strip()
+    if not stripped:
+        return None
+    if (
+        timeline
+        and timeline[-1].get("type") == "text"
+        and timeline[-1].get("data", "").strip() == stripped
+    ):
+        return None
+    timeline.append({"type": "text", "data": stripped})
+    return {"type": "text", "data": stripped}
+
+
+def _is_streaming_prefix_of_final(partial: str, final: str) -> bool:
+    """True when partial looks like a streaming artifact of the same answer."""
+    if not partial or not final:
+        return False
+    if final.startswith(partial) or partial.startswith(final):
+        return True
+    head_len = min(len(partial), len(final), 80)
+    return partial[:head_len] == final[:head_len]
+
+
+def _set_final_text_in_timeline(
+    timeline: list[dict[str, Any]], final_content: str
+) -> None:
+    stripped = final_content.strip()
+    if not stripped:
+        return
+    if timeline and timeline[-1].get("type") == "text":
+        last = timeline[-1].get("data", "").strip()
+        if last == stripped:
+            return
+        if _is_streaming_prefix_of_final(last, stripped):
+            timeline[-1] = {"type": "text", "data": stripped}
+            return
+    timeline.append({"type": "text", "data": stripped})
+
+
 def _upsert_tool_event(tool_events: list[dict[str, Any]], mapped: dict[str, Any]) -> None:
     if mapped["type"] in ("tool", "tool_result"):
         tool_use_id = mapped.get("toolUseId")
@@ -96,6 +157,9 @@ def _map_sink_event(event: dict[str, Any]) -> dict[str, Any] | None:
 
     if event_type == "markdown":
         return {"type": "token", "data": data}
+
+    if event_type == "text_segment":
+        return {"type": "text", "data": data}
 
     if event_type == "info":
         tool_match = _TOOL_INPUT_RE.match(str(data))
@@ -219,8 +283,29 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
                 continue
 
             if mapped["type"] == "token":
-                streamed_text = mapped["data"]
+                before = streamed_text
+                streamed_text, committed = _handle_token(
+                    tool_events, streamed_text, mapped["data"]
+                )
+                if streamed_text == before and committed is None:
+                    continue
+                if committed:
+                    yield _sse_event(committed)
+                yield _sse_event(mapped)
+                continue
+            elif mapped["type"] == "text":
+                committed = _flush_text_segment(tool_events, mapped["data"])
+                streamed_text = ""
+                if committed:
+                    yield _sse_event(committed)
+                continue
             elif mapped["type"] in ("tool", "tool_result", "info"):
+                if mapped["type"] in ("tool", "tool_result"):
+                    committed = _flush_text_segment(tool_events, streamed_text)
+                    if mapped["type"] == "tool":
+                        streamed_text = ""
+                    if committed:
+                        yield _sse_event(committed)
                 for tool_event in _track_tool_event(tool_events, tool_meta, mapped):
                     yield _sse_event(tool_event)
                 continue
@@ -234,7 +319,14 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
             yield _sse_event({"type": "done", "content": error_text, "images": []})
             return
 
-        final_content = result_holder.get("content") or streamed_text
+        authoritative_final = (result_holder.get("content") or "").strip()
+        final_content = authoritative_final or streamed_text
+        if authoritative_final:
+            # Skip flushing streamed_text — it is a streaming artifact of the same answer.
+            _set_final_text_in_timeline(tool_events, final_content)
+        else:
+            _flush_text_segment(tool_events, streamed_text)
+            _set_final_text_in_timeline(tool_events, final_content)
         images = result_holder.get("images") or []
 
         task_store.add_message(
@@ -250,6 +342,7 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
                 "type": "done",
                 "content": final_content,
                 "images": images,
+                "tool_events": tool_events,
             }
         )
 

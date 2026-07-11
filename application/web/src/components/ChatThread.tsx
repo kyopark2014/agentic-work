@@ -6,7 +6,7 @@ interface Props {
   messages: Message[];
   streaming: boolean;
   streamText: string;
-  streamTools: ToolEvent[];
+  streamEvents: ToolEvent[];
   taskTitle: string;
   footer?: ReactNode;
 }
@@ -15,7 +15,7 @@ export function ChatThread({
   messages,
   streaming,
   streamText,
-  streamTools,
+  streamEvents,
   taskTitle,
   footer,
 }: Props) {
@@ -23,7 +23,7 @@ export function ChatThread({
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, streamText, streamTools]);
+  }, [messages, streamText, streamEvents]);
 
   return (
     <>
@@ -41,11 +41,11 @@ export function ChatThread({
           ))}
           {streaming && (
             <>
-              {streamTools.length > 0 || streamText ? (
+              {streamEvents.length > 0 || streamText ? (
                 <MessageBubble
                   role="assistant"
                   content={streamText}
-                  toolEvents={streamTools}
+                  toolEvents={streamEvents}
                 />
               ) : (
                 <div className="message-row assistant">

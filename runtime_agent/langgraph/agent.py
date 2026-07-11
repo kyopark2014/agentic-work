@@ -162,6 +162,12 @@ async def agent_langgraph(payload):
 
     logger.info(f"guardrail_enabled: {chat.guardrail_enabled}")
 
+    runtime_session_id = payload.get("runtime_session_id")
+    if not runtime_session_id:
+        runtime_session_id = chat._runtime_session_id()
+    logger.info(f"runtime_session_id: {runtime_session_id}")
+    chat.set_checkpoint_session_id(runtime_session_id)
+
     try:
         if auth_type == "iam":
             httpx.AsyncClient.__init__ = patched_init
@@ -179,7 +185,11 @@ async def agent_langgraph(payload):
                 return
 
         try:
-            app, config = await chat.create_agent(mcp_servers, skill_list)
+            app, config = await chat.create_agent(
+                mcp_servers,
+                skill_list,
+                runtime_session_id=runtime_session_id,
+            )
         except Exception as e:
             logger.error(f"Failed to create agent: {traceback.format_exc()}")
             yield {

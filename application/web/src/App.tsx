@@ -27,7 +27,7 @@ export default function App() {
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [drawer, setDrawer] = useState<DrawerKind>(null);
-  const { streaming, streamText, streamTools, sendMessage } = useChatStream();
+  const { streaming, streamText, streamEvents, sendMessage } = useChatStream();
 
   const activeTask = tasks.find((t) => t.id === activeTaskId) ?? null;
 
@@ -182,7 +182,21 @@ export default function App() {
     };
     setMessages((prev) => [...prev, optimistic]);
 
-    await sendMessage(activeTaskId, prompt, async () => {
+    await sendMessage(activeTaskId, prompt, async (final) => {
+      if (final && (final.content || final.tool_events.length > 0)) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `pending-assistant-${crypto.randomUUID()}`,
+            task_id: activeTaskId,
+            role: "assistant",
+            content: final.content,
+            images: final.images,
+            tool_events: final.tool_events,
+            created_at: new Date().toISOString(),
+          },
+        ]);
+      }
       await loadMessages(activeTaskId);
       await refreshTasks();
     });
@@ -213,7 +227,7 @@ export default function App() {
           messages={messages}
           streaming={streaming}
           streamText={streamText}
-          streamTools={streamTools}
+          streamEvents={streamEvents}
           taskTitle={activeTask?.title ?? "New task"}
           footer={
             <ChatInput disabled={!activeTask || streaming} onSend={handleSend} />
