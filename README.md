@@ -358,7 +358,7 @@ if "text/event-stream" in response.get("contentType", ""):
 
 ## 프로젝트 구조
 
-프로젝트는 **Codex형 Web UI(`application/`)** 와 **LangGraph Agent Runtime(`runtime_agent/langgraph/`)** 으로 나뉩니다. 루트 [installer.py](./installer.py)는 ECS·VPC·Knowledge Base·**S3 Files 세션 스토리지**를 배포하고, [runtime_agent/langgraph/installer.py](./runtime_agent/langgraph/installer.py)는 AgentCore Runtime·ECR·IAM을 배포합니다. UI는 ECS에서 사용자 입력·MCP/Skill·모델 선택과 스트리밍 결과 표시만 담당하고, LLM 추론·MCP·Skill 실행·대화 checkpoint 저장은 AgentCore Runtime 컨테이너에서 수행합니다.
+프로젝트는 **Web UI(`application/`)** 와 **LangGraph Agent Runtime(`runtime_agent/langgraph/`)** 으로 나뉩니다. 루트 [installer.py](./installer.py)는 ECS·VPC·Knowledge Base·**S3 Files 세션 스토리지**를 배포하고, [runtime_agent/langgraph/installer.py](./runtime_agent/langgraph/installer.py)는 AgentCore Runtime·ECR·IAM을 배포합니다. UI는 ECS에서 사용자 입력·MCP/Skill·모델 선택과 스트리밍 결과 표시만 담당하고, LLM 추론·MCP·Skill 실행·대화 checkpoint 저장은 AgentCore Runtime 컨테이너에서 수행합니다.
 
 ```text
 Web UI (ECS)                            AgentCore Runtime
@@ -370,7 +370,7 @@ application/agentcore_client.py  ──SSE──▶  chat.py · skill.py · mcp_
   invoke_agent_runtime
 ```
 
-### `application/` — Codex형 Web UI (ECS)
+### `application/` — Web UI (ECS)
 
 루트 [Dockerfile](./Dockerfile)로 빌드되어 ECS에 배포됩니다. FastAPI + React SPA이며, AgentCore Runtime을 `invoke_agent_runtime`으로 호출합니다.
 
@@ -396,11 +396,11 @@ application/
 | `server.py` | FastAPI 앱, `/api/*` REST·SSE, React SPA 서빙 |
 | `task_store.py` | New task별 `runtime_session_id`·UI 메시지 영속 |
 | `agentcore_client.py` | payload를 Runtime으로 전송, SSE 스트림 처리. 태스크별 `runtime_session_id` 지원 |
-| `web/` | Codex형 사이드바(New task, Skill, MCP, Model) + 채팅 UI |
+| `web/` | 사이드바(New task, Skill, MCP, Model) + 채팅 UI |
 
 ## App UI
 
-Web UI는 **FastAPI 백엔드 + React SPA**로 구성됩니다. Streamlit을 대체한 Codex형 레이아웃이며, ECS(또는 로컬 `8501`)에서 `application/server.py`가 API와 빌드된 정적 파일(`application/web/dist/`)을 함께 제공합니다.
+Web UI는 **FastAPI 백엔드 + React SPA**로 구성됩니다. Streamlit을 대체한 레이아웃이며, ECS(또는 로컬 `8501`)에서 `application/server.py`가 API와 빌드된 정적 파일(`application/web/dist/`)을 함께 제공합니다.
 
 ### 기술 스택
 
@@ -412,7 +412,7 @@ Web UI는 **FastAPI 백엔드 + React SPA**로 구성됩니다. Streamlit을 대
 | **프론트엔드** | React 19, TypeScript | SPA UI |
 | **프론트엔드** | Vite 6 | 개발 서버·프로덕션 빌드 |
 | **프론트엔드** | react-markdown, remark-gfm | Assistant 응답 Markdown 렌더링 |
-| **프론트엔드** | CSS (`codex.css`) | 다크 테마 Codex형 레이아웃 |
+| **프론트엔드** | CSS (`agent.css`) | 다크 테마 Agent 레이아웃 |
 | **인증** | HttpOnly Cookie (`agent_user_id`) | User ID 세션 유지 |
 
 ### 화면 구조
@@ -476,7 +476,7 @@ application/web/
 │   │   ├── ChatInput.tsx
 │   │   └── ToolCallCard.tsx
 │   └── styles/
-│       └── codex.css
+│       └── agent.css
 └── dist/                     # npm run build 결과 (server.py가 서빙)
 ```
 
