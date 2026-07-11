@@ -501,14 +501,12 @@ application/web/
 
 #### 사전 준비
 
-- **Python 3** + 가상환경(권장)
+- **Python 3** (시스템 또는 사용자 로컬 환경)
 - **Node.js 18+** 및 `npm` (프론트엔드 빌드)
 - AgentCore Runtime 호출을 위한 **AWS 자격 증명** (`aws configure` 또는 환경 변수). 상세는 [Local에서 실행하기](#local에서-실행하기) 참조.
 
 ```text
 # 저장소 루트에서
-python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
@@ -530,7 +528,7 @@ cd ../..
 `routes_chat.py`, `agentcore_client.py` 등 Python 코드를 수정했다면 서버를 **재시작**해야 반영됩니다.
 
 ```text
-# 저장소 루트에서 (venv 활성화 상태)
+# 저장소 루트에서
 uvicorn application.server:app --host 0.0.0.0 --port 8501
 ```
 
@@ -571,7 +569,6 @@ npm run dev
 ```text
 cd application/web && npm install && npm run build
 cd ../..
-source .venv/bin/activate
 uvicorn application.server:app --host 0.0.0.0 --port 8501
 ```
 
@@ -1430,14 +1427,7 @@ aws configure
 curl -fsSL https://cli.kiro.dev/install | bash
 ```
 
-venv로 환경을 구성하면 편리하게 패키지를 관리합니다. 아래와 같이 환경을 설정합니다.
-
-```text
-python -m venv .venv
-source .venv/bin/activate
-```
-
-이후 다운로드 받은 github 폴더로 이동한 후에 아래와 같이 필요한 패키지를 추가로 설치 합니다.
+로컬 Python 환경에서 아래와 같이 필요한 패키지를 설치합니다.
 
 ```text
 pip install -r requirements.txt
