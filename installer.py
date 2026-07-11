@@ -4565,22 +4565,22 @@ def _wait_for_ecs_service_ready(
         primary = next((d for d in deployments if d.get("status") == "PRIMARY"), None)
         draining = [d for d in deployments if d.get("status") == "DRAINING"]
 
-        if _ecs_primary_deployment_ready(service):
-            healthy_targets = 0
-            if target_group_arn:
-                try:
-                    health = elbv2_client.describe_target_health(
-                        TargetGroupArn=target_group_arn
-                    )
-                    healthy_targets = sum(
-                        1
-                        for target in health.get("TargetHealthDescriptions", [])
-                        if target.get("TargetHealth", {}).get("State") == "healthy"
-                    )
-                except ClientError as exc:
-                    logger.debug(f"  Target health check skipped: {exc}")
+        healthy_targets = None
+        if target_group_arn:
+            try:
+                health = elbv2_client.describe_target_health(
+                    TargetGroupArn=target_group_arn
+                )
+                healthy_targets = sum(
+                    1
+                    for target in health.get("TargetHealthDescriptions", [])
+                    if target.get("TargetHealth", {}).get("State") == "healthy"
+                )
+            except ClientError as exc:
+                logger.debug(f"  Target health check skipped: {exc}")
 
-            if not target_group_arn or healthy_targets > 0:
+        if _ecs_primary_deployment_ready(service):
+            if not target_group_arn or (healthy_targets or 0) > 0:
                 if draining:
                     logger.info(
                         "  ✓ ECS PRIMARY deployment ready "
@@ -4596,17 +4596,24 @@ def _wait_for_ecs_service_ready(
 
         primary_rollout = primary.get("rolloutState") if primary else "UNKNOWN"
         logger.info(
-            "  ECS wait attempt %s: running=%s/%s pending=%s primary_rollout=%s draining=%s",
+            "  ECS wait attempt %s: running=%s/%s pending=%s "
+            "primary=%s/%s failed=%s primary_rollout=%s draining=%s healthy_targets=%s",
             attempt,
             service.get("runningCount"),
             service.get("desiredCount"),
             service.get("pendingCount"),
+            (primary or {}).get("runningCount"),
+            (primary or {}).get("desiredCount"),
+            (primary or {}).get("failedTasks"),
             primary_rollout,
             len(draining),
+            healthy_targets,
         )
         time.sleep(poll_interval_seconds)
 
     service = _describe_ecs_service(cluster_name, service_name)
+    deployments = service.get("deployments") or []
+    primary = next((d for d in deployments if d.get("status") == "PRIMARY"), None)
     if _ecs_primary_deployment_ready(service):
         logger.warning(
             "  ECS wait timed out after %ss, but PRIMARY deployment is ready; continuing",
@@ -4617,7 +4624,11 @@ def _wait_for_ecs_service_ready(
     raise TimeoutError(
         f"Timed out after {timeout_seconds}s waiting for ECS service {service_name} "
         f"(running={service.get('runningCount')}/{service.get('desiredCount')}, "
-        f"pending={service.get('pendingCount')})"
+        f"pending={service.get('pendingCount')}, "
+        f"primary={((primary or {}).get('runningCount'))}/{((primary or {}).get('desiredCount'))}, "
+        f"failedTasks={(primary or {}).get('failedTasks')}). "
+        "Check ECS task stopped reason / CloudWatch logs "
+        f"(/ecs/app-for-{project_name}) for container startup failures."
     )
 
 

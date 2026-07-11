@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl \
 
 RUN pip install \
     fastapi \
+    python-multipart \
     uvicorn[standard] \
     boto3 \
     langchain_aws \
