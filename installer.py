@@ -4531,11 +4531,13 @@ def _ecs_primary_deployment_ready(service: Dict[str, object]) -> bool:
     desired = primary.get("desiredCount", 0)
     running = primary.get("runningCount", 0)
     pending = primary.get("pendingCount", 0)
+    # Only evaluate the PRIMARY deployment. During rolling updates the service-level
+    # runningCount can exceed desiredCount while the previous deployment drains
+    # (minimumHealthyPercent=100%, ALB deregistration delay up to 300s).
     return (
         desired > 0
         and running == desired
         and pending == 0
-        and service.get("runningCount", 0) == service.get("desiredCount", 0)
         and service.get("pendingCount", 0) == 0
     )
 
