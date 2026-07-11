@@ -1947,19 +1947,17 @@ https://{region}.console.aws.amazon.com/cloudwatch/home?region={region}#dashboar
 
 ## 실행 결과
 
-"https://github.com/kyopark2014/strands-runtime/blob/main/README.md 을 정리해줘."와 같이 입력하면 웹의 정보를 편리하게 활용할 수 있습니다.
+"https://openai.com/index/how-agents-are-transforming-work/ 를 정리해주세요."와 같이 입력하면 웹의 정보를 편리하게 활용할 수 있습니다.
 
-<img width="728" height="729" alt="image" src="https://github.com/user-attachments/assets/c3a18138-ba1c-4956-90b4-d55a0737da33" />
+<img width="800" alt="image" src="https://github.com/user-attachments/assets/9f13f8e7-a572-4b70-b166-fe2c99898c5e" />
 
-이때의 결과는 아래와 같습니다.
+"aws document로 agent evalutation 에 대해 조사해줘."로 하면 아래와 같이 많은 tool을 이용해 필요한 정보를 조회합니다.
 
-<img width="663" height="780" alt="image" src="https://github.com/user-attachments/assets/6b4ed348-c923-46d7-838b-da8f54e123f8" />
+<img width="800" alt="image" src="https://github.com/user-attachments/assets/6c3a92c4-cd05-42b3-9e40-0122133f489e" />
 
+수집된 정보를 정리하여 아래와 같이 제공합니다.
 
-"aws document로 agent evalutation 에 대해 조사해줘."로 하면 필요한 정보를 조회하여 정리합니다.
-
-<img width="720" height="706" alt="image" src="https://github.com/user-attachments/assets/fb5eb40e-720e-420f-ad3b-8aafceab236e" />
-
+<img width="800" alt="image" src="https://github.com/user-attachments/assets/7069c737-f72d-4289-8c09-04e8aba806a1" />
 
 
 ## Reference 
