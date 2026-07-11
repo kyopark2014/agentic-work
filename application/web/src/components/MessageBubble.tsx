@@ -13,16 +13,22 @@ interface Props {
 export function MessageBubble({ role, content, images = [], toolEvents = [] }: Props) {
   return (
     <div className={`message-row ${role}`}>
-      {toolEvents.map((event, i) => (
-        <ToolCallCard key={`${event.type}-${i}`} event={event} />
-      ))}
-      <div className="message-bubble">
-        {role === "assistant" ? (
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
-        ) : (
-          content
-        )}
-      </div>
+      {toolEvents.length > 0 && (
+        <div className="tool-events">
+          {toolEvents.map((event, i) => (
+            <ToolCallCard key={`${event.type}-${event.toolUseId ?? i}`} event={event} />
+          ))}
+        </div>
+      )}
+      {content.trim() && (
+        <div className="message-bubble">
+          {role === "assistant" ? (
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+          ) : (
+            content
+          )}
+        </div>
+      )}
       {images.length > 0 && (
         <div className="message-images">
           {images.map((url) => (

@@ -4,7 +4,7 @@ import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from application.api.routes_auth import router as auth_router
@@ -60,4 +60,21 @@ if os.path.isdir(_WEB_DIST):
         index_path = os.path.join(_WEB_DIST, "index.html")
         if os.path.isfile(index_path):
             return FileResponse(index_path)
-        return {"message": "Frontend not built. Run npm run build in application/web."}
+        return HTMLResponse(
+            "<h1>Frontend not built</h1>"
+            "<p>Run <code>cd application/web && npm install && npm run build</code></p>",
+            status_code=503,
+        )
+else:
+
+    @app.get("/")
+    def frontend_missing() -> HTMLResponse:
+        return HTMLResponse(
+            "<!doctype html><html lang='ko'><head><meta charset='UTF-8' />"
+            "<title>Agent UI</title></head><body>"
+            "<h1>Frontend not built</h1>"
+            "<p>Run <code>cd application/web && npm install && npm run build</code>, "
+            "then restart the server.</p>"
+            "</body></html>",
+            status_code=503,
+        )

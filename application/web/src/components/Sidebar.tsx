@@ -1,6 +1,8 @@
+import { formatBrandTitle } from "../formatBrandTitle";
 import type { AppConfig, Task } from "../types";
 import { ConfigDrawer } from "./ConfigDrawer";
 import { TaskListItem } from "./TaskListItem";
+import { GuardrailIcon, McpIcon, ModelIcon, NewTaskIcon, SkillIcon } from "./SidebarIcons";
 
 type DrawerKind = "skill" | "mcp" | null;
 
@@ -31,16 +33,18 @@ export function Sidebar({
 }: Props) {
   const skills = activeTask?.skills ?? config?.default_skills ?? [];
   const mcpServers = activeTask?.mcp_servers ?? config?.default_mcp_servers ?? [];
+  const brandTitle = formatBrandTitle(config?.projectName ?? "agent");
 
   return (
     <>
       <aside className="sidebar">
         <div className="sidebar-header">
-          <div className="brand">Agent</div>
+          <div className="brand">{brandTitle}</div>
         </div>
 
-        <button type="button" className="new-task-btn" onClick={onNewTask}>
-          + New task
+        <button type="button" className="sidebar-menu-btn" onClick={onNewTask}>
+          <NewTaskIcon className="sidebar-icon" />
+          <span>New task</span>
         </button>
 
         <div className="task-list">
@@ -61,40 +65,46 @@ export function Sidebar({
           <div className="section-label">Configuration</div>
           <button
             type="button"
-            className="config-btn"
+            className="sidebar-menu-btn"
             onClick={() => onOpenDrawer("skill")}
             disabled={!activeTask}
           >
-            Skill ({skills.length})
+            <SkillIcon className="sidebar-icon" />
+            <span>Skill ({skills.length})</span>
           </button>
           <button
             type="button"
-            className="config-btn"
+            className="sidebar-menu-btn"
             onClick={() => onOpenDrawer("mcp")}
             disabled={!activeTask}
           >
-            MCP ({mcpServers.length})
+            <McpIcon className="sidebar-icon" />
+            <span>MCP ({mcpServers.length})</span>
           </button>
-          <select
-            className="model-select"
-            value={activeTask?.model_name ?? config?.default_model ?? ""}
-            disabled={!activeTask}
-            onChange={(e) =>
-              activeTask && onPatchTask(activeTask.id, { model_name: e.target.value })
-            }
-          >
-            {(config?.models ?? []).map((model) => (
-              <option key={model} value={model}>
-                {model}
-              </option>
-            ))}
-          </select>
+          <label className="sidebar-menu-btn model-select-row">
+            <ModelIcon className="sidebar-icon" />
+            <select
+              className="model-select"
+              value={activeTask?.model_name ?? config?.default_model ?? ""}
+              disabled={!activeTask}
+              onChange={(e) =>
+                activeTask && onPatchTask(activeTask.id, { model_name: e.target.value })
+              }
+            >
+              {(config?.models ?? []).map((model) => (
+                <option key={model} value={model}>
+                  {model}
+                </option>
+              ))}
+            </select>
+          </label>
         </div>
 
         <div className="sidebar-section">
           <div className="section-label">Settings</div>
-          <label className="settings-toggle">
-            Guardrail
+          <label className="sidebar-menu-btn settings-toggle">
+            <GuardrailIcon className="sidebar-icon" />
+            <span>Guardrail</span>
             <input
               type="checkbox"
               checked={activeTask?.guardrail_enabled ?? false}

@@ -2,6 +2,20 @@ import { useCallback, useState } from "react";
 import type { ToolEvent } from "../types";
 import { api } from "../api";
 
+function upsertToolEvent(prev: ToolEvent[], event: ToolEvent): ToolEvent[] {
+  if (event.type === "tool" || event.type === "tool_result") {
+    const idx = prev.findIndex(
+      (e) => e.type === event.type && e.toolUseId === event.toolUseId,
+    );
+    if (idx >= 0) {
+      const next = [...prev];
+      next[idx] = event;
+      return next;
+    }
+  }
+  return [...prev, event];
+}
+
 export function useChatStream() {
   const [streaming, setStreaming] = useState(false);
   const [streamText, setStreamText] = useState("");
@@ -22,7 +36,7 @@ export function useChatStream() {
             event.type === "tool_result" ||
             event.type === "info"
           ) {
-            setStreamTools((prev) => [...prev, event as ToolEvent]);
+            setStreamTools((prev) => upsertToolEvent(prev, event as ToolEvent));
           } else if (event.type === "error") {
             setStreamText(event.data ?? "Unknown error");
           }

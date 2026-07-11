@@ -31,7 +31,7 @@ def set_session(body: SessionRequest, response: Response) -> SessionResponse:
 
 @router.get("", response_model=SessionResponse | None)
 def get_session(request: Request) -> SessionResponse | None:
-    user_id = request.cookies.get(SESSION_COOKIE)
+    user_id = (request.cookies.get(SESSION_COOKIE) or "").strip()
     if not user_id:
         return None
     return SessionResponse(user_id=user_id)

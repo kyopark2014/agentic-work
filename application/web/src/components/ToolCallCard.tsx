@@ -7,7 +7,7 @@ interface Props {
 export function ToolCallCard({ event }: Props) {
   if (event.type === "tool") {
     return (
-      <details className="tool-card" open>
+      <details className="tool-card">
         <summary>Tool: {event.tool}</summary>
         <pre>{JSON.stringify(event.input, null, 2)}</pre>
       </details>

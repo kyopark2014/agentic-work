@@ -203,6 +203,7 @@ async def agent_langgraph(payload):
         tool_used = False
         tool_input_list = {}
         yielded_tool_ids = set()
+        partial_json_tools = set()
 
         # call_model이 chain.astream을 쓰므로 LLM 토큰/청크가 그래프로 전달됨 (langgraph_agent.call_model)
         async for stream in app.astream(inputs, config, stream_mode="messages"):
@@ -237,6 +238,7 @@ async def agent_langgraph(payload):
                                 if tool_use_id not in tool_input_list:
                                     tool_input_list[tool_use_id] = ""
                             if "partial_json" in item:
+                                partial_json_tools.add(tool_use_id)
                                 pj = item.get("partial_json", "") or ""
                                 if tool_use_id:
                                     tool_input_list[tool_use_id] = tool_input_list.get(tool_use_id, "") + pj
@@ -244,16 +246,14 @@ async def agent_langgraph(payload):
                                 if tool_use_id and args_raw:
                                     try:
                                         args_obj = json.loads(args_raw)
-                                        if tool_use_id not in yielded_tool_ids:
-                                            yielded_tool_ids.add(tool_use_id)
-                                            logger.info(
-                                                f"tool_name: {tool_name}, content: {args_obj}, toolUseId: {tool_use_id}"
-                                            )
-                                            yield {
-                                                "tool": tool_name,
-                                                "input": args_obj,
-                                                "toolUseId": tool_use_id,
-                                            }
+                                        logger.info(
+                                            f"tool_name: {tool_name}, content: {args_obj}, toolUseId: {tool_use_id}"
+                                        )
+                                        yield {
+                                            "tool": tool_name,
+                                            "input": args_obj,
+                                            "toolUseId": tool_use_id,
+                                        }
                                     except json.JSONDecodeError:
                                         pass
                 if getattr(chunk, "tool_calls", None):
@@ -268,7 +268,7 @@ async def agent_langgraph(payload):
                             tid = getattr(tc, "id", "") or ""
                             name = getattr(tc, "name", "") or ""
                             args = getattr(tc, "args", {}) or {}
-                        if tid and tid not in yielded_tool_ids:
+                        if tid and tid not in yielded_tool_ids and tid not in partial_json_tools:
                             yielded_tool_ids.add(tid)
                             yield {"tool": name, "input": args, "toolUseId": tid}
 
@@ -302,7 +302,7 @@ async def agent_langgraph(payload):
                             tid = getattr(tc, "id", "") or ""
                             name = getattr(tc, "name", "") or ""
                             args = getattr(tc, "args", {}) or {}
-                        if tid and tid not in yielded_tool_ids:
+                        if tid and tid not in yielded_tool_ids and tid not in partial_json_tools:
                             yielded_tool_ids.add(tid)
                             yield {"tool": name, "input": args, "toolUseId": tid}
 

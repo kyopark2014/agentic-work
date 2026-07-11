@@ -31,6 +31,7 @@ export interface Message {
 }
 
 export interface AppConfig {
+  projectName: string;
   skills: string[];
   mcp_servers: string[];
   models: string[];

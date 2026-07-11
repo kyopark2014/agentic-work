@@ -41,16 +41,12 @@ export function ChatThread({
           ))}
           {streaming && (
             <>
-              {streamTools.map((event, i) => (
+              {streamTools.length > 0 || streamText ? (
                 <MessageBubble
-                  key={`stream-tool-${i}`}
                   role="assistant"
-                  content=""
-                  toolEvents={[event]}
+                  content={streamText}
+                  toolEvents={streamTools}
                 />
-              ))}
-              {streamText ? (
-                <MessageBubble role="assistant" content={streamText} />
               ) : (
                 <div className="message-row assistant">
                   <div className="streaming-indicator">thinking...</div>

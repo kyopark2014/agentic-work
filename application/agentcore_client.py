@@ -41,6 +41,11 @@ def tool_slot_update(notification_queue, slot_key: str, message: str):
     if notification_queue is not None:
         notification_queue.tool_update(slot_key, message)
 
+def _format_tool_input(input_value) -> str:
+    if isinstance(input_value, (dict, list)):
+        return json.dumps(input_value, ensure_ascii=False)
+    return str(input_value)
+
 def _runtime_id_from_arn(arn: str) -> str:
     """Extract agentRuntimeId from an AgentCore runtime ARN."""
     return arn.rsplit("/", 1)[-1] if arn else ""
@@ -630,7 +635,7 @@ def run_agent(prompt, user_id, history_mode, mcp_servers, model_name, notificati
                                     if toolUseId not in tool_info_list:
                                         current = ""
                                         tool_info_list[toolUseId] = True
-                                    tool_slot_update(notification_queue, f"{toolUseId}:input", f"Tool: {tool}, Input: {input}")
+                                    tool_slot_update(notification_queue, f"{toolUseId}:input", f"Tool: {tool}, Input: {_format_tool_input(input)}")
                                     
                                 elif 'toolResult' in data_json:
                                     toolResult = data_json['toolResult']
@@ -683,7 +688,7 @@ def run_agent(prompt, user_id, history_mode, mcp_servers, model_name, notificati
                                         current = ""
                                         tool_info_list[toolUseId] = True
                                     logger.info(f"tool info: {toolUseId}")
-                                    tool_slot_update(notification_queue, f"{toolUseId}:input", f"Tool: {tool}, Input: {input}")
+                                    tool_slot_update(notification_queue, f"{toolUseId}:input", f"Tool: {tool}, Input: {_format_tool_input(input)}")
                                     
                                 elif 'toolResult' in data_json:
                                     toolResult = data_json['toolResult']

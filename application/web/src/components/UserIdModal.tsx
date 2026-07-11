@@ -1,10 +1,12 @@
 import { FormEvent } from "react";
+import { createPortal } from "react-dom";
 
 interface Props {
   onSubmit: (userId: string) => void;
+  error?: string | null;
 }
 
-export function UserIdModal({ onSubmit }: Props) {
+export function UserIdModal({ onSubmit, error }: Props) {
   function handleSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const form = new FormData(e.currentTarget);
@@ -12,18 +14,22 @@ export function UserIdModal({ onSubmit }: Props) {
     if (userId) onSubmit(userId);
   }
 
-  return (
-    <div className="modal-overlay">
-      <form className="modal" onSubmit={handleSubmit}>
-        <h2>User ID 입력</h2>
-        <p>시작하려면 User ID를 입력하세요.</p>
-        <input name="user_id" placeholder="예: user01" autoFocus required />
-        <div className="modal-actions">
-          <button type="submit" className="send-btn">
-            시작
-          </button>
-        </div>
-      </form>
-    </div>
+  return createPortal(
+    <div className="auth-screen">
+      <div className="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="user-id-title">
+        <form className="modal" onSubmit={handleSubmit}>
+          <h2 id="user-id-title">User ID 입력</h2>
+          <p>시작하려면 User ID를 입력하세요.</p>
+          {error && <p className="modal-error">{error}</p>}
+          <input name="user_id" placeholder="예: user01" autoFocus required />
+          <div className="modal-actions">
+            <button type="submit" className="send-btn">
+              시작
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>,
+    document.body,
   );
 }

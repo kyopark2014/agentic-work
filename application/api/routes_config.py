@@ -66,6 +66,7 @@ def get_config():
     if not default_skills and "skill-creator" in skill_options:
         default_skills = ["skill-creator"]
     return {
+        "projectName": config.get("projectName", "agent"),
         "skills": skill_options,
         "mcp_servers": mcp_options,
         "models": MODELS,

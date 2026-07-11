@@ -31,6 +31,16 @@ def _sse_event(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+def _upsert_tool_event(tool_events: list[dict[str, Any]], mapped: dict[str, Any]) -> None:
+    if mapped["type"] in ("tool", "tool_result"):
+        tool_use_id = mapped.get("toolUseId")
+        for i, existing in enumerate(tool_events):
+            if existing.get("type") == mapped["type"] and existing.get("toolUseId") == tool_use_id:
+                tool_events[i] = mapped
+                return
+    tool_events.append(mapped)
+
+
 def _map_sink_event(event: dict[str, Any]) -> dict[str, Any] | None:
     event_type = event.get("type")
     data = event.get("data", "")
@@ -157,7 +167,7 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
             if mapped["type"] == "token":
                 streamed_text = mapped["data"]
             elif mapped["type"] in ("tool", "tool_result", "info"):
-                tool_events.append(mapped)
+                _upsert_tool_event(tool_events, mapped)
 
             yield _sse_event(mapped)
 

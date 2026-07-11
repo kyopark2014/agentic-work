@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "./api";
+import { formatBrandTitle } from "./formatBrandTitle";
 import { useChatStream } from "./hooks/useChatStream";
 import type { AppConfig, Message, Task } from "./types";
 import { Sidebar } from "./components/Sidebar";
@@ -18,6 +19,8 @@ function sortTasks(tasks: Task[]): Task[] {
 
 export default function App() {
   const [userId, setUserId] = useState<string | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [bootError, setBootError] = useState<string | null>(null);
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
@@ -40,13 +43,25 @@ export default function App() {
 
   useEffect(() => {
     (async () => {
-      const session = await api.getSession();
-      if (session?.user_id) {
-        setUserId(session.user_id);
+      try {
+        const session = await api.getSession();
+        const id = session?.user_id?.trim();
+        if (id) {
+          setUserId(id);
+        }
+        setConfig(await api.getConfig());
+      } catch (err) {
+        setBootError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setAuthReady(true);
       }
-      setConfig(await api.getConfig());
     })();
   }, []);
+
+  useEffect(() => {
+    if (!config?.projectName) return;
+    document.title = formatBrandTitle(config.projectName);
+  }, [config?.projectName]);
 
   useEffect(() => {
     if (!userId) return;
@@ -76,8 +91,13 @@ export default function App() {
   }, [activeTaskId, loadMessages]);
 
   async function handleLogin(id: string) {
-    await api.setSession(id);
-    setUserId(id);
+    setBootError(null);
+    try {
+      await api.setSession(id);
+      setUserId(id.trim());
+    } catch (err) {
+      setBootError(err instanceof Error ? err.message : String(err));
+    }
   }
 
   async function handleNewTask() {
@@ -143,8 +163,8 @@ export default function App() {
     });
   }
 
-  if (!userId) {
-    return <UserIdModal onSubmit={handleLogin} />;
+  if (!authReady || !userId) {
+    return <UserIdModal onSubmit={handleLogin} error={bootError} />;
   }
 
   return (
