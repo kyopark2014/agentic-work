@@ -73,6 +73,41 @@ export function GuardrailIcon({ className }: IconProps) {
   );
 }
 
+export function MenuIcon({ className }: IconProps) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 16 16"
+      aria-hidden="true"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.15"
+      strokeLinecap="round"
+    >
+      <path d="M2.5 4h11" />
+      <path d="M2.5 8h11" />
+      <path d="M2.5 12h11" />
+    </svg>
+  );
+}
+
+export function CloseIcon({ className }: IconProps) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 16 16"
+      aria-hidden="true"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.15"
+      strokeLinecap="round"
+    >
+      <path d="M4 4l8 8" />
+      <path d="M12 4l-8 8" />
+    </svg>
+  );
+}
+
 export function LogoutIcon({ className }: IconProps) {
   return (
     <svg

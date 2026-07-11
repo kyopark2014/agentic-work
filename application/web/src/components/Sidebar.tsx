@@ -2,7 +2,7 @@ import { formatBrandTitle } from "../formatBrandTitle";
 import type { AppConfig, Task } from "../types";
 import { ConfigDrawer } from "./ConfigDrawer";
 import { TaskListItem } from "./TaskListItem";
-import { GuardrailIcon, LogoutIcon, McpIcon, ModelIcon, NewTaskIcon, SkillIcon } from "./SidebarIcons";
+import { GuardrailIcon, LogoutIcon, McpIcon, ModelIcon, NewTaskIcon, SkillIcon, CloseIcon } from "./SidebarIcons";
 
 type DrawerKind = "skill" | "mcp" | null;
 
@@ -12,6 +12,8 @@ interface Props {
   activeTask: Task | null;
   config: AppConfig | null;
   drawer: DrawerKind;
+  open: boolean;
+  onClose: () => void;
   onNewTask: () => void;
   onSelectTask: (id: string) => void;
   onOpenDrawer: (kind: DrawerKind) => void;
@@ -27,6 +29,8 @@ export function Sidebar({
   activeTask,
   config,
   drawer,
+  open,
+  onClose,
   onNewTask,
   onSelectTask,
   onOpenDrawer,
@@ -58,19 +62,29 @@ export function Sidebar({
 
   return (
     <>
-      <aside className="sidebar">
+      <aside className={`sidebar${open ? " sidebar-panel-open" : ""}`}>
         <div className="sidebar-header">
           <div className="brand-row">
             <div className="brand">{brandTitle}</div>
-            <button
-              type="button"
-              className="brand-logout-btn"
-              aria-label="나가기"
-              title="나가기"
-              onClick={onLogout}
-            >
-              <LogoutIcon className="sidebar-icon" />
-            </button>
+            <div className="sidebar-header-actions">
+              <button
+                type="button"
+                className="sidebar-close-btn"
+                aria-label="메뉴 닫기"
+                onClick={onClose}
+              >
+                <CloseIcon className="sidebar-icon" />
+              </button>
+              <button
+                type="button"
+                className="brand-logout-btn"
+                aria-label="나가기"
+                title="나가기"
+                onClick={onLogout}
+              >
+                <LogoutIcon className="sidebar-icon" />
+              </button>
+            </div>
           </div>
         </div>
 

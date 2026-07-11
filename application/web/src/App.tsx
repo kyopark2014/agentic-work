@@ -27,6 +27,7 @@ export default function App() {
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [drawer, setDrawer] = useState<DrawerKind>(null);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const { streaming, streamText, streamEvents, sendMessage } = useChatStream();
 
   const activeTask = tasks.find((t) => t.id === activeTaskId) ?? null;
@@ -94,6 +95,27 @@ export default function App() {
     }
   }, [activeTaskId, loadMessages]);
 
+  useEffect(() => {
+    if (!sidebarOpen) return;
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") setSidebarOpen(false);
+    }
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = "";
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [sidebarOpen]);
+
+  useEffect(() => {
+    function onResize() {
+      if (window.innerWidth > 768) setSidebarOpen(false);
+    }
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
   async function handleLogin(id: string) {
     setBootError(null);
     try {
@@ -136,6 +158,7 @@ export default function App() {
 
   async function handleSelectTask(id: string) {
     setActiveTaskId(id);
+    setSidebarOpen(false);
     await loadMessages(id);
   }
 
@@ -202,19 +225,34 @@ export default function App() {
     });
   }
 
+  async function handleNewTaskAndCloseSidebar() {
+    await handleNewTask();
+    setSidebarOpen(false);
+  }
+
   if (!authReady || !userId) {
     return <UserIdModal onSubmit={handleLogin} error={bootError} />;
   }
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell${sidebarOpen ? " sidebar-open" : ""}`}>
+      {sidebarOpen && (
+        <button
+          type="button"
+          className="sidebar-backdrop"
+          aria-label="메뉴 닫기"
+          onClick={() => setSidebarOpen(false)}
+        />
+      )}
       <Sidebar
         userId={userId}
         tasks={tasks}
         activeTask={activeTask}
         config={config}
         drawer={drawer}
-        onNewTask={handleNewTask}
+        open={sidebarOpen}
+        onClose={() => setSidebarOpen(false)}
+        onNewTask={handleNewTaskAndCloseSidebar}
         onSelectTask={handleSelectTask}
         onOpenDrawer={setDrawer}
         onCloseDrawer={() => setDrawer(null)}
@@ -229,6 +267,7 @@ export default function App() {
           streamText={streamText}
           streamEvents={streamEvents}
           taskTitle={activeTask?.title ?? "New task"}
+          onMenuClick={() => setSidebarOpen(true)}
           footer={
             <ChatInput disabled={!activeTask || streaming} onSend={handleSend} />
           }
