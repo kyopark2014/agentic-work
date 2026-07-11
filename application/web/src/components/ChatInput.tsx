@@ -19,22 +19,26 @@ const RAG_ACCEPT = ".pdf,.txt,.md,.csv,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.html,.h
 export function ChatInput({ disabled, onSend, onRagUploadComplete }: Props) {
   const [value, setValue] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
-  const [menuPosition, setMenuPosition] = useState<{ left: number; top: number } | null>(
-    null,
-  );
+  const [menuPosition, setMenuPosition] = useState<{
+    left: number;
+    top: number;
+    width: number;
+  } | null>(null);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const addWrapRef = useRef<HTMLDivElement>(null);
   const menuPortalRef = useRef<HTMLDivElement>(null);
   const addBtnRef = useRef<HTMLButtonElement>(null);
+  const inputWrapRef = useRef<HTMLFormElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   function updateMenuPosition() {
-    const rect = addBtnRef.current?.getBoundingClientRect();
+    const rect = inputWrapRef.current?.getBoundingClientRect();
     if (!rect) return;
     setMenuPosition({
       left: rect.left,
       top: rect.top - 8,
+      width: rect.width,
     });
   }
 
@@ -123,6 +127,7 @@ export function ChatInput({ disabled, onSend, onRagUploadComplete }: Props) {
             style={{
               left: menuPosition.left,
               top: menuPosition.top,
+              width: menuPosition.width,
             }}
           >
             <button
@@ -171,7 +176,7 @@ export function ChatInput({ disabled, onSend, onRagUploadComplete }: Props) {
           RAG에 업로드하고 동기화하는 중...
         </div>
       )}
-      <form className="chat-input-wrap" onSubmit={onSubmit}>
+      <form className="chat-input-wrap" ref={inputWrapRef} onSubmit={onSubmit}>
         <input
           ref={fileInputRef}
           type="file"
@@ -211,7 +216,6 @@ export function ChatInput({ disabled, onSend, onRagUploadComplete }: Props) {
               </svg>
             </button>
           </div>
-          {menu}
           <button
             className="chat-send-btn"
             type="submit"
@@ -231,6 +235,7 @@ export function ChatInput({ disabled, onSend, onRagUploadComplete }: Props) {
           </button>
         </div>
       </form>
+      {menu}
     </div>
   );
 }

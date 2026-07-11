@@ -60,6 +60,10 @@ if os.path.isdir(_WEB_DIST):
     def spa_fallback(full_path: str):
         if full_path.startswith("api/"):
             raise HTTPException(status_code=404)
+        if full_path:
+            file_path = os.path.join(_WEB_DIST, full_path)
+            if os.path.isfile(file_path):
+                return FileResponse(file_path)
         index_path = os.path.join(_WEB_DIST, "index.html")
         if os.path.isfile(index_path):
             return FileResponse(index_path)
