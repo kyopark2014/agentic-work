@@ -17,6 +17,18 @@ from botocore.exceptions import ClientError, NoCredentialsError
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 config_path = os.path.join(script_dir, "config.json")
+RUNTIME_TYPE = "langgraph"
+
+
+def runtime_build_context() -> str:
+    """Directory that contains the LangGraph AgentCore Dockerfile."""
+    return script_dir
+
+
+def ecr_repository_name(config: dict) -> str:
+    """ECR repo name must not depend on the shell cwd."""
+    project_name = config.get("projectName", "agent")
+    return f"{project_name}_{RUNTIME_TYPE}"
 
 def load_config():
     """Load config.json file and merge S3 Files settings from application config."""
@@ -1034,7 +1046,7 @@ def _host_is_arm64() -> bool:
     return os.uname().machine.lower() in ("aarch64", "arm64")
 
 
-def build_and_push_arm64_image(local_tag: str, ecr_uri: str) -> bool:
+def build_and_push_arm64_image(local_tag: str, ecr_uri: str, build_context: str) -> bool:
     """Build an ARM64 image and push it to ECR (native build on ARM64 hosts only)."""
     if not _host_is_arm64():
         print("Error: AgentCore requires linux/arm64 images.", flush=True)
@@ -1042,8 +1054,19 @@ def build_and_push_arm64_image(local_tag: str, ecr_uri: str) -> bool:
         print("  Build on an ARM64 EC2 instance (e.g. t4g, m7g) and retry.", flush=True)
         return False
 
+    dockerfile = os.path.join(build_context, "Dockerfile")
     if not run_docker_command(
-        ["docker", "build", "--platform", "linux/arm64", "-t", local_tag, "."],
+        [
+            "docker",
+            "build",
+            "--platform",
+            "linux/arm64",
+            "-f",
+            dockerfile,
+            "-t",
+            local_tag,
+            build_context,
+        ],
         "Building Docker Image",
     ):
         return False
@@ -1109,12 +1132,10 @@ def push_to_ecr():
             print("Required: accountId, region, projectName")
             return False
         
-        # Get current folder name
-        current_folder_name = os.path.basename(os.getcwd())
-        print(f"CURRENT_FOLDER_NAME: {current_folder_name}")
-        
-        # Construct ECR repository name
-        ecr_repository = f"{project_name}_{current_folder_name}"
+        # Construct ECR repository name (fixed; do not use shell cwd)
+        build_context = runtime_build_context()
+        ecr_repository = ecr_repository_name(config)
+        print(f"BUILD_CONTEXT: {build_context}")
         print(f"ECR_REPOSITORY: {ecr_repository}")
         
         # Construct image tag and ECR URI
@@ -1156,7 +1177,7 @@ def push_to_ecr():
         # Build Docker image
         print("Build output streams below (this may take several minutes)...", flush=True)
         local_tag = f"{ecr_repository}:{image_tag}"
-        if not build_and_push_arm64_image(local_tag, ecr_uri):
+        if not build_and_push_arm64_image(local_tag, ecr_uri, build_context):
             return False
         
         # Complete
@@ -1189,9 +1210,7 @@ def get_latest_image_tag(config):
     """Get the latest image tag from ECR."""
     try:
         aws_region = config['region']
-        project_name = config.get('projectName')
-        current_folder_name = os.path.basename(os.getcwd())
-        repository_name = f"{project_name}_{current_folder_name}"
+        repository_name = ecr_repository_name(config)
         
         ecr_client = boto3.client('ecr', region_name=aws_region)
         response = ecr_client.describe_images(repositoryName=repository_name)
@@ -1552,10 +1571,8 @@ def create_agent_runtime():
         aws_region = config['region']
         project_name = config.get('projectName')
         
-        # Get current folder name
-        current_folder_name = os.path.basename(os.getcwd())
-        repository_name = f"{project_name}_{current_folder_name}"
-        runtime_name = agent_runtime_name(current_folder_name)
+        repository_name = ecr_repository_name(config)
+        runtime_name = agent_runtime_name(RUNTIME_TYPE)
         
         print(f"Repository name: {repository_name}")
         print(f"Runtime name: {runtime_name}")

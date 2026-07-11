@@ -16,7 +16,7 @@ AgentCore의 runtime은 배포를 위해 Docker를 이용합니다. 현재(2025.
  
 ### Operation Architecture
 
-Web UI(`application/server.py`, `application/web/`)에서 MCP·Skill·모델을 선택하면 `application/agentcore_client.py`가 AgentCore Runtime(`invoke_agent_runtime`)으로 요청을 보냅니다. 대화는 항상 Agent(Chat) 모드(`history_mode=Enable`)이며, New task마다 별도 `runtimeSessionId`로 checkpoint가 격리됩니다. Runtime은 `runtime_agent/langgraph/agent.py`의 `BedrockAgentCoreApp` 엔트리포인트에서 LangGraph 워크플로우를 실행하고, 선택된 MCP는 `runtime_agent/langgraph/mcp_config.py`에 따라 **동일 컨테이너 내 stdio 서브프로세스**로 기동됩니다. Skill은 `runtime_agent/langgraph/skills/`의 `SKILL.md`와 `get_skill_instructions` 도구로 제공되며, MCP와는 별도 체계입니다.
+Web UI(`application/server.py`, `application/web/`)에서 MCP·Skill·모델을 선택하면 `application/agentcore_client.py`가 AgentCore Runtime(`invoke_agent_runtime`)으로 요청을 보냅니다. New task마다 별도 `runtimeSessionId`로 checkpoint가 격리됩니다. Runtime은 `runtime_agent/langgraph/agent.py`의 `BedrockAgentCoreApp` 엔트리포인트에서 LangGraph 워크플로우를 실행하고, 선택된 MCP는 `runtime_agent/langgraph/mcp_config.py`에 따라 **동일 컨테이너 내 stdio 서브프로세스**로 기동됩니다. Skill은 `runtime_agent/langgraph/skills/`의 `SKILL.md`와 `get_skill_instructions` 도구로 제공되며, MCP와는 별도 체계입니다.
 
 ```mermaid
 flowchart TB
@@ -98,7 +98,7 @@ flowchart TB
 
 | 모드 | 모듈 | 설명 |
 |------|------|------|
-| **Agent (Chat)** | `application/server.py` → `agentcore_client.run_agent` | 대화 이력 유지. `history_mode=Enable`, 태스크별 `runtimeSessionId` |
+| **Agent (Chat)** | `application/server.py` → `agentcore_client.run_agent` | 태스크별 `runtimeSessionId`로 대화 이력(checkpoint) 유지 |
 | LangGraph Runtime | `runtime_agent/langgraph/agent.py` | LangGraph StateGraph + `MultiServerMCPClient` + 내장 도구 |
 | Skill | `runtime_agent/langgraph/skill.py` · `runtime_agent/langgraph/skills/` | `SKILL.md` 기반 지침. UI `application/skills.list`에서 선택 후 `get_skill_instructions`로 로드 |
 | MCP (로컬 stdio) | `runtime_agent/langgraph/mcp_server_*.py` | Agent 컨테이너 안에서 subprocess로 기동 (`runtime_agent/langgraph/mcp_config.py`가 command/args 정의) |
@@ -806,7 +806,7 @@ response = client.create_agent_runtime(
 
 ### LangGraph checkpointer 연동
 
-기존 `MemorySaver`는 프로세스 메모리에만 저장되어 컨테이너가 재시작되면 history가 사라집니다. `history_mode=Enable`일 때 [runtime_agent/langgraph/chat.py](./runtime_agent/langgraph/chat.py)의 `ensure_checkpointer()`가 **AsyncSqliteSaver**를 초기화하고, `buildChatAgentWithHistory()`가 이를 checkpointer로 사용합니다.
+기존 `MemorySaver`는 프로세스 메모리에만 저장되어 컨테이너가 재시작되면 history가 사라집니다. [runtime_agent/langgraph/chat.py](./runtime_agent/langgraph/chat.py)의 `ensure_checkpointer()`가 **AsyncSqliteSaver**를 초기화하고, `buildChatAgentWithHistory()`가 이를 checkpointer로 사용합니다.
 
 | 구분 | Strands (참고) | LangGraph (본 프로젝트) |
 |------|----------------|-------------------------|
@@ -837,29 +837,24 @@ return workflow.compile(
 
 ### 클라이언트 runtimeSessionId
 
-Web UI 클라이언트([application/agentcore_client.py](./application/agentcore_client.py))는 **태스크별 `runtimeSessionId`**를 사용합니다. New task를 만들면 새 UUID가 부여되어 AgentCore checkpoint가 격리됩니다.
+Web UI 클라이언트([application/task_store.py](./application/task_store.py))는 **태스크 생성 시 `runtime_session_id`(UUID)** 를 발급하고, [application/agentcore_client.py](./application/agentcore_client.py)가 `invoke_agent_runtime` 호출마다 동일 ID를 전달합니다.
 
 ```python
-def runtime_session_id_for(user_id: str, history_mode: str) -> str:
-    if history_mode == "Enable" and user_id:
-        seed = f"agentcore-session-{user_id}"
-        session_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
-    else:
-        session_id = str(uuid.uuid4())
-    return session_id
+# task_store.py — create_task()
+runtime_session_id = str(uuid.uuid4())
 ```
 
 ```mermaid
 sequenceDiagram
-    participant UI as Streamlit
+    participant UI as Web UI
     participant Client as agentcore_client
     participant AC as AgentCore Runtime
     participant LG as LangGraph
 
-    UI->>Client: history_mode=Enable, user_id
-    Client->>AC: invoke(runtimeSessionId=uuid5(user_id))
+    UI->>Client: task.runtime_session_id, user_id
+    Client->>AC: invoke(runtimeSessionId=task.runtime_session_id)
     Note over AC: /mnt/workspace 마운트
-    AC->>LG: astream(..., thread_id=user_id:scope)
+    AC->>LG: astream(..., thread_id=scope)
     LG->>LG: AsyncSqliteSaver → langgraph_checkpoints.sqlite
     Client->>AC: 다음 턴 (동일 runtimeSessionId)
     LG->>LG: thread_id로 이전 checkpoint 로드
@@ -1121,15 +1116,15 @@ AgentCore Runtime에서 대화 history를 유지하려면 **`/mnt/workspace` 영
 
 #### runtimeSessionId (클라이언트)
 
-[application/agentcore_client.py](./application/agentcore_client.py)의 `runtime_session_id_for()`는 history 모드에서 user_id 기반 **고정 UUID**를 생성합니다. sessionStorage 복원은 **invoke마다 동일한 `runtimeSessionId`**가 전달될 때만 동작합니다.
+[application/task_store.py](./application/task_store.py)가 태스크별 `runtime_session_id`를 발급합니다. sessionStorage 복원은 **같은 태스크에서 invoke마다 동일한 `runtimeSessionId`**가 전달될 때만 동작합니다.
 
-- history 모드에서 `runtimeSessionId`는 `user_id`만으로 고정 (`agentcore_client.py`)
+- 태스크마다 `runtimeSessionId`가 UUID로 격리됨 (`task_store.py`)
 
 #### 배포·운영 체크리스트
 
 1. `get-agent-runtime`으로 `filesystemConfigurations`에 `sessionStorage` 존재 확인
 2. create/update 모두 `/mnt/workspace` mount path 포함
-3. history 모드에서 `runtimeSessionId`가 user_id마다 고정인지 확인
+3. 태스크별 `runtimeSessionId`가 create/invoke 전 구간에서 동일한지 확인
 4. runtime **version 업데이트 직후**에는 session data가 wipe됨 (정상 동작)
 5. CloudWatch(`/aws/bedrock-agentcore/runtimes/...`)에서 `checkpointer` 로그로 `initialized` vs `opened (existing)` 확인
 
@@ -1142,7 +1137,7 @@ AgentCore Runtime에서 대화 history를 유지하려면 **`/mnt/workspace` 영
 
 ### Message Trim
 
-LangGraph 에이전트([runtime_agent/langgraph/langgraph_agent.py](./runtime_agent/langgraph/langgraph_agent.py)의 `call_model`)는 LLM 호출 직전에 **HumanMessage 기준 최근 N턴**만 남깁니다. LangGraph state의 `messages`는 checkpointer에 그대로 두고, **모델에 넘기는 메시지만** trim합니다. `history_mode=Enable`/`Disable` 모두 동일하게 적용됩니다.
+LangGraph 에이전트([runtime_agent/langgraph/langgraph_agent.py](./runtime_agent/langgraph/langgraph_agent.py)의 `call_model`)는 LLM 호출 직전에 **HumanMessage 기준 최근 N턴**만 남깁니다. LangGraph state의 `messages`는 checkpointer에 그대로 두고, **모델에 넘기는 메시지만** trim합니다.
 
 **기본값:** `MAX_CONTEXT_TURNS = 5`
 
@@ -1199,32 +1194,20 @@ def trim_messages_by_human_turns(messages: list, max_turns: int) -> list:
             ...
 ```
 
-에이전트 config는 `chat.py`의 `create_agent()`에서 생성하며, `history_mode`와 관계없이 `max_turns`를 전달합니다.
+에이전트 config는 `chat.py`의 `create_agent()`에서 생성하며 `max_turns`를 전달합니다.
 
 ```python
 # runtime_agent/langgraph/chat.py — create_agent()
-    if history_mode == "Enable":
-        app = langgraph_agent.buildChatAgentWithHistory(tools)
-        config = {
-            "recursion_limit": 100,
-            "configurable": {
-                "thread_id": thread_id,
-                "tools": tools,
-                "system_prompt": system_prompt,
-            },
-            "max_turns": langgraph_agent.MAX_CONTEXT_TURNS,
-        }
-    else:
-        app = langgraph_agent.buildChatAgent(tools)
-        config = {
-            "recursion_limit": 100,
-            "configurable": {
-                "thread_id": thread_id,
-                "tools": tools,
-                "system_prompt": system_prompt,
-            },
-            "max_turns": langgraph_agent.MAX_CONTEXT_TURNS,
-        }
+    app = langgraph_agent.buildChatAgentWithHistory(tools)
+    agent_config = {
+        "recursion_limit": 100,
+        "configurable": {
+            "thread_id": thread_id,
+            "tools": tools,
+            "system_prompt": system_prompt,
+        },
+        "max_turns": langgraph_agent.MAX_CONTEXT_TURNS,
+    }
 ```
 
 **`max_turns=5`의 의미**
@@ -1680,7 +1663,7 @@ Observability 다음 단계로 [evaluation.py](./runtime_agent/langgraph/evaluat
 Online evaluation은 같은 `session.id`(대개 AgentCore `runtimeSessionId`)의 span을 모은 뒤, **마지막 활동 이후 N분 유휴**하면 세션이 끝난 것으로 보고 평가합니다.
 
 - 기본(서비스): 15분 → 이 프로젝트는 **5분**으로 설정
-- Chat 모드(`history_mode=Enable`)는 user별 `runtimeSessionId`가 고정이라 턴이 한 세션에 계속 쌓임
+- 태스크별 `runtimeSessionId`로 같은 대화 턴이 한 세션에 계속 쌓임
 - timeout이 길면 세션 span이 [한도](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/bedrock-agentcore-limits.html)(**1000 spans / 15 MB**)를 넘어 `ValidationException`이 납니다
 
 에이전트 대화 세션을 끊는 설정이 아니라, **평가용 세션 경계를 나누는 타이머**입니다. 값은 `evaluation.py`의 `DEFAULT_SESSION_TIMEOUT_MINUTES`에서 바꾸며, installer 재실행 시 기존 config를 `update_online_evaluation_config`로 갱신합니다.

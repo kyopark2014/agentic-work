@@ -212,11 +212,8 @@ async def agent_langgraph(payload):
             tool_name_by_id[tool_use_id] = tool_name
             if isinstance(args, dict):
                 if not args:
-                    previous = last_tool_args_json.get(tool_use_id)
-                    if previous and previous != "{}":
-                        return None
-                else:
-                    tool_args_by_id[tool_use_id] = args
+                    return None
+                tool_args_by_id[tool_use_id] = args
             args_json = json.dumps(args, ensure_ascii=False, sort_keys=True)
             if last_tool_args_json.get(tool_use_id) == args_json:
                 return None
@@ -233,6 +230,53 @@ async def agent_langgraph(payload):
                 "input": args,
                 "toolUseId": tool_use_id,
             }
+
+        def tool_call_fields(tool_call) -> tuple[str, str, dict]:
+            if isinstance(tool_call, dict):
+                return (
+                    tool_call.get("id", ""),
+                    tool_call.get("name", ""),
+                    tool_call.get("args", {}) if isinstance(tool_call.get("args"), dict) else {},
+                )
+            return (
+                getattr(tool_call, "id", "") or "",
+                getattr(tool_call, "name", "") or "",
+                getattr(tool_call, "args", {}) or {},
+            )
+
+        def args_from_ai_message(message: AIMessage, tool_use_id: str) -> dict:
+            for tc in getattr(message, "tool_calls", None) or []:
+                tid, _, args = tool_call_fields(tc)
+                if tid == tool_use_id and args:
+                    return args
+            content = message.content
+            if isinstance(content, list):
+                for item in content:
+                    if not isinstance(item, dict) or item.get("type") != "tool_use":
+                        continue
+                    if item.get("id") == tool_use_id:
+                        input_val = item.get("input")
+                        if isinstance(input_val, dict) and input_val:
+                            return input_val
+            return {}
+
+        async def args_from_graph_state(tool_use_id: str) -> dict:
+            try:
+                state = await app.aget_state(config)
+            except Exception:
+                logger.exception("Failed to read graph state for tool args")
+                return {}
+            messages = (state.values or {}).get("messages", [])
+            for message in reversed(messages):
+                if isinstance(message, AIMessage):
+                    args = args_from_ai_message(message, tool_use_id)
+                    if args:
+                        return args
+            return {}
+
+        def yield_tool_args(tool_use_id: str, tool_name: str, args) -> dict | None:
+            payload = remember_tool_args(tool_use_id, tool_name, args)
+            return payload
 
         def resolved_tool_args(tool_use_id: str) -> dict:
             if tool_use_id in tool_args_by_id:
@@ -285,7 +329,7 @@ async def agent_langgraph(payload):
                             if "input" in item and item.get("input") is not None:
                                 input_val = item.get("input")
                                 if isinstance(input_val, dict) and input_val:
-                                    payload = remember_tool_args(
+                                    payload = yield_tool_args(
                                         tool_use_id,
                                         tool_name_by_id.get(tool_use_id, tool_name),
                                         input_val,
@@ -301,7 +345,7 @@ async def agent_langgraph(payload):
                                 if tool_use_id and args_raw:
                                     try:
                                         args_obj = json.loads(args_raw)
-                                        payload = remember_tool_args(
+                                        payload = yield_tool_args(
                                             tool_use_id,
                                             tool_name_by_id.get(tool_use_id, tool_name),
                                             args_obj,
@@ -324,7 +368,7 @@ async def agent_langgraph(payload):
                             args = getattr(tc, "args", {}) or {}
                         if not tid or not name or not args:
                             continue
-                        payload = remember_tool_args(tid, name, args)
+                        payload = yield_tool_args(tid, name, args)
                         if payload:
                             yield payload
 
@@ -339,6 +383,14 @@ async def agent_langgraph(payload):
                             text_part = item.get("text", "")
                             if text_part:
                                 text_parts.append(text_part)
+                        elif isinstance(item, dict) and item.get("type") == "tool_use":
+                            tool_use_id = item.get("id", "")
+                            tool_name = item.get("name", "") or tool_name_by_id.get(tool_use_id, "")
+                            input_val = item.get("input")
+                            if tool_use_id and tool_name and isinstance(input_val, dict) and input_val:
+                                payload = yield_tool_args(tool_use_id, tool_name, input_val)
+                                if payload:
+                                    yield payload
                 for text_part in text_parts:
                     if tool_used:
                         result_text = text_part
@@ -360,7 +412,7 @@ async def agent_langgraph(payload):
                             args = getattr(tc, "args", {}) or {}
                         if not tid or not name or not args:
                             continue
-                        payload = remember_tool_args(tid, name, args)
+                        payload = yield_tool_args(tid, name, args)
                         if payload:
                             yield payload
 
@@ -371,7 +423,9 @@ async def agent_langgraph(payload):
                 tool_name = chunk.name or tool_name_by_id.get(tool_use_id, "")
                 if tool_use_id and tool_name:
                     args_obj = resolved_tool_args(tool_use_id)
-                    payload = remember_tool_args(tool_use_id, tool_name, args_obj)
+                    if not args_obj:
+                        args_obj = await args_from_graph_state(tool_use_id)
+                    payload = yield_tool_args(tool_use_id, tool_name, args_obj)
                     if payload:
                         yield payload
                 yield {
@@ -387,7 +441,7 @@ async def agent_langgraph(payload):
                 args_obj = json.loads(args_raw)
             except json.JSONDecodeError:
                 continue
-            payload = remember_tool_args(
+            payload = yield_tool_args(
                 tool_use_id,
                 tool_name_by_id.get(tool_use_id, ""),
                 args_obj,
