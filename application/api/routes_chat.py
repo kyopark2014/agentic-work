@@ -17,8 +17,18 @@ logger = logging.getLogger("routes_chat")
 
 router = APIRouter(prefix="/api/tasks", tags=["chat"])
 
-_TOOL_INPUT_RE = re.compile(r"^Tool: (.+?), Input: (.+)$", re.DOTALL)
+_TOOL_INPUT_RE = re.compile(r"^Tool: (.+?), Input:\s*(.*)$", re.DOTALL)
 _TOOL_RESULT_RE = re.compile(r"^Tool Result: (.+)$", re.DOTALL)
+
+
+def _parse_tool_input(raw_input: str) -> Any:
+    stripped = raw_input.strip()
+    if not stripped:
+        return {}
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return raw_input
 
 
 class ChatRequest(BaseModel):
@@ -91,12 +101,30 @@ def _set_final_text_in_timeline(
 
 
 def _upsert_tool_event(tool_events: list[dict[str, Any]], mapped: dict[str, Any]) -> None:
+    if mapped["type"] == "info":
+        data = str(mapped.get("data", ""))
+        if _TOOL_INPUT_RE.match(data) or _TOOL_RESULT_RE.match(data):
+            return
+        tool_events.append(mapped)
+        return
+
     if mapped["type"] in ("tool", "tool_result"):
         tool_use_id = mapped.get("toolUseId")
         for i, existing in enumerate(tool_events):
             if existing.get("type") == mapped["type"] and existing.get("toolUseId") == tool_use_id:
                 tool_events[i] = mapped
                 return
+        if mapped["type"] == "tool":
+            tool_name = mapped.get("tool")
+            if tool_name:
+                for i in range(len(tool_events) - 1, -1, -1):
+                    existing = tool_events[i]
+                    if existing.get("type") == "tool" and existing.get("tool") == tool_name:
+                        if mapped.get("toolUseId") and mapped["toolUseId"] != tool_name:
+                            tool_events[i] = mapped
+                        else:
+                            tool_events[i] = {**existing, **mapped}
+                        return
     tool_events.append(mapped)
 
 
@@ -165,11 +193,7 @@ def _map_sink_event(event: dict[str, Any]) -> dict[str, Any] | None:
         tool_match = _TOOL_INPUT_RE.match(str(data))
         if tool_match:
             tool_name = tool_match.group(1)
-            raw_input = tool_match.group(2)
-            try:
-                tool_input = json.loads(raw_input)
-            except json.JSONDecodeError:
-                tool_input = raw_input
+            tool_input = _parse_tool_input(tool_match.group(2))
             return {
                 "type": "tool",
                 "tool": tool_name,

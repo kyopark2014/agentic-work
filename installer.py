@@ -4511,6 +4511,116 @@ def _ensure_private_subnets(vpc_info: Dict[str, str]) -> List[str]:
     return available_subnets
 
 
+def _ecs_primary_deployment_ready(service: Dict[str, object]) -> bool:
+    """Return True when the PRIMARY deployment is serving the desired task count."""
+    if service.get("status") != "ACTIVE":
+        return False
+
+    deployments = service.get("deployments") or []
+    primary = next((d for d in deployments if d.get("status") == "PRIMARY"), None)
+    if not primary:
+        return False
+
+    desired = primary.get("desiredCount", 0)
+    running = primary.get("runningCount", 0)
+    pending = primary.get("pendingCount", 0)
+    return (
+        desired > 0
+        and running == desired
+        and pending == 0
+        and service.get("runningCount", 0) == service.get("desiredCount", 0)
+        and service.get("pendingCount", 0) == 0
+    )
+
+
+def _describe_ecs_service(cluster_name: str, service_name: str) -> Dict[str, object]:
+    response = ecs_client.describe_services(cluster=cluster_name, services=[service_name])
+    services = response.get("services") or []
+    if not services:
+        raise RuntimeError(f"ECS service not found: {service_name}")
+    return services[0]
+
+
+def _wait_for_ecs_service_ready(
+    cluster_name: str,
+    service_name: str,
+    *,
+    target_group_arn: Optional[str] = None,
+    timeout_seconds: int = 600,
+    poll_interval_seconds: int = 15,
+) -> None:
+    """Wait until the PRIMARY ECS deployment is ready.
+
+    The boto3 ``services_stable`` waiter also blocks on DRAINING deployments while
+    ALB target deregistration (default 300s) completes. The service is already
+    usable once the PRIMARY deployment reaches the desired task count.
+    """
+    deadline = time.time() + timeout_seconds
+    attempt = 0
+
+    while time.time() < deadline:
+        attempt += 1
+        service = _describe_ecs_service(cluster_name, service_name)
+        deployments = service.get("deployments") or []
+        primary = next((d for d in deployments if d.get("status") == "PRIMARY"), None)
+        draining = [d for d in deployments if d.get("status") == "DRAINING"]
+
+        if _ecs_primary_deployment_ready(service):
+            healthy_targets = 0
+            if target_group_arn:
+                try:
+                    health = elbv2_client.describe_target_health(
+                        TargetGroupArn=target_group_arn
+                    )
+                    healthy_targets = sum(
+                        1
+                        for target in health.get("TargetHealthDescriptions", [])
+                        if target.get("TargetHealth", {}).get("State") == "healthy"
+                    )
+                except ClientError as exc:
+                    logger.debug(f"  Target health check skipped: {exc}")
+
+            if not target_group_arn or healthy_targets > 0:
+                if draining:
+                    logger.info(
+                        "  ✓ ECS PRIMARY deployment ready "
+                        f"(running={service.get('runningCount')}/{service.get('desiredCount')}); "
+                        f"{len(draining)} draining deployment(s) still cleaning up"
+                    )
+                else:
+                    logger.info(
+                        "  ✓ ECS service stable "
+                        f"(running={service.get('runningCount')}/{service.get('desiredCount')})"
+                    )
+                return
+
+        primary_rollout = primary.get("rolloutState") if primary else "UNKNOWN"
+        logger.info(
+            "  ECS wait attempt %s: running=%s/%s pending=%s primary_rollout=%s draining=%s",
+            attempt,
+            service.get("runningCount"),
+            service.get("desiredCount"),
+            service.get("pendingCount"),
+            primary_rollout,
+            len(draining),
+        )
+        time.sleep(poll_interval_seconds)
+
+    service = _describe_ecs_service(cluster_name, service_name)
+    if _ecs_primary_deployment_ready(service):
+        logger.warning(
+            "  ECS wait timed out after %ss, but PRIMARY deployment is ready; continuing",
+            timeout_seconds,
+        )
+        return
+
+    raise TimeoutError(
+        f"Timed out after {timeout_seconds}s waiting for ECS service {service_name} "
+        f"(running={service.get('runningCount')}/{service.get('desiredCount')}, "
+        f"pending={service.get('pendingCount')})"
+    )
+
+
 def deploy_ecs_service(
     vpc_info: Dict[str, str],
     alb_info: Dict[str, str],
@@ -4595,7 +4705,6 @@ def deploy_ecs_service(
                 service=service_name,
                 taskDefinition=task_definition_arn,
                 desiredCount=1,
-                forceNewDeployment=True,
             )
             logger.info("  ✓ Updated ECS service with new task definition")
     except ClientError:
@@ -4629,8 +4738,11 @@ def deploy_ecs_service(
         logger.info(f"  ✓ Created ECS service: {service_name}")
 
     logger.info("  Waiting for ECS service to become stable...")
-    waiter = ecs_client.get_waiter("services_stable")
-    waiter.wait(cluster=cluster_name, services=[service_name])
+    _wait_for_ecs_service_ready(
+        cluster_name,
+        service_name,
+        target_group_arn=tg_arn,
+    )
 
     logger.info(f"✓ ECS service deployed in private subnets: {', '.join(private_subnets)}")
     return {

@@ -3,7 +3,16 @@ import type { ToolEvent } from "../types";
 import { api } from "../api";
 import { uiError, uiLog, uiWarn } from "../debug";
 
+const TOOL_INPUT_INFO_RE = /^Tool: .+?, Input:/s;
+const TOOL_RESULT_INFO_RE = /^Tool Result: /s;
+
 function upsertToolEvent(prev: ToolEvent[], event: ToolEvent): ToolEvent[] {
+  if (event.type === "info") {
+    const data = event.data ?? "";
+    if (TOOL_INPUT_INFO_RE.test(data) || TOOL_RESULT_INFO_RE.test(data)) {
+      return prev;
+    }
+  }
   if (event.type === "tool" || event.type === "tool_result") {
     const idx = prev.findIndex(
       (e) => e.type === event.type && e.toolUseId === event.toolUseId,
@@ -12,6 +21,19 @@ function upsertToolEvent(prev: ToolEvent[], event: ToolEvent): ToolEvent[] {
       const next = [...prev];
       next[idx] = event;
       return next;
+    }
+    if (event.type === "tool" && event.tool) {
+      const byName = prev.findIndex(
+        (e) => e.type === "tool" && e.tool === event.tool,
+      );
+      if (byName >= 0) {
+        const next = [...prev];
+        next[byName] =
+          event.toolUseId && event.toolUseId !== event.tool
+            ? event
+            : { ...next[byName], ...event };
+        return next;
+      }
     }
   }
   return [...prev, event];
