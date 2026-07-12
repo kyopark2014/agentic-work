@@ -4229,8 +4229,97 @@ def _require_arm64_build_host(context: str) -> None:
 NATIVE_BUILDX_BUILDER = "ecs-native-builder"
 
 
+def _list_docker_driver_builders() -> list[str]:
+    """Return buildx builder names that use the docker driver."""
+    result = subprocess.run(
+        ["docker", "buildx", "ls"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+
+    builders: list[str] = []
+    for line in result.stdout.splitlines():
+        # Skip header and node rows (" \_ nodename ...")
+        if not line.strip() or line.startswith("NAME") or line[:1].isspace():
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        name = parts[0].rstrip("*")
+        driver = parts[1]
+        # Exact match: "docker" only (not "docker-container")
+        if driver == "docker":
+            builders.append(name)
+    return builders
+
+
+def _current_docker_context() -> Optional[str]:
+    result = subprocess.run(
+        ["docker", "context", "show"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    name = result.stdout.strip()
+    return name or None
+
+
+def _use_buildx_builder(name: str) -> None:
+    use = subprocess.run(
+        ["docker", "buildx", "use", name],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if use.returncode != 0:
+        err = (use.stderr or use.stdout).strip()
+        raise RuntimeError(f"Failed to select buildx builder '{name}': {err}")
+
+
+def _select_existing_docker_builder() -> Optional[str]:
+    """Pick a usable docker-driver builder for the current Docker context."""
+    existing = _list_docker_driver_builders()
+    if not existing:
+        return None
+
+    context = _current_docker_context()
+    # Prefer the builder matching the active context (e.g. desktop-linux),
+    # then other well-known local builders. "default" often requires switching
+    # Docker context and fails on Docker Desktop.
+    candidates: list[str] = []
+    for name in (context, "desktop-linux", "default", *existing):
+        if name and name in existing and name not in candidates:
+            candidates.append(name)
+
+    last_error = None
+    for name in candidates:
+        try:
+            _use_buildx_builder(name)
+            return name
+        except RuntimeError as exc:
+            last_error = exc
+            continue
+
+    if last_error:
+        raise last_error
+    return None
+
+
 def _ensure_native_buildx_builder() -> None:
-    """Ensure a local docker-driver buildx builder for reliable ECR push."""
+    """Ensure a local docker-driver buildx builder for reliable ECR push.
+
+    Docker only allows a single named instance of the docker driver in many
+    environments (Docker Desktop already provides default/desktop-linux).
+    Prefer reusing an existing docker-driver builder over creating a new one.
+    """
     inspect = subprocess.run(
         ["docker", "buildx", "inspect", NATIVE_BUILDX_BUILDER],
         capture_output=True,
@@ -4238,33 +4327,42 @@ def _ensure_native_buildx_builder() -> None:
         timeout=60,
         check=False,
     )
-    if inspect.returncode != 0:
-        create = subprocess.run(
-            [
-                "docker", "buildx", "create",
-                "--name", NATIVE_BUILDX_BUILDER,
-                "--driver", "docker",
-                "--use",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            check=False,
-        )
-        if create.returncode != 0:
-            err = (create.stderr or create.stdout).strip()
-            raise RuntimeError(f"Failed to create buildx builder: {err}")
+    if inspect.returncode == 0:
+        _use_buildx_builder(NATIVE_BUILDX_BUILDER)
     else:
-        use = subprocess.run(
-            ["docker", "buildx", "use", NATIVE_BUILDX_BUILDER],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-        if use.returncode != 0:
-            err = (use.stderr or use.stdout).strip()
-            raise RuntimeError(f"Failed to select buildx builder: {err}")
+        selected = _select_existing_docker_builder()
+        if selected:
+            logger.info(
+                f"  Reusing existing docker-driver buildx builder: {selected} "
+                f"(cannot create additional docker-driver instances)"
+            )
+        else:
+            create = subprocess.run(
+                [
+                    "docker", "buildx", "create",
+                    "--name", NATIVE_BUILDX_BUILDER,
+                    "--driver", "docker",
+                    "--use",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            if create.returncode != 0:
+                err = (create.stderr or create.stdout).strip()
+                # Last resort: reuse whatever docker-driver builder exists
+                if "additional instances of driver" in err:
+                    selected = _select_existing_docker_builder()
+                    if selected:
+                        logger.info(
+                            f"  Reusing existing docker-driver buildx builder: {selected} "
+                            f"after create failed: {err}"
+                        )
+                    else:
+                        raise RuntimeError(f"Failed to create buildx builder: {err}")
+                else:
+                    raise RuntimeError(f"Failed to create buildx builder: {err}")
 
     bootstrap = subprocess.run(
         ["docker", "buildx", "inspect", "--bootstrap"],
