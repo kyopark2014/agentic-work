@@ -78,7 +78,7 @@ def remove_task(task_id: str, request: Request):
 @router.get("/{task_id}/messages")
 def get_messages(task_id: str, request: Request):
     user_id = require_user_id(request)
-    task = task_store.get_task(task_id, user_id)
+    task = task_store.get_task_refreshing(task_id, user_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     return {"messages": task_store.list_messages(task_id)}

@@ -262,7 +262,7 @@ def _run_agent_thread(
 @router.post("/{task_id}/chat")
 def chat_stream(task_id: str, body: ChatRequest, request: Request):
     user_id = require_user_id(request)
-    task = task_store.get_task(task_id, user_id)
+    task = task_store.get_task_refreshing(task_id, user_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 

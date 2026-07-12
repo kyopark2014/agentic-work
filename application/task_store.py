@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from application.task_store_persistence import (
+    flush_persist,
     schedule_persist,
     working_db_path,
 )
@@ -128,6 +129,23 @@ def get_task(task_id: str, user_id: str | None = None) -> dict[str, Any] | None:
     return _row_to_task(row) if row else None
 
 
+def get_task_refreshing(task_id: str, user_id: str | None = None) -> dict[str, Any] | None:
+    """Return a task, reloading from S3 Files once if missing on this instance."""
+    task = get_task(task_id, user_id)
+    if task:
+        return task
+    try:
+        from application.task_store_persistence import persistence_enabled, restore_tasks_db
+
+        if not persistence_enabled():
+            return None
+        restore_tasks_db()
+        init_db()
+    except Exception:
+        return None
+    return get_task(task_id, user_id)
+
+
 def create_task(
     user_id: str,
     *,
@@ -162,7 +180,9 @@ def create_task(
                 now,
             ),
         )
-    _after_write()
+    # Flush immediately so sibling ECS tasks / replacements can see the row
+    # (debounced persist alone loses creates during rolling deploys).
+    flush_persist()
     return get_task(task_id)  # type: ignore[return-value]
 
 

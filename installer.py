@@ -4630,6 +4630,7 @@ def create_alb_target_group_for_ecs(vpc_info: Dict[str, str]) -> str:
     """Create ALB target group for ECS Fargate (IP target type)."""
     target_port = 8501
     target_group_name = f"TG-for-{project_name}"
+    tg_arn = None
 
     try:
         tgs = elbv2_client.describe_target_groups(Names=[target_group_name])
@@ -4640,27 +4641,44 @@ def create_alb_target_group_for_ecs(vpc_info: Dict[str, str]) -> str:
                     f"Existing target group {target_group_name} uses TargetType="
                     f"{tg.get('TargetType')}. Delete it or rename before ECS deployment."
                 )
-            logger.warning(f"  Target group already exists: {tg['TargetGroupArn']}")
-            return tg["TargetGroupArn"]
+            tg_arn = tg["TargetGroupArn"]
+            logger.warning(f"  Target group already exists: {tg_arn}")
     except ClientError as e:
         if e.response["Error"]["Code"] != "TargetGroupNotFound":
             raise
 
-    tg_response = elbv2_client.create_target_group(
-        Name=target_group_name,
-        Protocol="HTTP",
-        Port=target_port,
-        VpcId=vpc_info["vpc_id"],
-        TargetType="ip",
-        HealthCheckProtocol="HTTP",
-        HealthCheckPath="/api/health",
-        HealthCheckIntervalSeconds=30,
-        HealthCheckTimeoutSeconds=5,
-        HealthyThresholdCount=2,
-        UnhealthyThresholdCount=3,
-    )
-    tg_arn = tg_response["TargetGroups"][0]["TargetGroupArn"]
-    logger.info(f"  ✓ Created ECS target group: {tg_arn}")
+    if not tg_arn:
+        tg_response = elbv2_client.create_target_group(
+            Name=target_group_name,
+            Protocol="HTTP",
+            Port=target_port,
+            VpcId=vpc_info["vpc_id"],
+            TargetType="ip",
+            HealthCheckProtocol="HTTP",
+            HealthCheckPath="/api/health",
+            HealthCheckIntervalSeconds=30,
+            HealthCheckTimeoutSeconds=5,
+            HealthyThresholdCount=2,
+            UnhealthyThresholdCount=3,
+        )
+        tg_arn = tg_response["TargetGroups"][0]["TargetGroupArn"]
+        logger.info(f"  ✓ Created ECS target group: {tg_arn}")
+
+    # SQLite working-copy is per-task; stickiness keeps create/chat on the same target
+    # during rolling deploys when two tasks are briefly registered.
+    try:
+        elbv2_client.modify_target_group_attributes(
+            TargetGroupArn=tg_arn,
+            Attributes=[
+                {"Key": "stickiness.enabled", "Value": "true"},
+                {"Key": "stickiness.type", "Value": "lb_cookie"},
+                {"Key": "stickiness.lb_cookie.duration_seconds", "Value": "86400"},
+            ],
+        )
+        logger.info("  ✓ Enabled ALB target group stickiness (lb_cookie, 86400s)")
+    except ClientError as e:
+        logger.warning(f"  Could not enable target group stickiness: {e}")
+
     return tg_arn
 
 
