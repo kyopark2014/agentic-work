@@ -101,40 +101,46 @@ def _checkpoint_sqlite(db_path: str) -> None:
         conn.close()
 
 
+def _remove_db_files(path: str) -> None:
+    for candidate in (path, path + "-wal", path + "-shm"):
+        try:
+            if os.path.isfile(candidate):
+                os.remove(candidate)
+        except OSError as exc:
+            logger.warning("Could not remove %s: %s", candidate, exc)
+
+
 def restore_tasks_db() -> None:
-    """Copy durable tasks.db from S3 Files mount into the local working path."""
+    """Prepare working tasks.db from S3 Files or start fresh when persistence is enabled."""
     working = working_db_path()
     persistent = persistent_db_path()
     if not persistence_enabled():
         logger.info("Task DB persistence disabled (no writable mount at %s)", mount_dir())
         return
 
-    if not _db_ready(persistent):
-        if os.path.isfile(persistent):
-            logger.warning(
-                "Persistent task DB empty, skip restore: %s (size=%s)",
-                persistent,
-                os.path.getsize(persistent),
-            )
-        else:
-            logger.info("No persistent task DB yet at %s", persistent)
+    os.makedirs(os.path.dirname(working), exist_ok=True)
+
+    if _db_ready(persistent):
+        _remove_db_files(working)
+        _copy_db_files(persistent, working)
+        logger.info("Restored task DB from S3 Files: %s -> %s", persistent, working)
         return
 
-    if _db_ready(working):
-        try:
-            if os.path.getmtime(persistent) <= os.path.getmtime(working):
-                logger.info(
-                    "Working task DB is newer, skip restore: working=%s persistent=%s",
-                    working,
-                    persistent,
-                )
-                return
-        except OSError as exc:
-            logger.warning("Could not compare task DB mtimes: %s", exc)
+    if os.path.isfile(persistent):
+        logger.warning(
+            "Persistent task DB empty, starting fresh: %s (size=%s)",
+            persistent,
+            os.path.getsize(persistent),
+        )
+    else:
+        logger.info("No persistent task DB yet at %s; creating fresh working DB", persistent)
 
-    os.makedirs(os.path.dirname(working), exist_ok=True)
-    _copy_db_files(persistent, working)
-    logger.info("Restored task DB from S3 Files: %s -> %s", persistent, working)
+    if any(os.path.isfile(working + suffix) for suffix in ("", "-wal", "-shm")):
+        logger.info(
+            "Removing pre-existing working task DB (e.g. image-baked test data): %s",
+            working,
+        )
+        _remove_db_files(working)
 
 
 def persist_tasks_db(*, force: bool = False) -> None:

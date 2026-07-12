@@ -644,7 +644,7 @@ Runtime checkpoint(`checkpoints/{runtime_session_id}/`)와 **서브 경로만 �
 #### 동작 흐름
 
 ```text
-[ECS 시작]  restore: S3 Files persistent → working (mtime 비교)
+[ECS 시작]  restore: S3 Files persistent → working (없으면 working 삭제 후 신규 생성)
 [실행 중]   task_store → application/data/tasks.db
 [변경 후]   schedule_persist (20초 debounce) / chat 종료·shutdown 시 flush_persist
 [persist]   PRAGMA wal_checkpoint → working → persistent copy
@@ -676,6 +676,8 @@ Runtime checkpoint(`checkpoints/{runtime_session_id}/`)와 **서브 경로만 �
 | `TASK_DB_PROJECT` | `agentic-work` (project name) |
 
 로컬 개발(`uvicorn`)에서는 `/mnt/app-data`가 없으므로 **기존처럼 `application/data/tasks.db`만** 사용합니다.
+
+Docker 이미지에는 `application/data/`를 포함하지 않습니다(`.dockerignore`). ECS 첫 기동 시 S3 Files에 persistent DB가 없으면 이미지에 포함된 테스트 DB 대신 **빈 DB**를 생성합니다.
 
 #### 배포·확인
 
