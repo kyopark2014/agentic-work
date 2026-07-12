@@ -478,6 +478,36 @@ application/web/
 └── dist/                     # npm run build 결과 (server.py가 서빙)
 ```
 
+### Markdown 렌더링
+
+Assistant 메시지는 plain text가 아니라 **Markdown으로 렌더링**됩니다. 별도 파서를 직접 구현하지 않고, `react-markdown` + GFM 플러그인 + CSS 조합을 사용합니다.
+
+| 구분 | 내용 |
+|------|------|
+| 컴포넌트 | [`MessageBubble.tsx`](./application/web/src/components/MessageBubble.tsx)의 `MarkdownText` |
+| 라이브러리 | `react-markdown` — MD → React 컴포넌트 |
+| GFM 확장 | `remark-gfm` — 테이블, 체크리스트, 취소선, 자동 링크 등 |
+| 스타일 | [`agent.css`](./application/web/src/styles/agent.css)의 `.message-bubble` |
+
+```tsx
+function MarkdownText({ content }: { content: string }) {
+  return <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>;
+}
+```
+
+- **user** 메시지: plain text 그대로 표시
+- **assistant** 메시지: `MarkdownText`로 렌더 (`role === "assistant"`일 때만)
+
+`.message-bubble` 하위에서 렌더된 HTML 태그를 꾸밉니다.
+
+| 선택자 | 역할 |
+|--------|------|
+| `p` | 단락 간격 |
+| `pre` | 코드 블록 배경·가로 스크롤 |
+| `table` / `th` / `td` | 테이블 테두리·줄바꿈 |
+| `code` | 모노스페이스 폰트 |
+| `img` | `max-width: 100%` |
+
 ### REST / SSE API
 
 | Method | Path | 설명 |
