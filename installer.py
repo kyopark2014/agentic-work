@@ -31,6 +31,10 @@ AGENTCORE_WEBSEARCH_GATEWAY_NAME = "gateway-websearch"
 AGENTCORE_WEBSEARCH_TARGET_NAME = "websearch"
 git_name = "agentic-work"
 
+# SSE streaming: long tool runs can go 30s+ without tokens; CloudFront/ALB must stay open.
+SSE_ORIGIN_READ_TIMEOUT_SECONDS = 120
+ALB_IDLE_TIMEOUT_SECONDS = 120
+
 
 def agent_runtime_name(project_name: str) -> str:
     """Return Bedrock AgentCore runtime name (e.g. agentic_work)."""
@@ -2767,6 +2771,7 @@ def create_alb(vpc_info: Dict[str, str]) -> Dict[str, str]:
         if albs["LoadBalancers"]:
             alb = albs["LoadBalancers"][0]
             logger.warning(f"ALB already exists: {alb['DNSName']}")
+            ensure_alb_idle_timeout(alb["LoadBalancerArn"])
             return {
                 "arn": alb["LoadBalancerArn"],
                 "dns": alb["DNSName"]
@@ -2850,6 +2855,7 @@ def create_alb(vpc_info: Dict[str, str]) -> Dict[str, str]:
     alb_dns = response["LoadBalancers"][0]["DNSName"]
     
     logger.info(f"✓ ALB created: {alb_dns}")
+    ensure_alb_idle_timeout(alb_arn)
     
     return {
         "arn": alb_arn,
@@ -3666,7 +3672,81 @@ def _reuse_cloudfront_distribution(dist: Dict) -> Dict[str, str]:
             f"Could not update CloudFront cache behaviors (reusing distribution anyway): {e}"
         )
 
+    try:
+        _ensure_cloudfront_alb_origin_timeouts(dist_id)
+    except Exception as e:
+        logger.warning(
+            f"Could not update CloudFront ALB origin timeouts (reusing distribution anyway): {e}"
+        )
+
     return {"id": dist_id, "domain": domain}
+
+
+def ensure_alb_idle_timeout(
+    alb_arn: str, timeout_seconds: int = ALB_IDLE_TIMEOUT_SECONDS
+) -> None:
+    """Raise ALB idle timeout so long SSE streams are not cut at 60s."""
+    try:
+        elbv2_client.modify_load_balancer_attributes(
+            LoadBalancerArn=alb_arn,
+            Attributes=[
+                {
+                    "Key": "idle_timeout.timeout_seconds",
+                    "Value": str(timeout_seconds),
+                }
+            ],
+        )
+        logger.info(f"  ✓ ALB idle timeout set to {timeout_seconds}s")
+    except ClientError as e:
+        logger.warning(f"Could not set ALB idle timeout: {e}")
+
+
+def _cloudfront_alb_custom_origin_config() -> Dict[str, object]:
+    return {
+        "HTTPPort": 80,
+        "HTTPSPort": 443,
+        "OriginProtocolPolicy": "http-only",
+        "OriginReadTimeout": SSE_ORIGIN_READ_TIMEOUT_SECONDS,
+        "OriginKeepaliveTimeout": 5,
+    }
+
+
+def _ensure_cloudfront_alb_origin_timeouts(
+    dist_id: str, timeout_seconds: int = SSE_ORIGIN_READ_TIMEOUT_SECONDS
+) -> None:
+    """Ensure CloudFront ALB origin read timeout supports long SSE tool runs."""
+    dist_config_response = cloudfront_client.get_distribution_config(Id=dist_id)
+    dist_config = dist_config_response["DistributionConfig"]
+    etag = dist_config_response["ETag"]
+
+    alb_origin_id = f"alb-{project_name}"
+    origins = dist_config.get("Origins", {}).get("Items", [])
+    updated = False
+    for origin in origins:
+        if origin.get("Id") != alb_origin_id:
+            continue
+        custom = origin.setdefault("CustomOriginConfig", {})
+        if custom.get("OriginReadTimeout") == timeout_seconds:
+            logger.info(
+                f"  CloudFront ALB origin read timeout already {timeout_seconds}s"
+            )
+            return
+        custom["OriginReadTimeout"] = timeout_seconds
+        custom.setdefault("OriginKeepaliveTimeout", 5)
+        updated = True
+        break
+
+    if not updated:
+        logger.warning(f"  CloudFront ALB origin {alb_origin_id} not found; skipping timeout update")
+        return
+
+    cloudfront_client.update_distribution(
+        Id=dist_id,
+        DistributionConfig=dist_config,
+        IfMatch=etag,
+    )
+    logger.info(f"  ✓ CloudFront ALB origin read timeout set to {timeout_seconds}s")
+    logger.warning("  Note: CloudFront origin timeout changes may take 15-20 minutes to deploy")
 
 
 def _cloudfront_s3_cache_behavior(path_pattern: str, s3_origin_id: str) -> Dict[str, object]:
@@ -3821,11 +3901,7 @@ def create_cloudfront_distribution(alb_info: Dict[str, str], s3_bucket_name: str
                 {
                     "Id": f"alb-{project_name}",
                     "DomainName": alb_info["dns"],
-                    "CustomOriginConfig": {
-                        "HTTPPort": 80,
-                        "HTTPSPort": 443,
-                        "OriginProtocolPolicy": "http-only"
-                    },
+                    "CustomOriginConfig": _cloudfront_alb_custom_origin_config(),
                     "CustomHeaders": {
                         "Quantity": 0,
                         "Items": []
@@ -4648,6 +4724,7 @@ def deploy_ecs_service(
     image_uri: str,
     app_environment: Dict[str, str],
     log_group_name: str,
+    s3_files_info: Optional[Dict[str, object]] = None,
 ) -> Dict[str, str]:
     """Create ECS task definition and Fargate service behind the ALB."""
     logger.info("[9/10] Deploying ECS Fargate service")
@@ -4667,49 +4744,92 @@ def deploy_ecs_service(
     task_family = f"task-for-{project_name}"
     service_name = f"service-for-{project_name}"
     container_name = "app"
+    app_data_mount = "/mnt/app-data"
 
-    task_def_response = ecs_client.register_task_definition(
-        family=task_family,
-        networkMode="awsvpc",
-        requiresCompatibilities=["FARGATE"],
-        cpu="1024",
-        memory="2048",
-        runtimePlatform=_ecs_runtime_platform(),
-        executionRoleArn=ecs_roles["execution_role_arn"],
-        taskRoleArn=ecs_roles["task_role_arn"],
-        containerDefinitions=[
+    environment = [
+        {
+            "name": "APP_CONFIG_JSON",
+            "value": json.dumps(app_environment),
+        }
+    ]
+    container_definition: Dict[str, object] = {
+        "name": container_name,
+        "image": image_uri,
+        "essential": True,
+        "portMappings": [{"containerPort": 8501, "protocol": "tcp"}],
+        "environment": environment,
+        "logConfiguration": {
+            "logDriver": "awslogs",
+            "options": {
+                "awslogs-group": log_group_name,
+                "awslogs-region": region,
+                "awslogs-stream-prefix": "ecs",
+            },
+        },
+        "healthCheck": {
+            "command": [
+                "CMD-SHELL",
+                "curl -f http://localhost:8501/api/health || exit 1",
+            ],
+            "interval": 30,
+            "timeout": 5,
+            "retries": 3,
+            "startPeriod": 60,
+        },
+    }
+
+    volumes: List[Dict[str, object]] = []
+    file_system_id = (s3_files_info or {}).get("file_system_id")
+    access_point_arn = (s3_files_info or {}).get("access_point_arn")
+    if file_system_id and access_point_arn:
+        file_system_arn = (
+            s3_files_info.get("file_system_arn")
+            or f"arn:aws:s3files:{region}:{account_id}:file-system/{file_system_id}"
+        )
+        volume_name = "app-data"
+        volumes.append(
             {
-                "name": container_name,
-                "image": image_uri,
-                "essential": True,
-                "portMappings": [{"containerPort": 8501, "protocol": "tcp"}],
-                "environment": [
-                    {
-                        "name": "APP_CONFIG_JSON",
-                        "value": json.dumps(app_environment),
-                    }
-                ],
-                "logConfiguration": {
-                    "logDriver": "awslogs",
-                    "options": {
-                        "awslogs-group": log_group_name,
-                        "awslogs-region": region,
-                        "awslogs-stream-prefix": "ecs",
-                    },
-                },
-                "healthCheck": {
-                    "command": [
-                        "CMD-SHELL",
-                        "curl -f http://localhost:8501/api/health || exit 1",
-                    ],
-                    "interval": 30,
-                    "timeout": 5,
-                    "retries": 3,
-                    "startPeriod": 60,
+                "name": volume_name,
+                "s3filesVolumeConfiguration": {
+                    "fileSystemArn": file_system_arn,
+                    "rootDirectory": "/",
+                    "accessPointArn": access_point_arn,
                 },
             }
-        ],
-    )
+        )
+        container_definition["mountPoints"] = [
+            {
+                "sourceVolume": volume_name,
+                "containerPath": app_data_mount,
+                "readOnly": False,
+            }
+        ]
+        environment.extend(
+            [
+                {"name": "TASK_DB_MOUNT", "value": app_data_mount},
+                {"name": "TASK_DB_PROJECT", "value": project_name},
+            ]
+        )
+        logger.info(
+            "  ECS task will mount S3 Files at %s for tasks.db persistence",
+            app_data_mount,
+        )
+
+    task_def_kwargs: Dict[str, object] = {
+        "family": task_family,
+        "networkMode": "awsvpc",
+        "requiresCompatibilities": ["FARGATE"],
+        "cpu": "1024",
+        "memory": "2048",
+        "runtimePlatform": _ecs_runtime_platform(),
+        "executionRoleArn": ecs_roles["execution_role_arn"],
+        "taskRoleArn": ecs_roles["task_role_arn"],
+        "containerDefinitions": [container_definition],
+    }
+    if volumes:
+        task_def_kwargs["volumes"] = volumes
+
+    task_def_response = ecs_client.register_task_definition(**task_def_kwargs)
     task_definition_arn = task_def_response["taskDefinition"]["taskDefinitionArn"]
     logger.info(f"  ✓ Registered task definition: {task_definition_arn}")
 
@@ -4725,6 +4845,10 @@ def deploy_ecs_service(
                 service=service_name,
                 taskDefinition=task_definition_arn,
                 desiredCount=1,
+                deploymentConfiguration={
+                    "minimumHealthyPercent": 0,
+                    "maximumPercent": 100,
+                },
             )
             logger.info("  ✓ Updated ECS service with new task definition")
     except ClientError:
@@ -4737,6 +4861,10 @@ def deploy_ecs_service(
             taskDefinition=task_definition_arn,
             desiredCount=1,
             launchType="FARGATE",
+            deploymentConfiguration={
+                "minimumHealthyPercent": 0,
+                "maximumPercent": 100,
+            },
             networkConfiguration={
                 "awsvpcConfiguration": {
                     "subnets": private_subnets,
@@ -5652,19 +5780,67 @@ def _get_or_create_s3files_file_system(s3_bucket_arn: str, role_arn: str) -> Dic
     }
 
 
+def _ensure_security_group_nfs_access(client_sg_id: str, mount_sg_id: str) -> None:
+    """Allow NFS (2049) between a client security group and S3 Files mount targets."""
+    if not client_sg_id or not mount_sg_id:
+        return
+
+    try:
+        ec2_client.authorize_security_group_egress(
+            GroupId=client_sg_id,
+            IpPermissions=[
+                {
+                    "IpProtocol": "tcp",
+                    "FromPort": 2049,
+                    "ToPort": 2049,
+                    "UserIdGroupPairs": [{"GroupId": mount_sg_id}],
+                }
+            ],
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "InvalidPermission.Duplicate":
+            logger.warning(
+                f"  Could not add NFS egress on client security group {client_sg_id}: {e}"
+            )
+
+    try:
+        ec2_client.authorize_security_group_ingress(
+            GroupId=mount_sg_id,
+            IpPermissions=[
+                {
+                    "IpProtocol": "tcp",
+                    "FromPort": 2049,
+                    "ToPort": 2049,
+                    "UserIdGroupPairs": [{"GroupId": client_sg_id}],
+                }
+            ],
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "InvalidPermission.Duplicate":
+            logger.warning(
+                f"  Could not add NFS ingress on mount security group {mount_sg_id}: {e}"
+            )
+
+
 def _get_or_create_s3files_mount_security_group(
     vpc_id: str,
-    agent_runtime_sg_id: str,
+    client_sg_ids: List[str],
 ) -> str:
     """Security group for S3 Files mount targets (NFS 2049)."""
     group_name = f"s3files-mount-sg-for-{project_name}"
+    unique_client_sg_ids = []
+    for sg_id in client_sg_ids:
+        if sg_id and sg_id not in unique_client_sg_ids:
+            unique_client_sg_ids.append(sg_id)
+
     ingress_rules = [
         {
             "IpProtocol": "tcp",
             "FromPort": 2049,
             "ToPort": 2049,
-            "UserIdGroupPairs": [{"GroupId": agent_runtime_sg_id}],
+            "UserIdGroupPairs": [{"GroupId": sg_id}],
         }
+        for sg_id in unique_client_sg_ids
     ]
     sg_id = create_security_group(
         vpc_id=vpc_id,
@@ -5672,7 +5848,61 @@ def _get_or_create_s3files_mount_security_group(
         description=f"S3 Files mount target security group for {project_name}",
         ingress_rules=ingress_rules,
     )
+
+    for client_sg_id in unique_client_sg_ids:
+        _ensure_security_group_nfs_access(client_sg_id, sg_id)
+
     return sg_id
+
+
+def ensure_ecs_task_s3files_policy(
+    ecs_task_role_name: str,
+    file_system_id: str,
+    access_point_arn: str,
+) -> None:
+    """Grant ECS task role permissions to mount the S3 Files volume."""
+    if not file_system_id or not access_point_arn:
+        return
+
+    file_system_arn = f"arn:aws:s3files:{region}:{account_id}:file-system/{file_system_id}"
+    policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "S3FilesClientAccess",
+                "Effect": "Allow",
+                "Action": [
+                    "s3files:ClientMount",
+                    "s3files:ClientWrite",
+                    "s3files:ClientRootAccess",
+                ],
+                "Resource": file_system_arn,
+                "Condition": {
+                    "ArnEquals": {
+                        "s3files:AccessPointArn": access_point_arn,
+                    }
+                },
+            },
+            {
+                "Sid": "S3FilesGetAccessPoint",
+                "Effect": "Allow",
+                "Action": ["s3files:GetAccessPoint"],
+                "Resource": access_point_arn,
+            },
+            {
+                "Sid": "S3FilesListMountTargets",
+                "Effect": "Allow",
+                "Action": ["s3files:ListMountTargets"],
+                "Resource": file_system_arn,
+            },
+        ],
+    }
+    attach_inline_policy(
+        ecs_task_role_name,
+        f"s3files-ecs-task-policy-for-{project_name}",
+        policy,
+    )
+    logger.info(f"  ✓ Attached S3 Files ECS task policy to {ecs_task_role_name}")
 
 
 def _ensure_s3files_mount_targets(
@@ -5743,15 +5973,19 @@ def _get_or_create_s3files_access_point(file_system_id: str) -> str:
 def _ensure_s3files_file_system_policy(
     file_system_id: str,
     access_point_arn: str,
-    agent_runtime_role_arn: str,
+    client_role_arns: List[str],
 ) -> None:
-    """Allow the AgentCore runtime role to mount and write via the access point."""
+    """Allow runtime/ECS roles to mount and write via the access point."""
+    principals = [arn for arn in client_role_arns if arn]
+    if not principals:
+        return
+
     policy = {
         "Version": "2012-10-17",
         "Statement": [
             {
                 "Effect": "Allow",
-                "Principal": {"AWS": agent_runtime_role_arn},
+                "Principal": {"AWS": principals if len(principals) > 1 else principals[0]},
                 "Action": [
                     "s3files:ClientMount",
                     "s3files:ClientWrite",
@@ -5770,7 +6004,7 @@ def _ensure_s3files_file_system_policy(
             fileSystemId=file_system_id,
             policy=json.dumps(policy),
         )
-        logger.info("  Applied S3 Files file system policy for AgentCore runtime role")
+        logger.info("  Applied S3 Files file system policy for client roles")
     except ClientError as e:
         logger.warning(f"  Could not apply S3 Files file system policy: {e}")
 
@@ -5848,6 +6082,9 @@ def _ensure_agent_runtime_vpc_endpoint_access(
 def create_s3_files_session_storage(
     vpc_info: Dict[str, str],
     s3_bucket_name: str,
+    *,
+    ecs_sg_id: str = "",
+    ecs_task_role_name: str = "",
 ) -> Dict[str, object]:
     """Provision S3 Files resources used as persistent AgentCore session storage."""
     logger.info("[5.5/10] Creating S3 Files session storage")
@@ -5861,33 +6098,22 @@ def create_s3_files_session_storage(
     file_system = _get_or_create_s3files_file_system(s3_bucket_arn, sync_role_arn)
     file_system_id = file_system["file_system_id"]
 
-    # Create cross-referenced security groups for NFS between runtime and mount targets.
+    # Create cross-referenced security groups for NFS between clients and mount targets.
     agent_runtime_sg_id = create_security_group(
         vpc_id=vpc_id,
         group_name=f"agent-runtime-sg-for-{project_name}",
         description=f"Security group for AgentCore Runtime ({project_name})",
     )
+    client_sg_ids = [agent_runtime_sg_id]
+    if ecs_sg_id and ecs_sg_id not in client_sg_ids:
+        client_sg_ids.append(ecs_sg_id)
+
     s3files_mount_sg_id = _get_or_create_s3files_mount_security_group(
         vpc_id,
-        agent_runtime_sg_id,
+        client_sg_ids,
     )
-    try:
-        ec2_client.authorize_security_group_egress(
-            GroupId=agent_runtime_sg_id,
-            IpPermissions=[
-                {
-                    "IpProtocol": "tcp",
-                    "FromPort": 2049,
-                    "ToPort": 2049,
-                    "UserIdGroupPairs": [{"GroupId": s3files_mount_sg_id}],
-                }
-            ],
-        )
-    except ClientError as e:
-        if e.response["Error"]["Code"] != "InvalidPermission.Duplicate":
-            logger.warning(
-                f"  Could not add NFS egress on agent runtime security group: {e}"
-            )
+    for client_sg_id in client_sg_ids:
+        _ensure_security_group_nfs_access(client_sg_id, s3files_mount_sg_id)
 
     _ensure_s3files_mount_targets(
         file_system_id,
@@ -5898,11 +6124,22 @@ def create_s3_files_session_storage(
     agent_runtime_role_arn = (
         f"arn:aws:iam::{account_id}:role/AmazonBedrockAgentCoreRuntimeRoleFor{project_name}"
     )
+    ecs_task_role_arn = (
+        f"arn:aws:iam::{account_id}:role/{ecs_task_role_name}"
+        if ecs_task_role_name
+        else ""
+    )
     _ensure_s3files_file_system_policy(
         file_system_id,
         access_point_arn,
-        agent_runtime_role_arn,
+        [agent_runtime_role_arn, ecs_task_role_arn],
     )
+    if ecs_task_role_name:
+        ensure_ecs_task_s3files_policy(
+            ecs_task_role_name,
+            file_system_id,
+            access_point_arn,
+        )
     _ensure_agent_runtime_vpc_endpoint_access(
         vpc_info["vpc_id"],
         agent_runtime_sg_id,
@@ -5913,9 +6150,12 @@ def create_s3_files_session_storage(
     logger.info(f"  Access point: {access_point_arn}")
     logger.info(f"  Runtime subnets: {', '.join(private_subnets)}")
     logger.info(f"  Runtime security group: {agent_runtime_sg_id}")
+    if ecs_sg_id:
+        logger.info(f"  ECS security group (S3 Files NFS): {ecs_sg_id}")
 
     return {
         "file_system_id": file_system_id,
+        "file_system_arn": file_system.get("file_system_arn", ""),
         "access_point_arn": access_point_arn,
         "subnets": private_subnets,
         "security_groups": [agent_runtime_sg_id],
@@ -6165,8 +6405,14 @@ def main():
         vpc_info = create_vpc()
         logger.info(f"VPC created...")
 
-        # 5.5. Create S3 Files session storage for AgentCore Runtime
-        s3_files_info = create_s3_files_session_storage(vpc_info, s3_bucket_name)
+        # 5.5. Create S3 Files session storage for AgentCore Runtime + ECS task DB
+        ecs_task_role_name = f"role-ecs-task-for-{project_name}-{region}"
+        s3_files_info = create_s3_files_session_storage(
+            vpc_info,
+            s3_bucket_name,
+            ecs_sg_id=vpc_info.get("ecs_sg_id", ""),
+            ecs_task_role_name=ecs_task_role_name,
+        )
         logger.info("S3 Files session storage created...")
         
         # 6. Create ALB
@@ -6228,6 +6474,7 @@ def main():
             image_uri,
             app_environment,
             log_group_name,
+            s3_files_info=s3_files_info,
         )
         logger.info("ECS service deployed...")
         

@@ -139,6 +139,23 @@ export function useChatStream() {
             setStreamText("");
           }
         }
+
+        if (!finalMessage) {
+          const partial = streamTextRef.current.trim();
+          uiError("chat:send stream closed before done", {
+            partialLength: partial.length,
+          });
+          finalMessage = {
+            content: partial
+              ? `${partial}\n\nError: Connection closed before the response completed. Try again or refresh messages.`
+              : "Error: Connection closed before the response completed. The agent may still be running — refresh or try again.",
+            images: [],
+            tool_events: [],
+          };
+          setStreaming(false);
+          streamTextRef.current = "";
+          setStreamText("");
+        }
       } catch (err) {
         uiError("chat:send failed", err);
         finalMessage = {

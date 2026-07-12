@@ -13,6 +13,12 @@ from application.api.routes_tasks import router as tasks_router
 from application.api.routes_chat import router as chat_router
 from application.api.routes_rag import router as rag_router
 from application.task_store import init_db
+from application.task_store_persistence import (
+    flush_persist,
+    persistence_enabled,
+    persistent_db_path,
+    restore_tasks_db,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,9 +38,15 @@ _WEB_DIST = os.path.join(_APPLICATION_DIR, "web", "dist")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    restore_tasks_db()
     init_db()
-    logger.info("Task store initialized")
+    if persistence_enabled():
+        logger.info("Task store persistence enabled: %s", persistent_db_path())
+    else:
+        logger.info("Task store using local SQLite only")
     yield
+    flush_persist()
+    logger.info("Task store shutdown persist complete")
 
 
 app = FastAPI(title="Agent UI", version="1.0.0", lifespan=lifespan)

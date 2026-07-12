@@ -5,9 +5,14 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from application.task_store_persistence import (
+    schedule_persist,
+    working_db_path,
+)
+
 _APPLICATION_DIR = os.path.dirname(os.path.abspath(__file__))
 _DATA_DIR = os.path.join(_APPLICATION_DIR, "data")
-_DB_PATH = os.path.join(_DATA_DIR, "tasks.db")
+_DB_PATH = working_db_path()
 
 DEFAULT_MODEL = "Claude 4.6 Sonnet"
 
@@ -24,6 +29,8 @@ def _connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
+    global _DB_PATH
+    _DB_PATH = working_db_path()
     with _connect() as conn:
         conn.executescript(
             """
@@ -61,6 +68,10 @@ def init_db() -> None:
             conn.execute("ALTER TABLE tasks ADD COLUMN pinned INTEGER DEFAULT 0")
         except sqlite3.OperationalError:
             pass
+
+
+def _after_write() -> None:
+    schedule_persist()
 
 
 def _row_to_task(row: sqlite3.Row) -> dict[str, Any]:
@@ -151,6 +162,7 @@ def create_task(
                 now,
             ),
         )
+    _after_write()
     return get_task(task_id)  # type: ignore[return-value]
 
 
@@ -194,6 +206,7 @@ def update_task(task_id: str, user_id: str, **fields: Any) -> dict[str, Any] | N
             f"UPDATE tasks SET {', '.join(sets)} WHERE id = ? AND user_id = ?",
             values,
         )
+    _after_write()
     return get_task(task_id, user_id)
 
 
@@ -204,6 +217,8 @@ def delete_task(task_id: str, user_id: str) -> bool:
             "DELETE FROM tasks WHERE id = ? AND user_id = ?",
             (task_id, user_id),
         )
+    if cur.rowcount > 0:
+        _after_write()
     return cur.rowcount > 0
 
 
@@ -261,6 +276,7 @@ def add_message(
             + " WHERE id = ?",
             ([now, title_update, task_id] if title_update else [now, task_id]),
         )
+    _after_write()
     with _connect() as conn:
         row = conn.execute(
             "SELECT * FROM messages WHERE id = ?", (message_id,)

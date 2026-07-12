@@ -3,6 +3,7 @@ import logging
 import queue
 import re
 import threading
+import time
 from typing import Any, Generator
 
 from fastapi import APIRouter, HTTPException, Request
@@ -10,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from application.api.routes_auth import require_user_id
 from application import task_store
+from application.task_store_persistence import flush_persist
 from application import chat
 from application.notification_queue import QueueNotificationSink
 from application.runtime_mode import run_agent
@@ -17,6 +19,9 @@ from application.runtime_mode import run_agent
 logger = logging.getLogger("routes_chat")
 
 router = APIRouter(prefix="/api/tasks", tags=["chat"])
+
+SSE_HEARTBEAT_INTERVAL_SECONDS = 15
+AGENT_STREAM_TIMEOUT_SECONDS = 300
 
 _TOOL_INPUT_RE = re.compile(r"^Tool: (.+?), Input:\s*(.*)$", re.DOTALL)
 _TOOL_RESULT_RE = re.compile(r"^Tool Result: (.+)$", re.DOTALL)
@@ -38,6 +43,10 @@ class ChatRequest(BaseModel):
 
 def _sse_event(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _sse_keepalive() -> str:
+    return ": keepalive\n\n"
 
 
 def _is_segment_reset(previous: str, new: str) -> bool:
@@ -288,88 +297,99 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
         tool_meta: dict[str, dict[str, Any]] = {}
         streamed_text = ""
 
-        while True:
-            try:
-                item = message_queue.get(timeout=300)
-            except queue.Empty:
-                error_text = "Agent timeout"
-                task_store.add_message(task_id, "assistant", f"Error: {error_text}")
-                yield _sse_event({"type": "error", "data": error_text})
-                yield _sse_event(
-                    {"type": "done", "content": f"Error: {error_text}", "images": []}
-                )
-                break
+        try:
+            deadline = time.monotonic() + AGENT_STREAM_TIMEOUT_SECONDS
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    error_text = "Agent timeout"
+                    task_store.add_message(task_id, "assistant", f"Error: {error_text}")
+                    yield _sse_event({"type": "error", "data": error_text})
+                    yield _sse_event(
+                        {"type": "done", "content": f"Error: {error_text}", "images": []}
+                    )
+                    break
 
-            if item is None:
-                break
-
-            mapped = _map_sink_event(item)
-            if not mapped:
-                continue
-
-            if mapped["type"] == "token":
-                before = streamed_text
-                streamed_text, committed = _handle_token(
-                    tool_events, streamed_text, mapped["data"]
-                )
-                if streamed_text == before and committed is None:
+                try:
+                    item = message_queue.get(
+                        timeout=min(SSE_HEARTBEAT_INTERVAL_SECONDS, remaining)
+                    )
+                except queue.Empty:
+                    yield _sse_keepalive()
                     continue
-                if committed:
-                    yield _sse_event(committed)
-                yield _sse_event(mapped)
-                continue
-            elif mapped["type"] == "text":
-                committed = _flush_text_segment(tool_events, mapped["data"])
-                streamed_text = ""
-                if committed:
-                    yield _sse_event(committed)
-                continue
-            elif mapped["type"] in ("tool", "tool_result", "info"):
-                if mapped["type"] in ("tool", "tool_result"):
-                    committed = _flush_text_segment(tool_events, streamed_text)
-                    if mapped["type"] == "tool":
-                        streamed_text = ""
+
+                if item is None:
+                    break
+
+                mapped = _map_sink_event(item)
+                if not mapped:
+                    continue
+
+                if mapped["type"] == "token":
+                    before = streamed_text
+                    streamed_text, committed = _handle_token(
+                        tool_events, streamed_text, mapped["data"]
+                    )
+                    if streamed_text == before and committed is None:
+                        continue
                     if committed:
                         yield _sse_event(committed)
-                for tool_event in _track_tool_event(tool_events, tool_meta, mapped):
-                    yield _sse_event(tool_event)
-                continue
+                    yield _sse_event(mapped)
+                    continue
+                elif mapped["type"] == "text":
+                    committed = _flush_text_segment(tool_events, mapped["data"])
+                    streamed_text = ""
+                    if committed:
+                        yield _sse_event(committed)
+                    continue
+                elif mapped["type"] in ("tool", "tool_result", "info"):
+                    if mapped["type"] in ("tool", "tool_result"):
+                        committed = _flush_text_segment(tool_events, streamed_text)
+                        if mapped["type"] == "tool":
+                            streamed_text = ""
+                        if committed:
+                            yield _sse_event(committed)
+                    for tool_event in _track_tool_event(tool_events, tool_meta, mapped):
+                        yield _sse_event(tool_event)
+                    continue
 
-            yield _sse_event(mapped)
+                yield _sse_event(mapped)
 
-        if "error" in result_holder:
-            error_text = f"Error: {result_holder['error']}"
-            task_store.add_message(task_id, "assistant", error_text)
-            yield _sse_event({"type": "error", "data": result_holder["error"]})
-            yield _sse_event({"type": "done", "content": error_text, "images": []})
-            return
+            if "error" in result_holder:
+                error_text = f"Error: {result_holder['error']}"
+                task_store.add_message(task_id, "assistant", error_text)
+                yield _sse_event({"type": "error", "data": result_holder["error"]})
+                yield _sse_event({"type": "done", "content": error_text, "images": []})
+                return
 
-        authoritative_final = (result_holder.get("content") or "").strip()
-        final_content = authoritative_final or streamed_text
-        if authoritative_final:
-            # Skip flushing streamed_text — it is a streaming artifact of the same answer.
-            _set_final_text_in_timeline(tool_events, final_content)
-        else:
-            _flush_text_segment(tool_events, streamed_text)
-            _set_final_text_in_timeline(tool_events, final_content)
-        images = result_holder.get("images") or []
+            authoritative_final = (result_holder.get("content") or "").strip()
+            final_content = authoritative_final or streamed_text
+            if authoritative_final:
+                # Skip flushing streamed_text — it is a streaming artifact of the same answer.
+                _set_final_text_in_timeline(tool_events, final_content)
+            else:
+                _flush_text_segment(tool_events, streamed_text)
+                _set_final_text_in_timeline(tool_events, final_content)
+            images = result_holder.get("images") or []
 
-        task_store.add_message(
-            task_id,
-            "assistant",
-            final_content,
-            images=images,
-            tool_events=tool_events,
-        )
+            task_store.add_message(
+                task_id,
+                "assistant",
+                final_content,
+                images=images,
+                tool_events=tool_events,
+            )
 
-        yield _sse_event(
-            {
-                "type": "done",
-                "content": final_content,
-                "images": images,
-                "tool_events": tool_events,
-            }
-        )
+            yield _sse_event(
+                {
+                    "type": "done",
+                    "content": final_content,
+                    "images": images,
+                    "tool_events": tool_events,
+                }
+            )
+        finally:
+            flush_persist()
 
     from fastapi.responses import StreamingResponse
 

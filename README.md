@@ -538,7 +538,7 @@ uvicorn application.server:app --host 0.0.0.0 --port 8501
 |-----------|------------|
 | 헬스체크 | `GET http://localhost:8501/api/health` |
 | UI 미빌드 시 | `Frontend not built` — 위 1) 단계 실행 후 서버 재시작 |
-| 태스크·메시지 DB | `application/data/tasks.db` (SQLite) |
+| 태스크·메시지 DB | `application/data/tasks.db` (로컬 working). ECS 배포 시 S3 Files `/mnt/app-data/application-database/{projectName}/tasks.db`에 영속화 |
 
 #### 3) (선택) 프론트엔드만 핫 리로드
 
@@ -573,6 +573,125 @@ uvicorn application.server:app --host 0.0.0.0 --port 8501
 ```
 
 브라우저: `http://localhost:8501` (프론트엔드 + API 동일 포트). Agent 추론은 AgentCore Runtime을 사용합니다.
+
+### SSE timeout Error
+
+배포 환경(CloudFront → ALB → ECS)에서 **도구 실행이 길어질 때** assistant 응답이 화면에 나타나지 않는 현상입니다. 로컬(`uvicorn` 직접 실행)에서는 CloudFront/ALB가 없어 동일 질의가 정상 동작할 수 있습니다.
+
+#### 증상
+
+- 사용자 메시지만 보이고 assistant 응답·이미지가 비어 있음
+- ECS·AgentCore Runtime 로그에는 `final_output`, 도구 호출(`websearch`, `execute_code` 등)이 **정상**으로 기록됨
+- 긴 질의(웹 검색 + 코드 실행 + S3 업로드 등)에서 재현되기 쉬움
+
+#### 원인
+
+| 구간 | 기본값 | 문제 |
+|------|--------|------|
+| CloudFront ALB origin **Origin Read Timeout** | 30초 | 도구 실행 중 SSE `data:` 이벤트가 30초 이상 없으면 CloudFront가 origin 연결을 끊음 |
+| ALB **idle timeout** | 60초 | 긴 스트림에서 ALB가 유휴 연결을 먼저 종료할 수 있음 |
+| 프론트엔드 | `done` 이벤트 대기 | 스트림이 조기 종료되면 optimistic UI만 남고 assistant 메시지가 확정되지 않음 |
+
+백엔드(`agentcore_client.py`)까지는 응답이 도달하지만, **CloudFront → 브라우저** 구간에서 SSE가 끊기는 것이 핵심입니다.
+
+#### 적용한 조치 (즉시·단기)
+
+**즉시 — 인프라 (`installer.py`, 기존 배포 재실행 시 자동 반영)**
+
+- CloudFront ALB origin `OriginReadTimeout`: **30 → 120초**
+- ALB `idle_timeout.timeout_seconds`: **60 → 120초**
+
+**단기 — 애플리케이션**
+
+- `application/api/routes_chat.py`: 도구 실행 대기 중 **15초마다 SSE heartbeat** (`: keepalive\n\n`) 전송
+- `application/web/src/hooks/useChatStream.ts`: `done` 없이 스트림이 종료되면 **에러 메시지** 표시
+
+#### 배포·확인
+
+```bash
+# 인프라 타임아웃 갱신 (기존 CloudFront/ALB 재사용 시에도 timeout 업데이트)
+python installer.py
+
+# Web UI + API (heartbeat·프론트 에러 처리)
+cd application/web && npm install && npm run build
+cd ../..
+# ECS 이미지 재빌드·배포 후 서비스 재시작
+```
+
+확인: CloudFront URL에서 도구가 많은 질의(예: *강남역 맛집 정보를 사진과 함께*) 후 assistant 응답·`done` 이벤트 수신.
+
+### Task DB persistence (S3 Files)
+
+ECS 재배포 후에도 Web UI **태스크·메시지 목록**(`tasks.db`)을 유지하기 위해, LangGraph checkpoint와 동일한 **working copy + S3 Files persist** 패턴을 사용합니다.
+
+#### 왜 NFS/S3 Files 위에서 SQLite를 직접 열지 않나
+
+S3 Files(NFS) 위에서 SQLite를 직접 read/write하면 lock·corruption 위험이 있습니다. Runtime checkpoint와 같이:
+
+| 경로 | 용도 |
+|------|------|
+| **Working** | `application/data/tasks.db` — 실행 중 SQLite I/O (로컬 디스크) |
+| **Persistent** | `/mnt/app-data/application-database/{projectName}/tasks.db` — S3 Files 마운트 (ECS Fargate) |
+
+S3 bucket 실제 객체 경로 (file system prefix `agentcore-sessions/`):
+
+```text
+s3://storage-for-{project}-{account}-{region}/agentcore-sessions/application-database/{projectName}/tasks.db
+```
+
+Runtime checkpoint(`checkpoints/{runtime_session_id}/`)와 **서브 경로만 분리**하고 동일 S3 Files file system을 재사용합니다.
+
+#### 동작 흐름
+
+```text
+[ECS 시작]  restore: S3 Files persistent → working (mtime 비교)
+[실행 중]   task_store → application/data/tasks.db
+[변경 후]   schedule_persist (20초 debounce) / chat 종료·shutdown 시 flush_persist
+[persist]   PRAGMA wal_checkpoint → working → persistent copy
+```
+
+관련 코드:
+
+| 파일 | 역할 |
+|------|------|
+| `application/task_store_persistence.py` | restore / persist / debounce |
+| `application/task_store.py` | write 후 `schedule_persist()` |
+| `application/server.py` | lifespan: restore → init_db → shutdown flush |
+| `application/api/routes_chat.py` | SSE stream `finally`: `flush_persist()` |
+| `installer.py` | ECS task definition S3 Files volume (`/mnt/app-data`), IAM·SG |
+
+#### 인프라 (installer.py)
+
+- ECS Fargate task definition에 **`s3filesVolumeConfiguration`** 볼륨 추가
+- ECS task role: `s3files:ClientMount`, `ClientWrite`, `GetAccessPoint`, `ListMountTargets`
+- S3 Files file system policy: Runtime role + **ECS task role**
+- ECS SG ↔ S3 Files mount SG: NFS **TCP 2049**
+- 배포: `minimumHealthyPercent=0`, `maximumPercent=100` (롤링 배포 중 DB 동시 write 방지)
+
+환경 변수 (ECS task definition에서 설정):
+
+| 변수 | 값 |
+|------|-----|
+| `TASK_DB_MOUNT` | `/mnt/app-data` |
+| `TASK_DB_PROJECT` | `agentic-work` (project name) |
+
+로컬 개발(`uvicorn`)에서는 `/mnt/app-data`가 없으므로 **기존처럼 `application/data/tasks.db`만** 사용합니다.
+
+#### 배포·확인
+
+```bash
+# S3 Files ECS volume + IAM/SG + task definition 갱신
+python installer.py
+
+# 또는 application 코드만 변경한 경우: Docker 이미지 재빌드 후 ECS 재배포
+```
+
+확인:
+
+1. CloudFront에서 태스크 생성·채팅 후 ECS 서비스 재배포
+2. 재배포 후 동일 User ID로 태스크·메시지 목록 유지
+3. S3 bucket: `agentcore-sessions/application-database/{projectName}/tasks.db` 객체 존재
+4. CloudWatch 로그: `Restored task DB from S3 Files` / `Persisted task DB to S3 Files`
 
 ### `runtime_agent/langgraph/` — LangGraph Agent (AgentCore Runtime)
 
