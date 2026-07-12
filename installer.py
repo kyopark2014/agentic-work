@@ -4300,6 +4300,37 @@ def _ensure_docker_disk_space(min_free_mb: int = DOCKER_MIN_FREE_MB) -> None:
         )
 
 
+def _promote_ecr_image_tag(
+    repository_uri: str, source_tag: str, target_tag: str = "latest"
+) -> None:
+    """Point an ECR tag at an already-pushed manifest (avoids docker push :latest index conflicts)."""
+    repository_name = repository_uri.rsplit("/", 1)[-1]
+    response = ecr_client.batch_get_image(
+        repositoryName=repository_name,
+        imageIds=[{"imageTag": source_tag}],
+        acceptedMediaTypes=[
+            "application/vnd.docker.distribution.manifest.v2+json",
+            "application/vnd.oci.image.manifest.v1+json",
+        ],
+    )
+    images = response.get("images") or []
+    if not images:
+        raise RuntimeError(
+            f"ECR image not found for tag {source_tag} in repository {repository_name}"
+        )
+    image = images[0]
+    put_params: Dict[str, str] = {
+        "repositoryName": repository_name,
+        "imageTag": target_tag,
+        "imageManifest": image["imageManifest"],
+    }
+    media_type = image.get("imageManifestMediaType")
+    if media_type:
+        put_params["imageManifestMediaType"] = media_type
+    ecr_client.put_image(**put_params)
+    logger.info(f"  ✓ Promoted ECR tag {source_tag} -> {target_tag}")
+
+
 def build_and_push_docker_image(
     repository_uri: str, image_tag: Optional[str] = None
 ) -> Tuple[str, str]:
@@ -4316,7 +4347,6 @@ def build_and_push_docker_image(
 
     registry = repository_uri.split("/")[0]
     image_uri = f"{repository_uri}:{image_tag}"
-    latest_uri = f"{repository_uri}:latest"
     project_root = os.path.dirname(os.path.abspath(__file__))
 
     logger.info(f"  Build number (image tag): {image_tag}")
@@ -4359,16 +4389,13 @@ def build_and_push_docker_image(
     )
     logger.info("  ✓ Docker build completed")
 
-    _run_command_streaming(["docker", "tag", image_uri, latest_uri])
-    logger.info(f"  Tagged image as latest: {latest_uri}")
-
     logger.info(f"  Starting Docker push: {image_uri}")
     _run_command_streaming(["docker", "push", image_uri])
-    logger.info(f"  Starting Docker push: {latest_uri}")
-    _run_command_streaming(["docker", "push", latest_uri])
+    logger.info(f"  Promoting {image_tag} to latest in ECR (avoid stale manifest list push)")
+    _promote_ecr_image_tag(repository_uri, image_tag, "latest")
     logger.info(f"  ✓ Pushed image: {image_uri}")
 
-    subprocess.run(["docker", "rmi", "-f", image_uri, latest_uri], capture_output=True, check=False)
+    subprocess.run(["docker", "rmi", "-f", image_uri], capture_output=True, check=False)
     _cleanup_docker_resources()
     return image_uri, image_tag
 
