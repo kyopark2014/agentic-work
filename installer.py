@@ -4226,6 +4226,59 @@ def _require_arm64_build_host(context: str) -> None:
     )
 
 
+NATIVE_BUILDX_BUILDER = "ecs-native-builder"
+
+
+def _ensure_native_buildx_builder() -> None:
+    """Ensure a local docker-driver buildx builder for reliable ECR push."""
+    inspect = subprocess.run(
+        ["docker", "buildx", "inspect", NATIVE_BUILDX_BUILDER],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if inspect.returncode != 0:
+        create = subprocess.run(
+            [
+                "docker", "buildx", "create",
+                "--name", NATIVE_BUILDX_BUILDER,
+                "--driver", "docker",
+                "--use",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        if create.returncode != 0:
+            err = (create.stderr or create.stdout).strip()
+            raise RuntimeError(f"Failed to create buildx builder: {err}")
+    else:
+        use = subprocess.run(
+            ["docker", "buildx", "use", NATIVE_BUILDX_BUILDER],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        if use.returncode != 0:
+            err = (use.stderr or use.stdout).strip()
+            raise RuntimeError(f"Failed to select buildx builder: {err}")
+
+    bootstrap = subprocess.run(
+        ["docker", "buildx", "inspect", "--bootstrap"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    if bootstrap.returncode != 0:
+        err = (bootstrap.stderr or bootstrap.stdout).strip()
+        raise RuntimeError(f"Failed to bootstrap buildx builder: {err}")
+
+
+
 def _docker_data_root() -> str:
     try:
         result = subprocess.run(
@@ -4374,28 +4427,28 @@ def build_and_push_docker_image(
     docker_platform = _docker_build_platform()
     logger.info(f"  Host architecture: {os.uname().machine}")
     logger.info(f"  Docker platform: {docker_platform} (native ARM64 build, no QEMU)")
-    logger.info(f"  Starting Docker build: {image_uri}")
+    _ensure_native_buildx_builder()
+    logger.info(f"  Starting Docker build+push: {image_uri}")
     logger.info("  Build output streams below (this may take several minutes)...")
+    # Push directly from buildx to avoid Docker Desktop containerd digest mismatch
+    # between `docker build` and `docker push` on large multi-stage images.
     _run_command_streaming(
         [
-            "docker", "build",
+            "docker", "buildx", "build",
             "--platform", docker_platform,
             "--provenance=false",
             "--sbom=false",
             "-t", image_uri,
+            "--push",
             ".",
         ],
         cwd=project_root,
     )
-    logger.info("  ✓ Docker build completed")
-
-    logger.info(f"  Starting Docker push: {image_uri}")
-    _run_command_streaming(["docker", "push", image_uri])
+    logger.info("  ✓ Docker build and push completed")
     logger.info(f"  Promoting {image_tag} to latest in ECR (avoid stale manifest list push)")
     _promote_ecr_image_tag(repository_uri, image_tag, "latest")
     logger.info(f"  ✓ Pushed image: {image_uri}")
 
-    subprocess.run(["docker", "rmi", "-f", image_uri], capture_output=True, check=False)
     _cleanup_docker_resources()
     return image_uri, image_tag
 
