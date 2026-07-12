@@ -4706,11 +4706,65 @@ def _describe_ecs_service(cluster_name: str, service_name: str) -> Dict[str, obj
     return services[0]
 
 
+def _ecs_az_rebalancing_enabled(service: Dict[str, object]) -> bool:
+    return (service.get("availabilityZoneRebalancing") or "").upper() == "ENABLED"
+
+
+def _ecs_single_task_deployment_config(
+    service: Optional[Dict[str, object]] = None,
+) -> Optional[Dict[str, int]]:
+    """Return 0/100 deployment config when compatible, else None (keep service default)."""
+    if service and _ecs_az_rebalancing_enabled(service):
+        return None
+    return {"minimumHealthyPercent": 0, "maximumPercent": 100}
+
+
+def _update_ecs_service_task_definition(
+    cluster_name: str,
+    service_name: str,
+    task_definition_arn: str,
+    existing_service: Dict[str, object],
+) -> None:
+    deployment_config = _ecs_single_task_deployment_config(existing_service)
+    update_kwargs: Dict[str, object] = {
+        "cluster": cluster_name,
+        "service": service_name,
+        "taskDefinition": task_definition_arn,
+        "desiredCount": 1,
+    }
+    if deployment_config:
+        update_kwargs["deploymentConfiguration"] = deployment_config
+    try:
+        ecs_client.update_service(**update_kwargs)
+    except ClientError as exc:
+        error_code = exc.response.get("Error", {}).get("Code", "")
+        error_message = exc.response.get("Error", {}).get("Message", "")
+        if error_code == "InvalidParameterException" and (
+            "Availability Zone Rebalancing" in error_message
+            or "maximumPercent" in error_message
+        ):
+            logger.warning(
+                "  ECS AZ Rebalancing enabled; retrying update with service-default "
+                "deployment configuration"
+            )
+            ecs_client.update_service(
+                cluster=cluster_name,
+                service=service_name,
+                taskDefinition=task_definition_arn,
+                desiredCount=1,
+                forceNewDeployment=True,
+            )
+        else:
+            raise
+    logger.info("  ✓ Updated ECS service with new task definition")
+
+
 def _wait_for_ecs_service_ready(
     cluster_name: str,
     service_name: str,
     *,
     target_group_arn: Optional[str] = None,
+    expected_task_definition_arn: Optional[str] = None,
     timeout_seconds: int = 600,
     poll_interval_seconds: int = 15,
 ) -> None:
@@ -4745,6 +4799,17 @@ def _wait_for_ecs_service_ready(
                 logger.debug(f"  Target health check skipped: {exc}")
 
         if _ecs_primary_deployment_ready(service):
+            if expected_task_definition_arn:
+                primary_task_def = (primary or {}).get("taskDefinition", "")
+                if primary_task_def != expected_task_definition_arn:
+                    logger.info(
+                        "  ECS wait attempt %s: PRIMARY still on %s, waiting for %s",
+                        attempt,
+                        primary_task_def.rsplit("/", 1)[-1],
+                        expected_task_definition_arn.rsplit("/", 1)[-1],
+                    )
+                    time.sleep(poll_interval_seconds)
+                    continue
             if not target_group_arn or (healthy_targets or 0) > 0:
                 if draining:
                     logger.info(
@@ -4760,9 +4825,11 @@ def _wait_for_ecs_service_ready(
                 return
 
         primary_rollout = primary.get("rolloutState") if primary else "UNKNOWN"
+        primary_task_def = (primary or {}).get("taskDefinition", "")
         logger.info(
             "  ECS wait attempt %s: running=%s/%s pending=%s "
-            "primary=%s/%s failed=%s primary_rollout=%s draining=%s healthy_targets=%s",
+            "primary=%s/%s failed=%s primary_rollout=%s draining=%s healthy_targets=%s "
+            "primary_task_def=%s",
             attempt,
             service.get("runningCount"),
             service.get("desiredCount"),
@@ -4773,6 +4840,7 @@ def _wait_for_ecs_service_ready(
             primary_rollout,
             len(draining),
             healthy_targets,
+            primary_task_def.rsplit("/", 1)[-1] if primary_task_def else "none",
         )
         time.sleep(poll_interval_seconds)
 
@@ -4780,6 +4848,15 @@ def _wait_for_ecs_service_ready(
     deployments = service.get("deployments") or []
     primary = next((d for d in deployments if d.get("status") == "PRIMARY"), None)
     if _ecs_primary_deployment_ready(service):
+        if expected_task_definition_arn:
+            primary_task_def = (primary or {}).get("taskDefinition", "")
+            if primary_task_def != expected_task_definition_arn:
+                raise TimeoutError(
+                    f"Timed out after {timeout_seconds}s waiting for ECS service {service_name} "
+                    f"to roll out task definition {expected_task_definition_arn.rsplit('/', 1)[-1]} "
+                    f"(PRIMARY still on {primary_task_def.rsplit('/', 1)[-1]}). "
+                    "Check ECS service events for update_service failures."
+                )
         logger.warning(
             "  ECS wait timed out after %ss, but PRIMARY deployment is ready; continuing",
             timeout_seconds,
@@ -4915,24 +4992,18 @@ def deploy_ecs_service(
 
     cluster_name = cluster_arn.split("/")[-1]
     service_arn = None
-    try:
-        services = ecs_client.describe_services(cluster=cluster_name, services=[service_name])
-        if services["services"] and services["services"][0]["status"] != "INACTIVE":
-            service_arn = services["services"][0]["serviceArn"]
-            logger.warning(f"  ECS service already exists: {service_name}")
-            ecs_client.update_service(
-                cluster=cluster_name,
-                service=service_name,
-                taskDefinition=task_definition_arn,
-                desiredCount=1,
-                deploymentConfiguration={
-                    "minimumHealthyPercent": 0,
-                    "maximumPercent": 100,
-                },
-            )
-            logger.info("  ✓ Updated ECS service with new task definition")
-    except ClientError:
-        pass
+    services = ecs_client.describe_services(cluster=cluster_name, services=[service_name])
+    service_list = services.get("services") or []
+    if service_list and service_list[0].get("status") != "INACTIVE":
+        existing_service = service_list[0]
+        service_arn = existing_service["serviceArn"]
+        logger.warning(f"  ECS service already exists: {service_name}")
+        _update_ecs_service_task_definition(
+            cluster_name,
+            service_name,
+            task_definition_arn,
+            existing_service,
+        )
 
     if not service_arn:
         service_response = ecs_client.create_service(
@@ -4945,6 +5016,7 @@ def deploy_ecs_service(
                 "minimumHealthyPercent": 0,
                 "maximumPercent": 100,
             },
+            availabilityZoneRebalancing="DISABLED",
             networkConfiguration={
                 "awsvpcConfiguration": {
                     "subnets": private_subnets,
@@ -4970,6 +5042,7 @@ def deploy_ecs_service(
         cluster_name,
         service_name,
         target_group_arn=tg_arn,
+        expected_task_definition_arn=task_definition_arn,
     )
 
     logger.info(f"✓ ECS service deployed in private subnets: {', '.join(private_subnets)}")
