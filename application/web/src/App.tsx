@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./api";
 import { uiError, uiLog } from "./debug";
 import { formatBrandTitle } from "./formatBrandTitle";
@@ -18,6 +18,10 @@ function sortTasks(tasks: Task[]): Task[] {
   });
 }
 
+function titleFromPrompt(prompt: string): string {
+  return prompt.trim().slice(0, 50) || "New task";
+}
+
 export default function App() {
   const [userId, setUserId] = useState<string | null>(null);
   const [authReady, setAuthReady] = useState(false);
@@ -29,6 +33,9 @@ export default function App() {
   const [drawer, setDrawer] = useState<DrawerKind>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const { streaming, streamText, streamEvents, sendMessage } = useChatStream();
+  // Survives React Strict Mode remount so empty-list bootstrap creates only one task.
+  const emptyTaskBootstrapRef = useRef<Promise<Task> | null>(null);
+  const tasksBootstrappedForUserRef = useRef<string | null>(null);
 
   const activeTask = tasks.find((t) => t.id === activeTaskId) ?? null;
 
@@ -48,12 +55,13 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
+        const cfg = await api.getConfig();
+        setConfig(cfg);
         const session = await api.getSession();
         const id = session?.user_id?.trim();
         if (id) {
           setUserId(id);
         }
-        setConfig(await api.getConfig());
       } catch (err) {
         uiError("boot failed", err);
         setBootError(err instanceof Error ? err.message : String(err));
@@ -69,16 +77,29 @@ export default function App() {
   }, [config?.projectName, userId]);
 
   useEffect(() => {
-    if (!userId) return;
+    if (!userId || !config) return;
+    if (tasksBootstrappedForUserRef.current === userId) return;
+
+    let cancelled = false;
+
     (async () => {
       const rows = await refreshTasks();
+      if (cancelled) return;
+
       if (rows.length === 0) {
-        const cfg = config ?? (await api.getConfig());
-        const task = await api.createTask({
-          model_name: cfg.default_model,
-          skills: cfg.default_skills,
-          mcp_servers: cfg.default_mcp_servers,
-        });
+        if (!emptyTaskBootstrapRef.current) {
+          emptyTaskBootstrapRef.current = (async () => {
+            const latest = sortTasks((await api.listTasks()).tasks);
+            if (latest.length > 0) return latest[0];
+            return api.createTask({
+              model_name: config.default_model,
+              skills: config.default_skills,
+              mcp_servers: config.default_mcp_servers,
+            });
+          })();
+        }
+        const task = await emptyTaskBootstrapRef.current;
+        if (cancelled) return;
         setTasks([task]);
         setActiveTaskId(task.id);
         setMessages([]);
@@ -86,7 +107,14 @@ export default function App() {
         setActiveTaskId(rows[0].id);
         await loadMessages(rows[0].id);
       }
+      if (!cancelled) {
+        tasksBootstrappedForUserRef.current = userId;
+      }
     })();
+
+    return () => {
+      cancelled = true;
+    };
   }, [userId, config, refreshTasks, loadMessages]);
 
   useEffect(() => {
@@ -133,6 +161,8 @@ export default function App() {
     } catch (err) {
       uiError("logout failed", err);
     }
+    tasksBootstrappedForUserRef.current = null;
+    emptyTaskBootstrapRef.current = null;
     setUserId(null);
     setTasks([]);
     setActiveTaskId(null);
@@ -218,6 +248,15 @@ export default function App() {
       created_at: new Date().toISOString(),
     };
     setMessages((prev) => [...prev, optimistic]);
+    setTasks((prev) =>
+      sortTasks(
+        prev.map((task) =>
+          task.id === activeTaskId && (task.title === "New task" || !task.title)
+            ? { ...task, title: titleFromPrompt(prompt), updated_at: new Date().toISOString() }
+            : task,
+        ),
+      ),
+    );
 
     await sendMessage(activeTaskId, prompt, async (final) => {
       if (final && (final.content || final.tool_events.length > 0)) {
