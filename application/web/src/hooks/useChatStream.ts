@@ -61,6 +61,7 @@ export interface ChatFinalMessage {
 
 export function useChatStream() {
   const [streaming, setStreaming] = useState(false);
+  const [streamingTaskId, setStreamingTaskId] = useState<string | null>(null);
   const [streamText, setStreamText] = useState("");
   const [streamEvents, setStreamEvents] = useState<ToolEvent[]>([]);
   const streamTextRef = useRef("");
@@ -73,6 +74,7 @@ export function useChatStream() {
     ) => {
       uiLog("chat:send start", { taskId, prompt });
       setStreaming(true);
+      setStreamingTaskId(taskId);
       streamTextRef.current = "";
       setStreamText("");
       setStreamEvents([]);
@@ -90,6 +92,7 @@ export function useChatStream() {
       const clearStreaming = () => {
         flushTextSegment();
         setStreaming(false);
+        setStreamingTaskId(null);
         streamTextRef.current = "";
         setStreamText("");
         setStreamEvents([]);
@@ -135,6 +138,7 @@ export function useChatStream() {
               tool_events: event.tool_events ?? [],
             };
             setStreaming(false);
+            setStreamingTaskId(null);
             streamTextRef.current = "";
             setStreamText("");
           }
@@ -153,6 +157,7 @@ export function useChatStream() {
             tool_events: [],
           };
           setStreaming(false);
+          setStreamingTaskId(null);
           streamTextRef.current = "";
           setStreamText("");
         }
@@ -173,6 +178,7 @@ export function useChatStream() {
           uiWarn("chat:send refresh failed", err);
         } finally {
           setStreamEvents([]);
+          setStreamingTaskId(null);
           uiLog("chat:send finished", { taskId });
         }
       }
@@ -180,5 +186,5 @@ export function useChatStream() {
     [],
   );
 
-  return { streaming, streamText, streamEvents, sendMessage };
+  return { streaming, streamingTaskId, streamText, streamEvents, sendMessage };
 }

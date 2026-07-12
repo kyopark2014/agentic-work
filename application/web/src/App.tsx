@@ -32,12 +32,18 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [drawer, setDrawer] = useState<DrawerKind>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const { streaming, streamText, streamEvents, sendMessage } = useChatStream();
+  const { streaming, streamingTaskId, streamText, streamEvents, sendMessage } = useChatStream();
   // Survives React Strict Mode remount so empty-list bootstrap creates only one task.
   const emptyTaskBootstrapRef = useRef<Promise<Task> | null>(null);
   const tasksBootstrappedForUserRef = useRef<string | null>(null);
+  const activeTaskIdRef = useRef<string | null>(null);
 
   const activeTask = tasks.find((t) => t.id === activeTaskId) ?? null;
+  const streamForActiveTask = streaming && streamingTaskId === activeTaskId;
+
+  useEffect(() => {
+    activeTaskIdRef.current = activeTaskId;
+  }, [activeTaskId]);
 
   const loadMessages = useCallback(async (taskId: string) => {
     uiLog("messages:load start", { taskId });
@@ -237,10 +243,11 @@ export default function App() {
       return;
     }
 
-    uiLog("chat:handleSend", { taskId: activeTaskId, prompt });
+    const taskId = activeTaskId;
+    uiLog("chat:handleSend", { taskId, prompt });
     const optimistic: Message = {
       id: `pending-${crypto.randomUUID()}`,
-      task_id: activeTaskId,
+      task_id: taskId,
       role: "user",
       content: prompt,
       images: [],
@@ -251,29 +258,32 @@ export default function App() {
     setTasks((prev) =>
       sortTasks(
         prev.map((task) =>
-          task.id === activeTaskId && (task.title === "New task" || !task.title)
+          task.id === taskId && (task.title === "New task" || !task.title)
             ? { ...task, title: titleFromPrompt(prompt), updated_at: new Date().toISOString() }
             : task,
         ),
       ),
     );
 
-    await sendMessage(activeTaskId, prompt, async (final) => {
-      if (final && (final.content || final.tool_events.length > 0)) {
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `pending-assistant-${crypto.randomUUID()}`,
-            task_id: activeTaskId,
-            role: "assistant",
-            content: final.content,
-            images: final.images,
-            tool_events: final.tool_events,
-            created_at: new Date().toISOString(),
-          },
-        ]);
+    await sendMessage(taskId, prompt, async (final) => {
+      // Only update the open thread if the user is still viewing this task.
+      if (activeTaskIdRef.current === taskId) {
+        if (final && (final.content || final.tool_events.length > 0)) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `pending-assistant-${crypto.randomUUID()}`,
+              task_id: taskId,
+              role: "assistant",
+              content: final.content,
+              images: final.images,
+              tool_events: final.tool_events,
+              created_at: new Date().toISOString(),
+            },
+          ]);
+        }
+        await loadMessages(taskId);
       }
-      await loadMessages(activeTaskId);
       await refreshTasks();
     });
   }
@@ -316,9 +326,9 @@ export default function App() {
       <div className="main-panel">
         <ChatThread
           messages={messages}
-          streaming={streaming}
-          streamText={streamText}
-          streamEvents={streamEvents}
+          streaming={streamForActiveTask}
+          streamText={streamForActiveTask ? streamText : ""}
+          streamEvents={streamForActiveTask ? streamEvents : []}
           taskTitle={activeTask?.title ?? "New task"}
           onMenuClick={() => setSidebarOpen(true)}
           footer={
