@@ -278,6 +278,32 @@ def _custom_metric_search_expression(
     )
 
 
+def _custom_model_metric_query(
+    metric_name: str,
+    project_name: str,
+    period: int,
+    metric_id: str = "e1",
+    stat: str = "Sum",
+) -> list[list[dict[str, Any]]]:
+    """SEARCH query with dynamic label showing ModelId only in legends.
+
+    Metrics are published with ProjectName, AgentRuntimeName, and ModelId.
+    Default SEARCH labels concatenate all dimension values
+    (e.g. "runtime_xxx claude-fable-5"); keep ModelId only.
+    """
+    return [
+        [
+            {
+                "expression": _custom_metric_search_expression(
+                    metric_name, project_name, period, stat
+                ),
+                "label": "${PROP('Dim.ModelId')}",
+                "id": metric_id,
+            }
+        ]
+    ]
+
+
 def _custom_project_metric(
     metric_name: str,
     project_name: str,
@@ -739,16 +765,9 @@ def build_dashboard_body(
                 {
                     **pie_base,
                     "title": "🥧 Tokens by Model",
-                    "metrics": [
-                        [
-                            {
-                                "expression": _custom_metric_search_expression(
-                                    "TotalTokens", project_name, 86400
-                                ),
-                                "id": "e1",
-                            }
-                        ]
-                    ],
+                    "metrics": _custom_model_metric_query(
+                        "TotalTokens", project_name, 86400
+                    ),
                 },
             ),
             _dashboard_metric_widget(
@@ -945,16 +964,9 @@ def build_dashboard_body(
                     "stacked": True,
                     "region": region,
                     "period": 300,
-                    "metrics": [
-                        [
-                            {
-                                "expression": _custom_metric_search_expression(
-                                    "TotalTokens", project_name, 300
-                                ),
-                                "id": "e1",
-                            }
-                        ]
-                    ],
+                    "metrics": _custom_model_metric_query(
+                        "TotalTokens", project_name, 300
+                    ),
                 },
             ),
             _dashboard_metric_widget(
