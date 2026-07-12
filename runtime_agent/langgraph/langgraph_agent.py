@@ -12,8 +12,7 @@ from typing import Literal
 from langgraph.graph import START, END, StateGraph
 from typing_extensions import Annotated, TypedDict
 from langgraph.graph.message import add_messages
-from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 from langchain_core.messages.ai import AIMessage, AIMessageChunk
 from langchain_core.messages.base import BaseMessage, BaseMessageChunk
 from langgraph.prebuilt import ToolNode
@@ -580,6 +579,42 @@ BASE_SYSTEM_PROMPT = (
 
 MAX_CONTEXT_TURNS = 5
 
+# Bedrock Anthropic/Nova prompt caching (ephemeral, 5m TTL).
+PROMPT_CACHE_CONTROL = {"type": "ephemeral", "ttl": "5m"}
+
+
+def _supports_prompt_caching(model_type: str | None) -> bool:
+    return model_type in ("claude", "nova")
+
+
+def _system_message_with_cache(system: str) -> SystemMessage:
+    """Build a SystemMessage with an Anthropic-style cache breakpoint."""
+    return SystemMessage(
+        content=[
+            {
+                "type": "text",
+                "text": system,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+    )
+
+
+def _log_prompt_cache_usage(response: AIMessage) -> None:
+    """Log cache_read / cache_creation from usage_metadata when present."""
+    usage = getattr(response, "usage_metadata", None) or {}
+    details = usage.get("input_token_details") if isinstance(usage, dict) else None
+    if not isinstance(details, dict):
+        return
+    cache_read = details.get("cache_read") or 0
+    cache_creation = details.get("cache_creation") or 0
+    if cache_read or cache_creation:
+        logger.info(
+            "prompt cache usage: cache_read=%s cache_creation=%s",
+            cache_read,
+            cache_creation,
+        )
+
 
 def trim_messages_by_human_turns(messages: list, max_turns: int) -> list:
     """Keep messages from the last N HumanMessage turns (inclusive)."""
@@ -609,9 +644,14 @@ async def call_model(state: State, config):
 
     # Capture model id before concurrent requests mutate the shared chat module.
     active_model_id = chat.model_id
+    active_model_type = chat.model_type
     chatModel = chat.get_chat()
 
     model = chatModel.bind_tools(tools) if tools else chatModel
+    use_prompt_cache = _supports_prompt_caching(active_model_type)
+    if use_prompt_cache:
+        # ChatBedrock: marks last message; ChatBedrockConverse: system+tools+last.
+        model = model.bind(cache_control=PROMPT_CACHE_CONTROL)
 
     try:
         raw = state["messages"]
@@ -660,17 +700,15 @@ async def call_model(state: State, config):
         if chat.uses_adaptive_thinking(active_model_id):
             messages = chat.sanitize_adaptive_thinking_messages(messages)
 
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                ("system", system),
-                MessagesPlaceholder(variable_name="messages"),
-            ]
-        )
-        chain = prompt | model
-            
+        if use_prompt_cache:
+            system_msg = _system_message_with_cache(system)
+        else:
+            system_msg = SystemMessage(content=system)
+        model_messages = [system_msg, *messages]
+
         # Stream tokens/chunks to the graph via astream (use with stream_mode="messages")
         accumulated: AIMessageChunk | None = None
-        async for chunk in chain.astream({"messages": messages}):
+        async for chunk in model.astream(model_messages):
             if accumulated is None:
                 accumulated = chunk
             else:
@@ -686,6 +724,7 @@ async def call_model(state: State, config):
         if chat.uses_adaptive_thinking(active_model_id):
             response = chat.sanitize_adaptive_thinking_messages([response])[0]
         logger.info(f"response of call_model: {response}")
+        _log_prompt_cache_usage(response)
 
         try:
             import cloudwatch_metrics
