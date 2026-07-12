@@ -46,6 +46,7 @@ agentcore_control_client = boto3.client(
     region_name=AGENTCORE_GATEWAY_REGION,
 )
 s3files_client = boto3.client("s3files", region_name=region)
+secrets_client = boto3.client("secretsmanager", region_name=region)
 
 # Get account ID if not set
 if not account_id:
@@ -2018,6 +2019,52 @@ def delete_s3_files_session_storage() -> None:
     logger.info("✓ S3 Files session storage deleted")
 
 
+def delete_secrets(skip_confirmation: bool = False) -> bool:
+    """Delete shared Secrets Manager secrets (Tavily / Notion API keys).
+
+    These secrets are shared across projects. By default, ask before deletion
+    and keep them when the answer is empty/no.
+
+    Returns True when secrets were deleted (or already gone after confirmation).
+    Returns False when the user declined deletion.
+    """
+    logger.info("[6.6/9] Deleting secrets")
+
+    secret_names = [
+        "tavilyapikey",
+        "notionapikey",
+    ]
+
+    if not skip_confirmation:
+        print("\n" + "=" * 60)
+        print("Shared secrets (reusable across projects) may be deleted:")
+        for secret_name in secret_names:
+            print(f"  - {secret_name}")
+        print("=" * 60)
+        response = input(
+            "\nDelete shared Tavily/Notion API key secrets? (yes/no) [no]: "
+        ).strip().lower()
+        if response != "yes":
+            logger.info(
+                "  Skipping shared secret deletion (default: no)."
+            )
+            return False
+
+    for secret_name in secret_names:
+        try:
+            secrets_client.delete_secret(
+                SecretId=secret_name,
+                ForceDeleteWithoutRecovery=True,
+            )
+            logger.info(f"  ✓ Deleted secret: {secret_name}")
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ResourceNotFoundException":
+                logger.warning(f"  Could not delete secret {secret_name}: {e}")
+
+    logger.info("✓ Secrets deleted")
+    return True
+
+
 def delete_local_config_files() -> None:
     """Remove local config files written by installer/runtime installers."""
     logger.info("[10/10] Deleting local config files")
@@ -2102,6 +2149,14 @@ def main():
             "(default: ask, default answer no)"
         ),
     )
+    parser.add_argument(
+        "--delete-shared-secrets",
+        action="store_true",
+        help=(
+            "Delete shared tavilyapikey/notionapikey secrets without a separate "
+            "confirmation prompt (default: ask, default answer no)"
+        ),
+    )
     
     args = parser.parse_args()
     
@@ -2154,6 +2209,7 @@ def main():
         agentcore_gateway_deleted = delete_agentcore_websearch_gateway(
             skip_confirmation=args.delete_agentcore_gateway
         )
+        delete_secrets(skip_confirmation=args.delete_shared_secrets)
         delete_iam_roles(delete_agentcore_gateway_role=agentcore_gateway_deleted)
         delete_s3_buckets()
         delete_disabled_cloudfront_distributions()

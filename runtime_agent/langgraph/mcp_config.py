@@ -58,7 +58,19 @@ def load_config(mcp_type):
     elif mcp_type == "image generation":
         mcp_type = "image_generation"
     
-    if mcp_type == "aws_documentation":
+    if mcp_type == "tavily":
+        return {
+            "mcpServers": {
+                "tavily-search": {
+                    "command": "python",
+                    "args": [
+                        f"{workingDir}/mcp_server_tavily.py"
+                    ]
+                }
+            }
+        }
+
+    elif mcp_type == "aws_documentation":
         return {
             "mcpServers": {
                 "awslabs.aws-documentation-mcp-server": {
@@ -124,6 +136,34 @@ def load_config(mcp_type):
                     "args": [
                         f"{workingDir}/mcp_server_image_generation.py"
                     ]
+                }
+            }
+        }
+
+    elif mcp_type == "aws-drawio":
+        return {
+            "mcpServers": {
+                "drawio": {
+                    "command": "npx",
+                    "args": [
+                        "-y",
+                        "https://github.com/aws-samples/sample-drawio-mcp/releases/latest/download/drawio-mcp-server-latest.tgz",
+                        "--no-cache"
+                    ],
+                    "type": "stdio"
+                }
+            }
+        }
+
+    elif mcp_type == "notion":
+        return {
+            "mcpServers": {
+                "notionApi": {
+                    "command": "npx",
+                    "args": ["-y", "@notionhq/notion-mcp-server"],
+                    "env": {
+                        "NOTION_TOKEN": utils.notion_api_key
+                    }
                 }
             }
         }

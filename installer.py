@@ -76,6 +76,7 @@ agentcore_control_client = boto3.client(
     region_name=AGENTCORE_GATEWAY_REGION,
 )
 s3files_client = boto3.client("s3files", region_name=region)
+secrets_client = boto3.client("secretsmanager", region_name=region)
 
 S3_FILES_SESSION_PREFIX = "agentcore-sessions/"
 
@@ -115,6 +116,69 @@ def setup_logging(log_level=logging.INFO):
 
 
 logger = setup_logging()
+
+
+def create_secrets() -> Dict[str, str]:
+    """Create shared Secrets Manager secrets for Tavily and Notion API keys.
+
+    Secret names are project-agnostic (tavilyapikey / notionapikey) so they
+    can be reused across projects in the same AWS account/region.
+    """
+    logger.info("Creating Secrets Manager secrets (shared across projects)")
+    logger.info("Please enter API keys when prompted (press Enter to skip and leave empty):")
+
+    secrets = {
+        "tavily": {
+            "name": "tavilyapikey",
+            "description": "shared secret for tavily api key (reusable across projects)",
+            "secret_value": {
+                "tavily_api_key": "",
+            }
+        },
+        "notion": {
+            "name": "notionapikey",
+            "description": "shared secret for notion api key (reusable across projects)",
+            "secret_value": {
+                "notion_api_key": ""
+            }
+        },
+    }
+
+    secret_arns = {}
+
+    for key, secret_config in secrets.items():
+        try:
+            response = secrets_client.describe_secret(SecretId=secret_config["name"])
+            secret_arns[key] = response["ARN"]
+            logger.warning(f"  Secret already exists: {secret_config['name']}")
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ResourceNotFoundException":
+                if key == "tavily":
+                    logger.info(f"Enter credential of {secret_config['name']} (Tavily API Key):")
+                    api_key = input(f"Creating {secret_config['name']} - Tavily API Key: ").strip()
+                    secret_config["secret_value"]["tavily_api_key"] = api_key
+                elif key == "notion":
+                    logger.info(f"Enter credential of {secret_config['name']} (Notion API Key):")
+                    api_key = input(f"Creating {secret_config['name']} - Notion API Key: ").strip()
+                    secret_config["secret_value"]["notion_api_key"] = api_key
+
+                try:
+                    response = secrets_client.create_secret(
+                        Name=secret_config["name"],
+                        Description=secret_config["description"],
+                        SecretString=json.dumps(secret_config["secret_value"])
+                    )
+                    secret_arns[key] = response["ARN"]
+                    logger.info(f"  ✓ Created secret: {secret_config['name']}")
+                except ClientError as create_error:
+                    logger.error(f"  Failed to create secret {secret_config['name']}: {create_error}")
+                    raise
+            else:
+                logger.error(f"  Failed to check secret {secret_config['name']}: {e}")
+                raise
+
+    logger.info(f"✓ Created/verified {len(secret_arns)} secrets")
+    return secret_arns
 
 
 def create_s3_bucket() -> str:
@@ -6627,6 +6691,9 @@ def main():
     deployment_success = False
     
     try:
+        # 0. Create Secrets Manager secrets (Tavily / Notion API keys)
+        create_secrets()
+
         # 1. Create S3 bucket
         s3_bucket_name = create_s3_bucket()
         logger.info(f"S3 bucket created...")

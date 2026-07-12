@@ -93,23 +93,18 @@ def _load_tavily_api_key(app_config: dict) -> str:
         return key
 
     region = app_config.get("region", "us-west-2")
-    secret_names = []
-    if app_config.get("knowledge_base_name"):
-        secret_names.append(f"tavilyapikey-{app_config['knowledge_base_name']}")
-    if app_config.get("projectName"):
-        secret_names.append(f"tavilyapikey-{app_config['projectName']}")
-
+    # Shared secret name — matches installer.py / langgraph IAM (tavilyapikey*).
+    secret_name = "tavilyapikey"
     secrets_client = boto3.client("secretsmanager", region_name=region)
-    for secret_name in dict.fromkeys(secret_names):
-        try:
-            response = secrets_client.get_secret_value(SecretId=secret_name)
-            secret_data = json.loads(response["SecretString"])
-            key = secret_data.get("tavily_api_key", "")
-            if key:
-                logger.info(f"tavily_key loaded from Secrets Manager: {secret_name}")
-                return key
-        except Exception as e:
-            logger.debug(f"Could not load Tavily secret {secret_name}: {e}")
+    try:
+        response = secrets_client.get_secret_value(SecretId=secret_name)
+        secret_data = json.loads(response["SecretString"])
+        key = secret_data.get("tavily_api_key", "")
+        if key:
+            logger.info(f"tavily_key loaded from Secrets Manager: {secret_name}")
+            return key
+    except Exception as e:
+        logger.debug(f"Could not load Tavily secret {secret_name}: {e}")
     return ""
 
 
@@ -120,3 +115,34 @@ if tavily_key:
     logger.info("tavily_key is configured")
 else:
     logger.info("tavily_key is not set.")
+
+
+def _load_notion_api_key(app_config: dict) -> str:
+    """Load Notion API key from config.json or Secrets Manager."""
+    key = (app_config.get("notion_api_key") or "").strip()
+    if key:
+        return key
+
+    region = app_config.get("region", "us-west-2")
+    # Shared secret name — matches installer.py / langgraph IAM (notionapikey*).
+    secret_name = "notionapikey"
+    secrets_client = boto3.client("secretsmanager", region_name=region)
+    try:
+        response = secrets_client.get_secret_value(SecretId=secret_name)
+        secret_data = json.loads(response["SecretString"])
+        key = (secret_data.get("notion_api_key") or "").strip()
+        if key:
+            logger.info(f"notion_api_key loaded from Secrets Manager: {secret_name}")
+            return key
+    except Exception as e:
+        logger.debug(f"Could not load Notion secret {secret_name}: {e}")
+    return ""
+
+
+notion_api_key = _load_notion_api_key(config)
+if notion_api_key:
+    os.environ["NOTION_API_KEY"] = notion_api_key
+    os.environ["NOTION_TOKEN"] = notion_api_key
+    logger.info("notion_api_key is configured")
+else:
+    logger.info("notion_api_key is not set.")
