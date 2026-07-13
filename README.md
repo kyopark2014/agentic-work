@@ -1630,8 +1630,14 @@ reduction_% = sum(cache_read) / sum(input + cache_creation + cache_read)
 아래와 같이 EC2를 이용해 배포 환경을 구성합니다.
 
 1. AWS Console의 EC2에 접속해서 [Launch instance]를 선택합니다.
-2. EC2 생성시 Architecture로 **Arm64**을 선택하고 나머지는 기본값으로 생성합니다. (ECS/AgentCore 이미지는 `linux/arm64`로 빌드합니다.)
-3. [EC2 Instance Connect]로 접속해서 OS를 확인한 뒤, git과 **Python 3.12**를 설치합니다.
+
+<img width="970" height="212" alt="image" src="https://github.com/user-attachments/assets/d6b0cb61-7de2-4436-9634-efc6700842d3" />
+
+2. ECS/AgentCore 이미지는 `linux/arm64`로 빌드하므로, EC2 생성시 Architecture로 **Arm64**을 선택하고 나머지는 기본값으로 생성합니다.  
+
+<img width="156" height="119" alt="image" src="https://github.com/user-attachments/assets/5a09e50d-e57b-46c7-9a3f-296a2f197ac8" />
+
+3. 생성한 EC2를 선택하여 [Connect] - [EC2 Instance Connect]로 접속합니다. 이후 아래와 같이 git과 **Python 3.12**를 설치합니다.
 
 Amazon Linux 2023의 기본 `python3`는 3.9입니다. AgentCore Web Search gateway(`targetConfiguration.mcp.connector`)는 **boto3 >= 1.43.32**가 필요하고, 이 버전은 **Python 3.10+**에서만 설치됩니다. 따라서 installer는 `python3.12` + venv로 실행하세요. `/usr/bin/python3` 심볼릭 링크는 바꾸지 마세요.
 
@@ -1680,13 +1686,13 @@ git clone https://github.com/kyopark2014/agentic-work
 cd agentic-work
 ```
 
-7. Python 3.12 가상환경을 만들고 의존성을 설치한 뒤, [installer.py](./installer.py)로 배포합니다.
+7. Python 3.12 가상환경을 만들고 boto3를 설치한 뒤, [installer.py](./installer.py)로 배포합니다.
 
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
+pip install boto3
+
 # boto3/botocore가 1.43.32 이상인지 확인
 python -c "import boto3, botocore; print(boto3.__version__, botocore.__version__)"
 
