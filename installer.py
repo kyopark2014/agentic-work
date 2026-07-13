@@ -19,7 +19,7 @@ import sys
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
-from botocore.exceptions import ClientError, NoCredentialsError
+from botocore.exceptions import ClientError, NoCredentialsError, ParamValidationError
 import urllib.request
 import urllib.error
 
@@ -29,6 +29,8 @@ region = "us-west-2"
 AGENTCORE_GATEWAY_REGION = "us-east-1"
 AGENTCORE_WEBSEARCH_GATEWAY_NAME = "gateway-websearch"
 AGENTCORE_WEBSEARCH_TARGET_NAME = "websearch"
+# Web-search gateway targets use targetConfiguration.mcp.connector (added in boto3 1.43.32).
+MIN_BOTO3_VERSION_FOR_AGENTCORE_CONNECTOR = "1.43.32"
 git_name = "agentic-work"
 
 # SSE streaming: long tool runs can go 30s+ without tokens; CloudFront/ALB must stay open.
@@ -3523,6 +3525,71 @@ def _write_websearch_gateway_config(gateway_info: Dict[str, str]) -> bool:
     return write_application_config(config_data)
 
 
+def _agentcore_mcp_supports_connector(client) -> bool:
+    """Return True when the local botocore model includes the MCP connector target."""
+    try:
+        shape = client.meta.service_model.shape_for("McpTargetConfiguration")
+        return "connector" in shape.members
+    except Exception:
+        return False
+
+
+def ensure_boto3_supports_agentcore_connector() -> None:
+    """Upgrade boto3/botocore when the SDK model lacks web-search connector support."""
+    import botocore
+
+    if _agentcore_mcp_supports_connector(agentcore_control_client):
+        return
+
+    current = getattr(botocore, "__version__", "unknown")
+    logger.warning(
+        "Local boto3/botocore (%s) is missing AgentCore MCP connector support "
+        "required for the web-search gateway. Upgrading to >= %s...",
+        current,
+        MIN_BOTO3_VERSION_FOR_AGENTCORE_CONNECTOR,
+    )
+    try:
+        subprocess.check_call(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--upgrade",
+                f"boto3>={MIN_BOTO3_VERSION_FOR_AGENTCORE_CONNECTOR}",
+                f"botocore>={MIN_BOTO3_VERSION_FOR_AGENTCORE_CONNECTOR}",
+            ]
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            f"boto3/botocore upgrade failed (current botocore {current}). "
+            "Install manually: "
+            f"pip install --upgrade 'boto3>={MIN_BOTO3_VERSION_FOR_AGENTCORE_CONNECTOR}' "
+            f"'botocore>={MIN_BOTO3_VERSION_FOR_AGENTCORE_CONNECTOR}'"
+        ) from e
+
+    logger.info("boto3 upgraded; restarting installer with updated SDK...")
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+def _websearch_gateway_target_configuration() -> Dict:
+    return {
+        "mcp": {
+            "connector": {
+                "source": {
+                    "connectorId": "web-search",
+                },
+                "configurations": [
+                    {
+                        "name": "WebSearch",
+                        "parameterValues": {},
+                    }
+                ],
+            }
+        }
+    }
+
+
 def _ensure_websearch_gateway_target(gateway_id: str) -> str:
     """Create the managed web-search connector target if it does not exist."""
     for target in _list_all_agentcore_gateway_targets(gateway_id):
@@ -3533,30 +3600,32 @@ def _ensure_websearch_gateway_target(gateway_id: str) -> str:
             )
             return target_id
 
+    if not _agentcore_mcp_supports_connector(agentcore_control_client):
+        raise RuntimeError(
+            "boto3/botocore is too old for AgentCore web-search connector targets. "
+            f"Run: pip install --upgrade 'boto3>={MIN_BOTO3_VERSION_FOR_AGENTCORE_CONNECTOR}' "
+            f"'botocore>={MIN_BOTO3_VERSION_FOR_AGENTCORE_CONNECTOR}'"
+        )
+
     logger.info("  Creating AgentCore websearch gateway target")
-    response = agentcore_control_client.create_gateway_target(
-        gatewayIdentifier=gateway_id,
-        name=AGENTCORE_WEBSEARCH_TARGET_NAME,
-        description=f"Managed Web Search connector for {project_name}",
-        targetConfiguration={
-            "mcp": {
-                "connector": {
-                    "source": {
-                        "connectorId": "web-search",
-                    },
-                    "configurations": [
-                        {
-                            "name": "WebSearch",
-                            "parameterValues": {},
-                        }
-                    ],
-                }
-            }
-        },
-        credentialProviderConfigurations=[
+    create_kwargs = {
+        "gatewayIdentifier": gateway_id,
+        "name": AGENTCORE_WEBSEARCH_TARGET_NAME,
+        "description": f"Managed Web Search connector for {project_name}",
+        "targetConfiguration": _websearch_gateway_target_configuration(),
+        "credentialProviderConfigurations": [
             {"credentialProviderType": "GATEWAY_IAM_ROLE"}
         ],
-    )
+    }
+    try:
+        response = agentcore_control_client.create_gateway_target(**create_kwargs)
+    except ParamValidationError as e:
+        raise RuntimeError(
+            "Failed to create AgentCore web-search gateway target because the local "
+            "boto3/botocore service model is outdated (missing targetConfiguration.mcp.connector). "
+            f"Upgrade with: pip install --upgrade 'boto3>={MIN_BOTO3_VERSION_FOR_AGENTCORE_CONNECTOR}' "
+            f"'botocore>={MIN_BOTO3_VERSION_FOR_AGENTCORE_CONNECTOR}'"
+        ) from e
     target_id = response["targetId"]
     logger.info(f"  ✓ AgentCore websearch target created: {target_id}")
 
@@ -4262,6 +4331,80 @@ DOCKER_MIN_FREE_MB = 2048
 DOCKER_REQUIRED_FREE_MB = 1024
 
 
+def _docker_daemon_reachable(timeout: int = 20) -> Tuple[bool, str]:
+    """Return (ok, detail) for whether the local Docker daemon accepts commands."""
+    try:
+        result = subprocess.run(
+            ["docker", "info"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        if result.returncode == 0:
+            return True, ""
+        return False, (result.stderr or result.stdout).strip()
+    except subprocess.TimeoutExpired:
+        return False, f"docker info timed out after {timeout}s"
+    except Exception as e:
+        return False, str(e)
+
+
+def _try_start_docker_daemon() -> bool:
+    """Best-effort start of the Docker service on Linux hosts."""
+    commands = [
+        ["systemctl", "start", "docker"],
+        ["sudo", "systemctl", "start", "docker"],
+        ["service", "docker", "start"],
+        ["sudo", "service", "docker", "start"],
+    ]
+    for cmd in commands:
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            if result.returncode == 0:
+                logger.info(f"  Started Docker via: {' '.join(cmd)}")
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def ensure_docker_daemon_running() -> None:
+    """Require a reachable Docker daemon before image build/push."""
+    ok, detail = _docker_daemon_reachable()
+    if ok:
+        logger.info("  ✓ Docker daemon is running")
+        return
+
+    logger.warning(f"  Docker daemon not reachable: {detail}")
+    logger.info("  Attempting to start Docker service...")
+    if _try_start_docker_daemon():
+        time.sleep(2)
+        ok, detail = _docker_daemon_reachable()
+        if ok:
+            logger.info("  ✓ Docker daemon is running")
+            return
+
+    raise RuntimeError(
+        "Docker daemon is not available.\n"
+        f"  Detail: {detail or 'unknown'}\n"
+        "  On Amazon Linux / EC2, run:\n"
+        "    sudo dnf install -y docker   # or: sudo yum install -y docker\n"
+        "    sudo systemctl start docker\n"
+        "    sudo systemctl enable docker\n"
+        "    sudo usermod -aG docker $USER\n"
+        "    newgrp docker\n"
+        "    docker info\n"
+        "  Then rerun installer.py (or use --skip-docker-build if the image is already in ECR)."
+    )
+
+
 def _host_is_arm64() -> bool:
     return os.uname().machine.lower() in ("aarch64", "arm64")
 
@@ -4293,31 +4436,63 @@ def _require_arm64_build_host(context: str) -> None:
 NATIVE_BUILDX_BUILDER = "ecs-native-builder"
 
 
+def _normalize_buildx_builder_name(name: str) -> str:
+    return name.strip().rstrip("*")
+
+
 def _list_docker_driver_builders() -> list[str]:
     """Return buildx builder names that use the docker driver."""
-    result = subprocess.run(
-        ["docker", "buildx", "ls"],
+    builders: list[str] = []
+
+    fmt = subprocess.run(
+        ["docker", "buildx", "ls", "--format", "{{.Name}} {{.Driver}}"],
         capture_output=True,
         text=True,
         timeout=60,
         check=False,
     )
-    if result.returncode != 0:
-        return []
+    if fmt.returncode == 0:
+        for line in fmt.stdout.splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 2 and parts[1] == "docker":
+                name = _normalize_buildx_builder_name(parts[0])
+                if name and name not in builders:
+                    builders.append(name)
 
-    builders: list[str] = []
-    for line in result.stdout.splitlines():
-        # Skip header and node rows (" \_ nodename ...")
-        if not line.strip() or line.startswith("NAME") or line[:1].isspace():
+    if not builders:
+        result = subprocess.run(
+            ["docker", "buildx", "ls"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                # Skip header and node rows (" \_ nodename ...")
+                if not line.strip() or line.startswith("NAME") or line[:1].isspace():
+                    continue
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                name = _normalize_buildx_builder_name(parts[0])
+                driver = parts[1]
+                if driver == "docker" and name not in builders:
+                    builders.append(name)
+
+    for fallback_name in ("default", "desktop-linux"):
+        if fallback_name in builders:
             continue
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        name = parts[0].rstrip("*")
-        driver = parts[1]
-        # Exact match: "docker" only (not "docker-container")
-        if driver == "docker":
-            builders.append(name)
+        inspect = subprocess.run(
+            ["docker", "buildx", "inspect", fallback_name],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        if inspect.returncode == 0:
+            builders.append(fallback_name)
+
     return builders
 
 
@@ -4377,13 +4552,14 @@ def _select_existing_docker_builder() -> Optional[str]:
     return None
 
 
-def _ensure_native_buildx_builder() -> None:
-    """Ensure a local docker-driver buildx builder for reliable ECR push.
+def _ensure_native_buildx_builder() -> bool:
+    """Ensure a usable buildx builder is selected for ECR push.
 
-    Docker only allows a single named instance of the docker driver in many
-    environments (Docker Desktop already provides default/desktop-linux).
-    Prefer reusing an existing docker-driver builder over creating a new one.
+    Returns True when buildx is ready, False when callers should use classic
+    ``docker build`` + ``docker push`` (native ARM64 EC2 hosts).
     """
+    selected: Optional[str] = None
+
     inspect = subprocess.run(
         ["docker", "buildx", "inspect", NATIVE_BUILDX_BUILDER],
         capture_output=True,
@@ -4392,15 +4568,10 @@ def _ensure_native_buildx_builder() -> None:
         check=False,
     )
     if inspect.returncode == 0:
-        _use_buildx_builder(NATIVE_BUILDX_BUILDER)
+        selected = NATIVE_BUILDX_BUILDER
     else:
         selected = _select_existing_docker_builder()
-        if selected:
-            logger.info(
-                f"  Reusing existing docker-driver buildx builder: {selected} "
-                f"(cannot create additional docker-driver instances)"
-            )
-        else:
+        if not selected:
             create = subprocess.run(
                 [
                     "docker", "buildx", "create",
@@ -4413,20 +4584,31 @@ def _ensure_native_buildx_builder() -> None:
                 timeout=120,
                 check=False,
             )
-            if create.returncode != 0:
+            if create.returncode == 0:
+                selected = NATIVE_BUILDX_BUILDER
+            else:
                 err = (create.stderr or create.stdout).strip()
-                # Last resort: reuse whatever docker-driver builder exists
-                if "additional instances of driver" in err:
-                    selected = _select_existing_docker_builder()
-                    if selected:
-                        logger.info(
-                            f"  Reusing existing docker-driver buildx builder: {selected} "
-                            f"after create failed: {err}"
-                        )
-                    else:
-                        raise RuntimeError(f"Failed to create buildx builder: {err}")
+                selected = _select_existing_docker_builder()
+                if selected:
+                    logger.info(
+                        f"  Reusing existing docker-driver buildx builder: {selected} "
+                        f"(cannot create additional docker-driver instances)"
+                    )
+                elif "additional instances of driver" in err:
+                    logger.warning(
+                        "  Could not create or select a buildx docker-driver builder; "
+                        "falling back to classic docker build + push."
+                    )
+                    return False
                 else:
-                    raise RuntimeError(f"Failed to create buildx builder: {err}")
+                    logger.warning(
+                        f"  buildx builder setup failed ({err}); "
+                        "falling back to classic docker build + push."
+                    )
+                    return False
+
+    if selected:
+        _use_buildx_builder(selected)
 
     bootstrap = subprocess.run(
         ["docker", "buildx", "inspect", "--bootstrap"],
@@ -4437,7 +4619,50 @@ def _ensure_native_buildx_builder() -> None:
     )
     if bootstrap.returncode != 0:
         err = (bootstrap.stderr or bootstrap.stdout).strip()
-        raise RuntimeError(f"Failed to bootstrap buildx builder: {err}")
+        logger.warning(
+            f"  buildx bootstrap failed ({err}); "
+            "falling back to classic docker build + push."
+        )
+        return False
+
+    return True
+
+
+def _build_and_push_with_buildx(
+    image_uri: str,
+    docker_platform: str,
+    project_root: str,
+) -> None:
+    _run_command_streaming(
+        [
+            "docker", "buildx", "build",
+            "--platform", docker_platform,
+            "--provenance=false",
+            "--sbom=false",
+            "-t", image_uri,
+            "--push",
+            ".",
+        ],
+        cwd=project_root,
+    )
+
+
+def _build_and_push_with_classic_docker(
+    image_uri: str,
+    docker_platform: str,
+    project_root: str,
+) -> None:
+    """Build and push without buildx (reliable on native ARM64 EC2)."""
+    _run_command_streaming(
+        [
+            "docker", "build",
+            "--platform", docker_platform,
+            "-t", image_uri,
+            ".",
+        ],
+        cwd=project_root,
+    )
+    _run_command_streaming(["docker", "push", image_uri], cwd=project_root)
 
 
 
@@ -4555,6 +4780,7 @@ def build_and_push_docker_image(
     if shutil.which("docker") is None:
         raise RuntimeError("Docker CLI is required to build and push the container image")
 
+    ensure_docker_daemon_running()
     _require_arm64_build_host("ECS container image build")
 
     if not image_tag:
@@ -4589,23 +4815,16 @@ def build_and_push_docker_image(
     docker_platform = _docker_build_platform()
     logger.info(f"  Host architecture: {os.uname().machine}")
     logger.info(f"  Docker platform: {docker_platform} (native ARM64 build, no QEMU)")
-    _ensure_native_buildx_builder()
+    use_buildx = _ensure_native_buildx_builder()
     logger.info(f"  Starting Docker build+push: {image_uri}")
     logger.info("  Build output streams below (this may take several minutes)...")
-    # Push directly from buildx to avoid Docker Desktop containerd digest mismatch
-    # between `docker build` and `docker push` on large multi-stage images.
-    _run_command_streaming(
-        [
-            "docker", "buildx", "build",
-            "--platform", docker_platform,
-            "--provenance=false",
-            "--sbom=false",
-            "-t", image_uri,
-            "--push",
-            ".",
-        ],
-        cwd=project_root,
-    )
+    if use_buildx:
+        # Push directly from buildx to avoid Docker Desktop containerd digest mismatch
+        # between `docker build` and `docker push` on large multi-stage images.
+        _build_and_push_with_buildx(image_uri, docker_platform, project_root)
+    else:
+        logger.info("  Using classic docker build + push (no buildx)")
+        _build_and_push_with_classic_docker(image_uri, docker_platform, project_root)
     logger.info("  ✓ Docker build and push completed")
     logger.info(f"  Promoting {image_tag} to latest in ECR (avoid stale manifest list push)")
     _promote_ecr_image_tag(repository_uri, image_tag, "latest")
@@ -6665,6 +6884,8 @@ def main():
         success = install_agent_runtime(runtime_type)
         sys.exit(0 if success else 1)
     
+    ensure_boto3_supports_agentcore_connector()
+
     logger.info("="*60)
     logger.info("Starting AWS Infrastructure Deployment")
     logger.info("="*60)

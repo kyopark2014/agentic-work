@@ -5,7 +5,7 @@ uvicorn[standard]
 
 # AWS / AgentCore
 bedrock-agentcore
-boto3
+boto3>=1.43.32
 aws-bedrock-token-generator
 
 # OpenTelemetry (runtime_agent/langgraph/)

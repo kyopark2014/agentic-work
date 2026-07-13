@@ -1630,18 +1630,37 @@ reduction_% = sum(cache_read) / sum(input + cache_creation + cache_read)
 아래와 같이 EC2를 이용해 배포 환경을 구성합니다.
 
 1. AWS Console의 EC2에 접속해서 [Launch instance]를 선택합니다.
-2. EC2 생성시 Architecture로 Arm64을 선택하고 나머지는 기본값으로 생성합니다.
-3. [EC2 Instance Connect]로 접속해서 아래와 같이 python, pip, git, boto3를 설치합니다.
+2. EC2 생성시 Architecture로 **Arm64**을 선택하고 나머지는 기본값으로 생성합니다. (ECS/AgentCore 이미지는 `linux/arm64`로 빌드합니다.)
+3. [EC2 Instance Connect]로 접속해서 OS를 확인한 뒤, git과 **Python 3.12**를 설치합니다.
 
-```text
-sudo yum install python3 python3-pip git 
-pip install boto3 
-```
-
-4. 아래 명령어로 docker를 설치합니다.
+Amazon Linux 2023의 기본 `python3`는 3.9입니다. AgentCore Web Search gateway(`targetConfiguration.mcp.connector`)는 **boto3 >= 1.43.32**가 필요하고, 이 버전은 **Python 3.10+**에서만 설치됩니다. 따라서 installer는 `python3.12` + venv로 실행하세요. `/usr/bin/python3` 심볼릭 링크는 바꾸지 마세요.
 
 ```bash
-sudo yum install -y docker
+cat /etc/os-release
+
+# Amazon Linux 2023
+sudo dnf update -y
+sudo dnf install -y git python3.12 python3.12-pip python3.12-devel
+
+# Amazon Linux 2 (python3.12 패키지가 없으면 pyenv 등 별도 설치 필요)
+# sudo yum install -y git python3 python3-pip
+```
+
+버전 확인:
+
+```bash
+python3.12 --version
+python3 --version   # 시스템 Python(대개 3.9) — installer 실행에는 사용하지 않음
+```
+
+4. Docker를 설치하고 데몬을 기동합니다. `Cannot connect to the Docker daemon at unix:///var/run/docker.sock` 에러가 나면 데몬이 꺼져 있거나 권한 문제입니다.
+
+```bash
+# Amazon Linux 2023
+sudo dnf install -y docker
+# Amazon Linux 2
+# sudo yum install -y docker
+
 sudo systemctl start docker
 sudo systemctl enable docker
 sudo usermod -aG docker ec2-user
@@ -1656,23 +1675,44 @@ docker info
 
 6. 아래와 같이 git source를 가져옵니다.
 
-```python
-git clone https://github.com/kyopark2014/langgraph-runtime
+```bash
+git clone https://github.com/kyopark2014/agentic-work
+cd agentic-work
 ```
 
-7. 아래와 같이 [installer.py](./installer.py)를 이용해 설치를 시작합니다.
+7. Python 3.12 가상환경을 만들고 의존성을 설치한 뒤, [installer.py](./installer.py)로 배포합니다.
 
-```text
-python3 langgraph-runtime/installer.py
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+# boto3/botocore가 1.43.32 이상인지 확인
+python -c "import boto3, botocore; print(boto3.__version__, botocore.__version__)"
+
+python installer.py
+```
+
+이미지가 이미 ECR에 있으면 Docker 빌드를 건너뛸 수 있습니다.
+
+```bash
+python installer.py --skip-docker-build
 ```
 
 8. 설치가 완료되면 CloudFront로 접속하여 동작을 확인합니다. Agent를 선택한 후에 적절한 MCP tool을 선택하여 원하는 작업을 수행합니다.
 
 9. 인프라가 더이상 필요없을 때에는 루트 [uninstaller.py](./uninstaller.py)를 이용해 제거합니다. AgentCore Runtime, S3 Files, VPC, ECS, Knowledge Base와 함께 `application/config.json`도 정리됩니다.
 
-```text
+```bash
+source .venv/bin/activate
 python uninstaller.py
 ```
+
+**참고 (트러블슈팅)**
+
+- `Unknown parameter in targetConfiguration.mcp: "connector"` → boto3가 오래됨. Python 3.12 venv에서 `pip install --upgrade 'boto3>=1.43.32'` 후 재실행.
+- `additional instances of driver "docker" cannot be created` → installer가 기존 buildx builder를 재사용하거나 classic `docker build`로 fallback합니다. `git pull`로 최신 installer를 받으세요.
+- `Cannot connect to the Docker daemon` → `sudo systemctl start docker` 후 `docker info`로 확인하세요.
 
 ### Knowledge Base 문서 동기화 하기 
 
