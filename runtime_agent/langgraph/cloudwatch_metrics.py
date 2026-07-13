@@ -97,8 +97,29 @@ def _resolve_model_pricing(model_id: str) -> dict[str, float]:
     return DEFAULT_MODEL_PRICING
 
 
+def _uncached_and_cache_tokens(
+    input_tokens: int,
+    cache_read: int,
+    cache_creation: int,
+) -> tuple[int, int, int]:
+    """Split input footprint into uncached / cache_read / cache_creation.
+
+    Some providers report ``input_tokens`` as the full footprint (uncached +
+    cache), others as uncached-only. Prefer the non-double-counting split.
+    """
+    cache_read = max(0, cache_read)
+    cache_creation = max(0, cache_creation)
+    input_tokens = max(0, input_tokens)
+    cache_total = cache_read + cache_creation
+    if cache_total and input_tokens >= cache_total:
+        uncached = input_tokens - cache_total
+    else:
+        uncached = input_tokens
+    return uncached, cache_read, cache_creation
+
+
 def extract_token_usage(message: Any) -> dict[str, int]:
-    """Extract token counts from a LangChain AIMessage or chunk."""
+    """Extract token counts (including prompt-cache) from a LangChain AIMessage or chunk."""
     usage: dict[str, int] = {}
 
     usage_metadata = getattr(message, "usage_metadata", None)
@@ -109,6 +130,10 @@ def extract_token_usage(message: Any) -> dict[str, int]:
             usage_metadata.get("total_tokens")
             or usage["input_tokens"] + usage["output_tokens"]
         )
+        details = usage_metadata.get("input_token_details")
+        if isinstance(details, dict):
+            usage["cache_read"] = int(details.get("cache_read") or 0)
+            usage["cache_creation"] = int(details.get("cache_creation") or 0)
 
     response_metadata = getattr(message, "response_metadata", None)
     if isinstance(response_metadata, dict):
@@ -129,6 +154,42 @@ def extract_token_usage(message: Any) -> dict[str, int]:
                     or usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
                 ),
             )
+            usage.setdefault(
+                "cache_read",
+                int(
+                    bedrock_usage.get("cache_read_input_tokens")
+                    or bedrock_usage.get("cacheReadInputTokens")
+                    or 0
+                ),
+            )
+            usage.setdefault(
+                "cache_creation",
+                int(
+                    bedrock_usage.get("cache_creation_input_tokens")
+                    or bedrock_usage.get("cache_write_input_tokens")
+                    or bedrock_usage.get("cacheWriteInputTokens")
+                    or 0
+                ),
+            )
+
+        # Top-level Converse / Bedrock response fields (when not nested under usage).
+        usage.setdefault(
+            "cache_read",
+            int(
+                response_metadata.get("cache_read_input_tokens")
+                or response_metadata.get("cacheReadInputTokens")
+                or 0
+            ),
+        )
+        usage.setdefault(
+            "cache_creation",
+            int(
+                response_metadata.get("cache_creation_input_tokens")
+                or response_metadata.get("cache_write_input_tokens")
+                or response_metadata.get("cacheWriteInputTokens")
+                or 0
+            ),
+        )
 
     return {k: v for k, v in usage.items() if v > 0}
 
@@ -141,7 +202,7 @@ def estimate_model_cost_usd(model_id: str, input_tokens: int, output_tokens: int
 
 
 def publish_token_metrics(model_id: str, message: Any) -> None:
-    """Publish token usage and estimated model cost to CloudWatch."""
+    """Publish token usage, prompt-cache, and estimated model cost to CloudWatch."""
     usage = extract_token_usage(message)
     if not usage:
         logger.info(
@@ -155,6 +216,16 @@ def publish_token_metrics(model_id: str, message: Any) -> None:
     total_tokens = usage.get("total_tokens", input_tokens + output_tokens)
     if total_tokens <= 0:
         return
+
+    uncached, cache_read, cache_creation = _uncached_and_cache_tokens(
+        input_tokens,
+        usage.get("cache_read", 0),
+        usage.get("cache_creation", 0),
+    )
+    input_footprint = uncached + cache_read + cache_creation
+    cache_hit_ratio = (
+        (100.0 * cache_read / input_footprint) if input_footprint > 0 else 0.0
+    )
 
     context = _load_runtime_context()
     model_short = model_id.rsplit(".", 1)[-1][:64] if model_id else "unknown"
@@ -179,6 +250,22 @@ def publish_token_metrics(model_id: str, message: Any) -> None:
         {"MetricName": "TotalTokens", "Value": float(total_tokens), "Unit": "Count"},
         {"MetricName": "EstimatedModelCostUSD", "Value": estimated_cost, "Unit": "None"},
         {"MetricName": "LLMInvocations", "Value": 1.0, "Unit": "Count"},
+        {"MetricName": "CacheReadTokens", "Value": float(cache_read), "Unit": "Count"},
+        {
+            "MetricName": "CacheCreationTokens",
+            "Value": float(cache_creation),
+            "Unit": "Count",
+        },
+        {
+            "MetricName": "UncachedInputTokens",
+            "Value": float(uncached),
+            "Unit": "Count",
+        },
+        {
+            "MetricName": "CacheHitRatio",
+            "Value": float(cache_hit_ratio),
+            "Unit": "Percent",
+        },
     ]
 
     for entry in metric_data:
@@ -192,10 +279,14 @@ def publish_token_metrics(model_id: str, message: Any) -> None:
             MetricData=metric_data,
         )
         logger.info(
-            "Published token metrics: model=%s input=%s output=%s cost=$%.6f",
+            "Published token metrics: model=%s input=%s output=%s "
+            "cache_read=%s cache_creation=%s hit_ratio=%.1f%% cost=$%.6f",
             model_short,
             input_tokens,
             output_tokens,
+            cache_read,
+            cache_creation,
+            cache_hit_ratio,
             estimated_cost,
         )
     except Exception as exc:
@@ -816,6 +907,189 @@ def build_dashboard_body(
         ]
     )
     y += 8
+
+    widgets.append(
+        _dashboard_section_title(
+            0,
+            y,
+            _DASHBOARD_GRID,
+            "💾 Prompt Cache",
+            "cache_read · cache_creation · hit ratio (LLM 호출 기준)",
+        )
+    )
+    y += 1
+
+    cache_kpi_specs: list[tuple[int, str, list[Any], str | None]] = [
+        (
+            0,
+            "📖 Cache Read (24h)",
+            [custom("CacheReadTokens", period=86400)],
+            None,
+        ),
+        (
+            6,
+            "✍️ Cache Write (24h)",
+            [custom("CacheCreationTokens", period=86400)],
+            None,
+        ),
+        (
+            12,
+            "🎯 Hit Ratio (24h)",
+            [
+                [
+                    {
+                        "expression": (
+                            "IF((IF(m1, m1, 0) + IF(m2, m2, 0) + IF(m3, m3, 0)) > 0, "
+                            "100 * IF(m1, m1, 0) / (IF(m1, m1, 0) + IF(m2, m2, 0) + IF(m3, m3, 0)), 0)"
+                        ),
+                        "label": "Hit %",
+                        "id": "e1",
+                    }
+                ],
+                _custom_project_metric(
+                    "CacheReadTokens",
+                    project_name,
+                    period=86400,
+                    id="m1",
+                    visible=False,
+                ),
+                _custom_project_metric(
+                    "CacheCreationTokens",
+                    project_name,
+                    period=86400,
+                    id="m2",
+                    visible=False,
+                ),
+                _custom_project_metric(
+                    "UncachedInputTokens",
+                    project_name,
+                    period=86400,
+                    id="m3",
+                    visible=False,
+                ),
+            ],
+            "Percent",
+        ),
+        (
+            18,
+            "📥 Uncached Input (24h)",
+            [custom("UncachedInputTokens", period=86400)],
+            None,
+        ),
+    ]
+    for x, title, metrics, y_label in cache_kpi_specs:
+        props: dict[str, Any] = {
+            "title": title,
+            "region": region,
+            "view": "singleValue",
+            "period": 86400,
+            "stat": "Sum",
+            "setPeriodToTimeRange": True,
+            "metrics": metrics,
+        }
+        if y_label == "Percent":
+            props["yAxis"] = {
+                "left": {"min": 0, "max": 100, "label": "%", "showUnits": False}
+            }
+            props["singleValueFullPrecision"] = True
+        widgets.append(_dashboard_metric_widget(x, y, 6, 5, props))
+    y += 5
+
+    widgets.extend(
+        [
+            _dashboard_metric_widget(
+                0,
+                y,
+                8,
+                8,
+                {
+                    **pie_base,
+                    "title": "🥧 Input Mix (Uncached / Cache Write / Cache Read)",
+                    "metrics": [
+                        [
+                            {
+                                "expression": (
+                                    f"SUM({_custom_metric_search_expression('UncachedInputTokens', project_name, 86400)})"
+                                ),
+                                "label": "Uncached",
+                                "id": "e1",
+                            }
+                        ],
+                        [
+                            {
+                                "expression": (
+                                    f"SUM({_custom_metric_search_expression('CacheCreationTokens', project_name, 86400)})"
+                                ),
+                                "label": "Cache Write",
+                                "id": "e2",
+                            }
+                        ],
+                        [
+                            {
+                                "expression": (
+                                    f"SUM({_custom_metric_search_expression('CacheReadTokens', project_name, 86400)})"
+                                ),
+                                "label": "Cache Read",
+                                "id": "e3",
+                            }
+                        ],
+                    ],
+                },
+            ),
+            _dashboard_metric_widget(
+                8,
+                y,
+                16,
+                8,
+                {
+                    "title": "📈 Prompt Cache Tokens (stacked)",
+                    "view": "timeSeries",
+                    "stacked": True,
+                    "region": region,
+                    "period": 300,
+                    "stat": "Sum",
+                    "metrics": [
+                        custom("UncachedInputTokens", label="Uncached"),
+                        custom("CacheCreationTokens", label="Cache Write"),
+                        custom("CacheReadTokens", label="Cache Read"),
+                    ],
+                },
+            ),
+            _dashboard_metric_widget(
+                0,
+                y + 8,
+                _DASHBOARD_PHI_WIDE,
+                7,
+                {
+                    "title": "🎯 Cache Hit Ratio by Model",
+                    "view": "timeSeries",
+                    "region": region,
+                    "period": 300,
+                    "yAxis": {"left": {"min": 0, "max": 100, "label": "%", "showUnits": False}},
+                    "metrics": _custom_model_metric_query(
+                        "CacheHitRatio", project_name, 300, stat="Average"
+                    ),
+                },
+            ),
+            _dashboard_metric_widget(
+                _DASHBOARD_PHI_WIDE,
+                y + 8,
+                _DASHBOARD_PHI_NARROW,
+                7,
+                {
+                    "title": "📖 Cache Read by Model",
+                    "view": "timeSeries",
+                    "stacked": True,
+                    "region": region,
+                    "period": 300,
+                    "metrics": _custom_model_metric_query(
+                        "CacheReadTokens", project_name, 300
+                    ),
+                },
+            ),
+        ]
+    )
+    y += 15
 
     widgets.append(
         _dashboard_section_title(
