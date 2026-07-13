@@ -2203,8 +2203,8 @@ def main():
 
         failed_vpcs = delete_vpc_resources()
 
-        delete_opensearch_collection()
         delete_knowledge_bases()
+        delete_opensearch_collection()
         delete_s3_vectors_store()
         agentcore_gateway_deleted = delete_agentcore_websearch_gateway(
             skip_confirmation=args.delete_agentcore_gateway

@@ -419,41 +419,29 @@ def create_knowledge_base_role() -> str:
         ]
     }
     attach_inline_policy(role_name, f"knowledge-base-s3-policy-for-{project_name}", s3_policy)
-    
-    # Remove legacy OpenSearch Serverless inline policy if upgrading from a previous install
+
+    # Remove legacy S3 Vectors inline policy if upgrading from a previous install
     try:
         iam_client.delete_role_policy(
             RoleName=role_name,
-            PolicyName=f"bedrock-agent-opensearch-policy-for-{project_name}",
+            PolicyName=f"bedrock-agent-s3vectors-policy-for-{project_name}",
         )
     except ClientError:
         pass
 
-    bucket_arn = s3_vectors_bucket_arn()
-    s3vectors_policy = {
+    opensearch_policy = {
         "Version": "2012-10-17",
         "Statement": [
             {
                 "Effect": "Allow",
-                "Action": [
-                    "s3vectors:GetVectorBucket",
-                    "s3vectors:ListVectorBuckets",
-                    "s3vectors:GetIndex",
-                    "s3vectors:ListIndexes",
-                    "s3vectors:QueryVectors",
-                    "s3vectors:GetVectors",
-                    "s3vectors:PutVectors",
-                    "s3vectors:DeleteVectors",
-                    "s3vectors:ListVectors",
-                ],
-                "Resource": [
-                    bucket_arn,
-                    f"{bucket_arn}/index/*",
-                ],
+                "Action": ["aoss:APIAccessAll"],
+                "Resource": ["*"],
             }
         ],
     }
-    attach_inline_policy(role_name, f"bedrock-agent-s3vectors-policy-for-{project_name}", s3vectors_policy)
+    attach_inline_policy(
+        role_name, f"bedrock-agent-opensearch-policy-for-{project_name}", opensearch_policy
+    )
     
     bedrock_policy = {
         "Version": "2012-10-17",
@@ -785,182 +773,37 @@ def create_ecs_roles(knowledge_base_role_arn: str) -> Dict[str, str]:
     }
 
 
-def create_opensearch_collection(ec2_role_arn: str = None, knowledge_base_role_arn: str = None) -> Dict[str, str]:
-    """Create OpenSearch Serverless collection and policies."""
-    logger.info("[4/10] Creating OpenSearch Serverless collection")
-    
-    collection_name = vector_index_name
-    enc_policy_name = f"enc-{project_name}-{region}"
-    net_policy_name = f"net-{project_name}-{region}"
-    data_policy_name = f"data-{project_name}"
-    
-    # Check if collection already exists first
-    try:
-        existing_collections = opensearch_client.list_collections()
-        for collection in existing_collections.get("collectionSummaries", []):
-            if collection["name"] == collection_name and collection["status"] == "ACTIVE":
-                logger.warning(f"OpenSearch collection already exists: {collection['name']}")
-                collection_arn = collection["arn"]
-                collection_id = collection["id"]
-                
-                # Get collection endpoint
-                collection_details = opensearch_client.batch_get_collection(names=[collection_name])
-                collection_detail = collection_details["collectionDetails"][0]
-                collection_endpoint = collection_detail.get("collectionEndpoint")
-                
-                # If endpoint is not available, wait for collection to be ready
-                if not collection_endpoint:
-                    logger.info("  Collection endpoint not yet available, waiting for collection to be ready...")
-                    wait_count = 0
-                    while True:
-                        response = opensearch_client.batch_get_collection(names=[collection_name])
-                        collection_detail = response["collectionDetails"][0]
-                        status = collection_detail.get("status")
-                        wait_count += 1
-                        if wait_count % 6 == 0:  # Log every minute
-                            logger.debug(f"  Collection status: {status} (waited {wait_count * 10} seconds)")
-                        
-                        if "collectionEndpoint" in collection_detail and collection_detail["collectionEndpoint"]:
-                            collection_endpoint = collection_detail["collectionEndpoint"]
-                            if status == "ACTIVE":
-                                break
-                        elif status == "ACTIVE":
-                            # If active but no endpoint, try one more time after a short wait
-                            time.sleep(10)
-                            response = opensearch_client.batch_get_collection(names=[collection_name])
-                            collection_detail = response["collectionDetails"][0]
-                            collection_endpoint = collection_detail.get("collectionEndpoint")
-                            if collection_endpoint:
-                                break
-                        
-                        if wait_count > 60:  # Timeout after 10 minutes
-                            raise Exception(f"Timeout waiting for collection endpoint. Collection status: {status}")
-                        time.sleep(10)
-                
-                # Update data access policy to include roles if needed
-                try:
-                    policy_detail = opensearch_client.get_access_policy(
-                        name=data_policy_name,
-                        type="data"
-                    )
-                    current_policy = policy_detail["accessPolicyDetail"]["policy"]
-                    
-                    # Check if roles are already in principals and update if needed
-                    needs_update = False
-                    roles_to_add = []
-                    if ec2_role_arn:
-                        roles_to_add.append(("EC2", ec2_role_arn))
-                    if knowledge_base_role_arn:
-                        roles_to_add.append(("Knowledge Base", knowledge_base_role_arn))
-                    
-                    for rule in current_policy:
-                        if "Principal" in rule:
-                            current_principals = rule["Principal"]
-                            if not isinstance(current_principals, list):
-                                current_principals = [current_principals]
-                            
-                            for role_type, role_arn in roles_to_add:
-                                if role_arn and role_arn not in current_principals:
-                                    current_principals.append(role_arn)
-                                    needs_update = True
-                                    logger.debug(f"Adding {role_type} role to data access policy: {role_arn}")
-                            
-                            rule["Principal"] = current_principals
-                    
-                    # Update policy if needed
-                    if needs_update:
-                        opensearch_client.update_access_policy(
-                            name=data_policy_name,
-                            type="data",
-                            policy=json.dumps(current_policy),
-                            policyVersion=policy_detail["accessPolicyDetail"]["policyVersion"]
-                        )
-                        logger.info(f"Updated data access policy to include roles")
-                    else:
-                        logger.debug("All roles already present in data access policy")
-                except Exception as update_error:
-                    logger.warning(f"Could not update existing data access policy: {update_error}")
-                
-                return {
-                    "arn": collection_arn,
-                    "endpoint": collection_endpoint
-                }
-    except Exception as e:
-        logger.debug(f"Error checking existing collections: {e}")
-    
-    # Create encryption policy
-    enc_policy = {
-        "Rules": [
-            {
-                "ResourceType": "collection",
-                "Resource": [f"collection/{collection_name}"]
-            }
-        ],
-        "AWSOwnedKey": True
-    }
-    
-    try:
-        opensearch_client.create_security_policy(
-            name=enc_policy_name,
-            type="encryption",
-            description=f"opensearch encryption policy for {project_name}",
-            policy=json.dumps(enc_policy)
-        )
-        logger.debug(f"Created encryption policy: {enc_policy_name}")
-    except ClientError as e:
-        if e.response["Error"]["Code"] == "ConflictException":
-            logger.warning(f"Encryption policy already exists: {enc_policy_name}")
-        else:
-            logger.error(f"Failed to create encryption policy: {e}")
-            raise
-    
-    # Create network policy
-    net_policy = [
-        {
-            "Rules": [
-                {
-                    "ResourceType": "dashboard",
-                    "Resource": [f"collection/{collection_name}"]
-                },
-                {
-                    "ResourceType": "collection",
-                    "Resource": [f"collection/{collection_name}"]
-                }
-            ],
-            "AllowFromPublic": True
-        }
+def _get_installer_iam_arn() -> str:
+    """Return IAM ARN for the credentials running this installer."""
+    identity = sts_client.get_caller_identity()
+    arn = identity["Arn"]
+    if ":assumed-role/" in arn:
+        role_name = arn.split(":assumed-role/")[1].split("/")[0]
+        return f"arn:aws:iam::{identity['Account']}:role/{role_name}"
+    return arn
+
+
+def _opensearch_data_access_principals(
+    knowledge_base_role_arn: Optional[str] = None,
+    ec2_role_arn: Optional[str] = None,
+) -> List[str]:
+    """Principals that need OpenSearch Serverless data-plane access."""
+    principals = [
+        f"arn:aws:iam::{account_id}:root",
+        _get_installer_iam_arn(),
     ]
-    
-    try:
-        opensearch_client.create_security_policy(
-            name=net_policy_name,
-            type="network",
-            description=f"opensearch network policy for {project_name}",
-            policy=json.dumps(net_policy)
-        )
-        logger.debug(f"Created network policy: {net_policy_name}")
-    except ClientError as e:
-        if e.response["Error"]["Code"] == "ConflictException":
-            logger.warning(f"Network policy already exists: {net_policy_name}")
-        else:
-            logger.error(f"Failed to create network policy: {e}")
-            raise
-    
-    # Create data access policy
-    account_arn = f"arn:aws:iam::{account_id}:root"
-    principals = [account_arn]
-    
-    # Add EC2 role to principals if provided
-    if ec2_role_arn:
-        principals.append(ec2_role_arn)
-        logger.debug(f"Adding EC2 role to data access policy: {ec2_role_arn}")
-    
-    # Add Knowledge Base role to principals if provided
     if knowledge_base_role_arn:
         principals.append(knowledge_base_role_arn)
-        logger.debug(f"Adding Knowledge Base role to data access policy: {knowledge_base_role_arn}")
-    
-    data_policy = [
+    if ec2_role_arn:
+        principals.append(ec2_role_arn)
+    return principals
+
+
+def _build_opensearch_data_policy_document(
+    collection_name: str, principals: List[str]
+) -> List[Dict]:
+    """Build OpenSearch Serverless data access policy document."""
+    return [
         {
             "Rules": [
                 {
@@ -969,9 +812,9 @@ def create_opensearch_collection(ec2_role_arn: str = None, knowledge_base_role_a
                         "aoss:CreateCollectionItems",
                         "aoss:DeleteCollectionItems",
                         "aoss:UpdateCollectionItems",
-                        "aoss:DescribeCollectionItems"
+                        "aoss:DescribeCollectionItems",
                     ],
-                    "ResourceType": "collection"
+                    "ResourceType": "collection",
                 },
                 {
                     "Resource": [f"index/{collection_name}/*"],
@@ -981,127 +824,284 @@ def create_opensearch_collection(ec2_role_arn: str = None, knowledge_base_role_a
                         "aoss:UpdateIndex",
                         "aoss:DescribeIndex",
                         "aoss:ReadDocument",
-                        "aoss:WriteDocument"
+                        "aoss:WriteDocument",
                     ],
-                    "ResourceType": "index"
-                }
+                    "ResourceType": "index",
+                },
             ],
-            "Principal": principals
+            "Principal": principals,
         }
     ]
-    
+
+
+def _ensure_opensearch_data_access_principals(
+    data_policy_name: str,
+    collection_name: str,
+    knowledge_base_role_arn: Optional[str] = None,
+    ec2_role_arn: Optional[str] = None,
+) -> None:
+    """Ensure data access policy grants installer, KB, and optional EC2 roles."""
+    principals_to_add = _opensearch_data_access_principals(
+        knowledge_base_role_arn, ec2_role_arn
+    )
+    try:
+        policy_detail = opensearch_client.get_access_policy(
+            name=data_policy_name, type="data"
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ResourceNotFoundException":
+            raise
+        data_policy = _build_opensearch_data_policy_document(
+            collection_name, principals_to_add
+        )
+        opensearch_client.create_access_policy(
+            name=data_policy_name,
+            type="data",
+            policy=json.dumps(data_policy),
+        )
+        logger.info(f"  Created data access policy: {data_policy_name}")
+        logger.info("  Waiting for OpenSearch data access policy to propagate...")
+        time.sleep(20)
+        return
+
+    current_policy = policy_detail["accessPolicyDetail"]["policy"]
+    if isinstance(current_policy, str):
+        current_policy = json.loads(current_policy)
+
+    needs_update = False
+    for rule in current_policy:
+        if "Principal" not in rule:
+            continue
+        current_principals = rule["Principal"]
+        if not isinstance(current_principals, list):
+            current_principals = [current_principals]
+        for principal in principals_to_add:
+            if principal and principal not in current_principals:
+                current_principals.append(principal)
+                needs_update = True
+                logger.info(f"  Adding principal to {data_policy_name}: {principal}")
+        rule["Principal"] = current_principals
+
+    if needs_update:
+        opensearch_client.update_access_policy(
+            name=data_policy_name,
+            type="data",
+            policy=json.dumps(current_policy),
+            policyVersion=policy_detail["accessPolicyDetail"]["policyVersion"],
+        )
+        logger.info(f"  Updated data access policy: {data_policy_name}")
+        logger.info("  Waiting for OpenSearch data access policy to propagate...")
+        time.sleep(20)
+    else:
+        logger.debug(f"  Required principals already present in {data_policy_name}")
+
+
+def create_opensearch_collection(
+    ec2_role_arn: str = None, knowledge_base_role_arn: str = None
+) -> Dict[str, str]:
+    """Create OpenSearch Serverless collection and policies."""
+    logger.info("[4/10] Creating OpenSearch Serverless collection")
+
+    collection_name = vector_index_name
+    enc_policy_name = f"enc-{project_name}-{region}"
+    net_policy_name = f"net-{project_name}-{region}"
+    data_policy_name = f"data-{project_name}"
+
+    # Check if collection already exists first
+    try:
+        existing_collections = opensearch_client.list_collections()
+        for collection in existing_collections.get("collectionSummaries", []):
+            if collection["name"] == collection_name and collection["status"] == "ACTIVE":
+                logger.warning(f"OpenSearch collection already exists: {collection['name']}")
+                collection_arn = collection["arn"]
+
+                collection_details = opensearch_client.batch_get_collection(
+                    names=[collection_name]
+                )
+                collection_detail = collection_details["collectionDetails"][0]
+                collection_endpoint = collection_detail.get("collectionEndpoint")
+
+                if not collection_endpoint:
+                    logger.info(
+                        "  Collection endpoint not yet available, waiting for collection to be ready..."
+                    )
+                    wait_count = 0
+                    while True:
+                        response = opensearch_client.batch_get_collection(
+                            names=[collection_name]
+                        )
+                        collection_detail = response["collectionDetails"][0]
+                        status = collection_detail.get("status")
+                        wait_count += 1
+                        if wait_count % 6 == 0:
+                            logger.debug(
+                                f"  Collection status: {status} (waited {wait_count * 10} seconds)"
+                            )
+
+                        if (
+                            "collectionEndpoint" in collection_detail
+                            and collection_detail["collectionEndpoint"]
+                        ):
+                            collection_endpoint = collection_detail["collectionEndpoint"]
+                            if status == "ACTIVE":
+                                break
+                        elif status == "ACTIVE":
+                            time.sleep(10)
+                            response = opensearch_client.batch_get_collection(
+                                names=[collection_name]
+                            )
+                            collection_detail = response["collectionDetails"][0]
+                            collection_endpoint = collection_detail.get(
+                                "collectionEndpoint"
+                            )
+                            if collection_endpoint:
+                                break
+
+                        if wait_count > 60:
+                            raise Exception(
+                                f"Timeout waiting for collection endpoint. Collection status: {status}"
+                            )
+                        time.sleep(10)
+
+                _ensure_opensearch_data_access_principals(
+                    data_policy_name,
+                    collection_name,
+                    knowledge_base_role_arn,
+                    ec2_role_arn,
+                )
+
+                return {
+                    "arn": collection_arn,
+                    "endpoint": collection_endpoint,
+                }
+    except Exception as e:
+        logger.debug(f"Error checking existing collections: {e}")
+
+    enc_policy = {
+        "Rules": [
+            {
+                "ResourceType": "collection",
+                "Resource": [f"collection/{collection_name}"],
+            }
+        ],
+        "AWSOwnedKey": True,
+    }
+
+    try:
+        opensearch_client.create_security_policy(
+            name=enc_policy_name,
+            type="encryption",
+            description=f"opensearch encryption policy for {project_name}",
+            policy=json.dumps(enc_policy),
+        )
+        logger.debug(f"Created encryption policy: {enc_policy_name}")
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConflictException":
+            logger.warning(f"Encryption policy already exists: {enc_policy_name}")
+        else:
+            logger.error(f"Failed to create encryption policy: {e}")
+            raise
+
+    net_policy = [
+        {
+            "Rules": [
+                {
+                    "ResourceType": "dashboard",
+                    "Resource": [f"collection/{collection_name}"],
+                },
+                {
+                    "ResourceType": "collection",
+                    "Resource": [f"collection/{collection_name}"],
+                },
+            ],
+            "AllowFromPublic": True,
+        }
+    ]
+
+    try:
+        opensearch_client.create_security_policy(
+            name=net_policy_name,
+            type="network",
+            description=f"opensearch network policy for {project_name}",
+            policy=json.dumps(net_policy),
+        )
+        logger.debug(f"Created network policy: {net_policy_name}")
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConflictException":
+            logger.warning(f"Network policy already exists: {net_policy_name}")
+        else:
+            logger.error(f"Failed to create network policy: {e}")
+            raise
+
+    principals = _opensearch_data_access_principals(
+        knowledge_base_role_arn, ec2_role_arn
+    )
+    data_policy = _build_opensearch_data_policy_document(collection_name, principals)
+
     try:
         opensearch_client.create_access_policy(
             name=data_policy_name,
             type="data",
-            policy=json.dumps(data_policy)
+            policy=json.dumps(data_policy),
         )
         logger.debug(f"Created data access policy: {data_policy_name}")
     except ClientError as e:
         if e.response["Error"]["Code"] == "ConflictException":
             logger.warning(f"Data access policy already exists: {data_policy_name}")
-            # Try to update existing policy to include roles
-            try:
-                # Get current policy version
-                policy_detail = opensearch_client.get_access_policy(
-                    name=data_policy_name,
-                    type="data"
-                )
-                current_policy = policy_detail["accessPolicyDetail"]["policy"]
-                
-                # Check if roles are already in principals and update if needed
-                needs_update = False
-                roles_to_add = []
-                if ec2_role_arn:
-                    roles_to_add.append(("EC2", ec2_role_arn))
-                if knowledge_base_role_arn:
-                    roles_to_add.append(("Knowledge Base", knowledge_base_role_arn))
-                
-                for rule in current_policy:
-                    if "Principal" in rule:
-                        current_principals = rule["Principal"]
-                        if not isinstance(current_principals, list):
-                            current_principals = [current_principals]
-                        
-                        for role_type, role_arn in roles_to_add:
-                            if role_arn and role_arn not in current_principals:
-                                current_principals.append(role_arn)
-                                needs_update = True
-                                logger.debug(f"Adding {role_type} role to data access policy: {role_arn}")
-                        
-                        rule["Principal"] = current_principals
-                
-                # Update policy if needed
-                if needs_update:
-                    opensearch_client.update_access_policy(
-                        name=data_policy_name,
-                        type="data",
-                        policy=json.dumps(current_policy),
-                        policyVersion=policy_detail["accessPolicyDetail"]["policyVersion"]
-                    )
-                    logger.info(f"Updated data access policy to include roles")
-                else:
-                    logger.debug("All roles already present in data access policy")
-            except Exception as update_error:
-                logger.warning(f"Could not update existing data access policy: {update_error}")
-                if ec2_role_arn:
-                    logger.warning(f"Please manually add EC2 role {ec2_role_arn} to the data access policy")
-                if knowledge_base_role_arn:
-                    logger.warning(f"Please manually add Knowledge Base role {knowledge_base_role_arn} to the data access policy")
+            _ensure_opensearch_data_access_principals(
+                data_policy_name,
+                collection_name,
+                knowledge_base_role_arn,
+                ec2_role_arn,
+            )
         else:
             logger.error(f"Failed to create data access policy: {e}")
             raise
-    
-    # Wait for policies to be ready
+
     logger.debug("Waiting for policies to be ready...")
     time.sleep(5)
-    
-    # Create collection
+
     try:
         response = opensearch_client.create_collection(
             name=collection_name,
             description=f"opensearch correction for {project_name}",
-            type="VECTORSEARCH"
+            type="VECTORSEARCH",
         )
         collection_detail = response["createCollectionDetail"]
         collection_arn = collection_detail["arn"]
-        
-        # Wait for collection to be active and get endpoint
+
         logger.info("  Waiting for collection to be active (this may take a few minutes)...")
         collection_endpoint = None
         wait_count = 0
         while True:
-            response = opensearch_client.batch_get_collection(
-                names=[collection_name]
-            )
+            response = opensearch_client.batch_get_collection(names=[collection_name])
             collection_detail = response["collectionDetails"][0]
             status = collection_detail["status"]
             wait_count += 1
-            if wait_count % 6 == 0:  # Log every minute
-                logger.debug(f"  Collection status: {status} (waited {wait_count * 10} seconds)")
-            
-            # Check if endpoint is available
+            if wait_count % 6 == 0:
+                logger.debug(
+                    f"  Collection status: {status} (waited {wait_count * 10} seconds)"
+                )
+
             if "collectionEndpoint" in collection_detail:
                 collection_endpoint = collection_detail["collectionEndpoint"]
                 if status == "ACTIVE":
                     break
             time.sleep(10)
 
-        # Wait for opensearch correction to be ready
         logger.debug("Waiting for opensearch correction to be ready...")
         time.sleep(30)
-            
+
         logger.info(f"✓ OpenSearch collection created: {collection_name}")
         logger.info(f"  Endpoint: {collection_endpoint}")
         return {
             "arn": collection_arn,
-            "endpoint": collection_endpoint
+            "endpoint": collection_endpoint,
         }
-    
+
     except ClientError as e:
         if e.response["Error"]["Code"] == "ConflictException":
             logger.warning(f"OpenSearch collection already exists: {collection_name}")
-            # Wait for collection endpoint to be available
             logger.info("  Waiting for collection endpoint to be available...")
             wait_count = 0
             collection_endpoint = None
@@ -1110,32 +1110,46 @@ def create_opensearch_collection(ec2_role_arn: str = None, knowledge_base_role_a
                 collection_detail = response["collectionDetails"][0]
                 status = collection_detail.get("status")
                 wait_count += 1
-                if wait_count % 6 == 0:  # Log every minute
-                    logger.debug(f"  Collection status: {status} (waited {wait_count * 10} seconds)")
-                
-                if "collectionEndpoint" in collection_detail and collection_detail["collectionEndpoint"]:
+                if wait_count % 6 == 0:
+                    logger.debug(
+                        f"  Collection status: {status} (waited {wait_count * 10} seconds)"
+                    )
+
+                if (
+                    "collectionEndpoint" in collection_detail
+                    and collection_detail["collectionEndpoint"]
+                ):
                     collection_endpoint = collection_detail["collectionEndpoint"]
                     if status == "ACTIVE":
                         break
                 elif status == "ACTIVE":
-                    # If active but no endpoint, try one more time after a short wait
                     time.sleep(10)
-                    response = opensearch_client.batch_get_collection(names=[collection_name])
+                    response = opensearch_client.batch_get_collection(
+                        names=[collection_name]
+                    )
                     collection_detail = response["collectionDetails"][0]
                     collection_endpoint = collection_detail.get("collectionEndpoint")
                     if collection_endpoint:
                         break
-                
-                if wait_count > 60:  # Timeout after 10 minutes
-                    raise Exception(f"Timeout waiting for collection endpoint. Collection status: {status}")
+
+                if wait_count > 60:
+                    raise Exception(
+                        f"Timeout waiting for collection endpoint. Collection status: {status}"
+                    )
                 time.sleep(10)
-            
+
             if not collection_endpoint:
                 raise Exception("Collection endpoint is not available even after waiting")
-            
+
+            _ensure_opensearch_data_access_principals(
+                data_policy_name,
+                collection_name,
+                knowledge_base_role_arn,
+                ec2_role_arn,
+            )
             return {
                 "arn": collection_detail["arn"],
-                "endpoint": collection_endpoint
+                "endpoint": collection_endpoint,
             }
         logger.error(f"Failed to create OpenSearch collection: {e}")
         raise
@@ -3155,7 +3169,7 @@ def ensure_data_source(
     knowledge_base_id: str,
     s3_bucket_name: str,
 ) -> str:
-    """Create S3 data source with default parser when missing."""
+    """Create S3 data source with hierarchical chunking and foundation-model parsing."""
     data_sources = bedrock_agent_client.list_data_sources(
         knowledgeBaseId=knowledge_base_id,
         maxResults=100,
@@ -3165,7 +3179,13 @@ def ensure_data_source(
             logger.info(f"  Data source already exists: {ds['dataSourceId']}")
             return ds["dataSourceId"]
 
-    logger.info("  Creating data source with default parser...")
+    # parsing_model_arn = f"arn:aws:bedrock:{region}:{account_id}:inference-profile/global.anthropic.claude-haiku-4-5-20251001-v1:0"
+    parsing_model_arn = (
+        f"arn:aws:bedrock:{region}:{account_id}:"
+        "inference-profile/global.anthropic.claude-sonnet-4-6"
+    )
+
+    logger.info("  Creating data source with hierarchical chunking + foundation model parsing...")
     data_source_response = bedrock_agent_client.create_data_source(
         knowledgeBaseId=knowledge_base_id,
         name=s3_bucket_name,
@@ -3180,10 +3200,19 @@ def ensure_data_source(
         },
         vectorIngestionConfiguration={
             "chunkingConfiguration": {
-                "chunkingStrategy": "FIXED_SIZE",
-                "fixedSizeChunkingConfiguration": {
-                    "maxTokens": 300,
-                    "overlapPercentage": 20,
+                "chunkingStrategy": "HIERARCHICAL",
+                "hierarchicalChunkingConfiguration": {
+                    "levelConfigurations": [
+                        {"maxTokens": 1500},
+                        {"maxTokens": 300},
+                    ],
+                    "overlapTokens": 60,
+                },
+            },
+            "parsingConfiguration": {
+                "parsingStrategy": "BEDROCK_FOUNDATION_MODEL",
+                "bedrockFoundationModelConfiguration": {
+                    "modelArn": parsing_model_arn,
                 },
             },
         },
@@ -3193,10 +3222,277 @@ def ensure_data_source(
     return data_source_id
 
 
+def create_vector_index_in_opensearch(collection_endpoint: str, index_name: str) -> bool:
+    """Create vector index in OpenSearch Serverless collection."""
+    try:
+        if not collection_endpoint or not collection_endpoint.strip():
+            logger.error(
+                f"  Invalid collection endpoint: '{collection_endpoint}'. "
+                "Collection endpoint is required."
+            )
+            return False
+
+        if not collection_endpoint.startswith(("http://", "https://")):
+            logger.error(
+                f"  Invalid collection endpoint format: '{collection_endpoint}'. "
+                "Must start with http:// or https://"
+            )
+            return False
+
+        try:
+            import requests
+            from requests_aws4auth import AWS4Auth
+        except ImportError:
+            logger.info("  Installing required packages for OpenSearch index creation...")
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "requests-aws4auth"]
+            )
+            import requests
+            from requests_aws4auth import AWS4Auth
+
+        session = boto3.Session()
+        credentials = session.get_credentials()
+        awsauth = AWS4Auth(
+            credentials.access_key,
+            credentials.secret_key,
+            region,
+            "aoss",
+            session_token=credentials.token,
+        )
+
+        url = f"{collection_endpoint}/{index_name}"
+        for attempt in range(6):
+            response = requests.get(url, auth=awsauth, timeout=30)
+            if response.status_code == 200:
+                logger.debug(f"Vector index '{index_name}' already exists")
+                return True
+            if response.status_code in (401, 403) and attempt < 5:
+                wait_seconds = 10 * (attempt + 1)
+                logger.info(
+                    f"  OpenSearch returned {response.status_code}; "
+                    f"waiting {wait_seconds}s for data access policy propagation "
+                    f"(attempt {attempt + 1}/5)..."
+                )
+                time.sleep(wait_seconds)
+                continue
+            if response.status_code == 401:
+                logger.error(
+                    "  Unauthorized (401) accessing OpenSearch. "
+                    f"Ensure {_get_installer_iam_arn()} is in the collection data access policy."
+                )
+                return False
+            if response.status_code == 403:
+                logger.error(f"  Forbidden (403) accessing OpenSearch index '{index_name}'")
+                return False
+            break
+
+        index_mapping = {
+            "settings": {
+                "index": {
+                    "knn": True,
+                    "knn.algo_param.ef_search": 512,
+                }
+            },
+            "mappings": {
+                "properties": {
+                    "vector_field": {
+                        "type": "knn_vector",
+                        "dimension": embedding_dimensions,
+                        "method": {
+                            "name": "hnsw",
+                            "space_type": "cosinesimil",
+                            "engine": "faiss",
+                            "parameters": {
+                                "ef_construction": 512,
+                                "m": 16,
+                            },
+                        },
+                    },
+                    "AMAZON_BEDROCK_TEXT": {"type": "text"},
+                    "AMAZON_BEDROCK_METADATA": {"type": "text"},
+                }
+            },
+        }
+
+        headers = {"Content-Type": "application/json"}
+        response = requests.put(
+            url,
+            auth=awsauth,
+            headers=headers,
+            data=json.dumps(index_mapping),
+            timeout=30,
+        )
+
+        if response.status_code in [200, 201]:
+            logger.info(f"  ✓ Vector index '{index_name}' created successfully")
+            logger.info("  Waiting for index to be ready...")
+            time.sleep(30)
+            return True
+
+        logger.error(
+            f"  Failed to create vector index: {response.status_code} - {response.text}"
+        )
+        return False
+
+    except ImportError:
+        logger.error(
+            "  requests-aws4auth package is required. "
+            "Install with: pip install requests-aws4auth"
+        )
+        return False
+    except Exception as e:
+        logger.error(f"  Error creating vector index: {e}")
+        return False
+
+
+def create_knowledge_base_with_opensearch(
+    opensearch_info: Dict[str, str], knowledge_base_role_arn: str, s3_bucket_name: str
+) -> Tuple[str, str]:
+    """Create Knowledge Base with OpenSearch Serverless as the vector store."""
+    logger.info("[4.5/10] Creating Knowledge Base with OpenSearch collection")
+
+    logger.info("  Creating vector index in OpenSearch collection...")
+    if not create_vector_index_in_opensearch(
+        opensearch_info["endpoint"], vector_index_name
+    ):
+        raise Exception("Failed to create vector index in OpenSearch collection")
+
+    bedrock_agent_client = boto3.client("bedrock-agent", region_name=region)
+
+    try:
+        logger.info("  Checking if Knowledge Base already exists...")
+        kb_list = bedrock_agent_client.list_knowledge_bases()
+        for kb in kb_list.get("knowledgeBaseSummaries", []):
+            if kb["name"] == project_name:
+                logger.warning(f"Knowledge Base already exists: {kb['knowledgeBaseId']}")
+
+                kb_details = bedrock_agent_client.get_knowledge_base(
+                    knowledgeBaseId=kb["knowledgeBaseId"]
+                )
+                storage = kb_details["knowledgeBase"]["storageConfiguration"]
+                storage_type = storage.get("type")
+                opensearch_cfg = storage.get("opensearchServerlessConfiguration", {})
+                kb_collection_arn = opensearch_cfg.get("collectionArn")
+
+                if (
+                    storage_type != "OPENSEARCH_SERVERLESS"
+                    or kb_collection_arn != opensearch_info["arn"]
+                ):
+                    logger.warning(
+                        "Knowledge Base is not using the expected OpenSearch collection:"
+                    )
+                    logger.warning(f"  Storage type: {storage_type}")
+                    logger.warning(f"  Current collection ARN: {kb_collection_arn}")
+                    logger.warning(f"  Expected collection ARN: {opensearch_info['arn']}")
+                    delete_knowledge_base(kb["knowledgeBaseId"])
+                    break
+
+                logger.info("Knowledge Base is using correct OpenSearch collection")
+                data_source_id = ensure_data_source(
+                    bedrock_agent_client, kb["knowledgeBaseId"], s3_bucket_name
+                )
+                return kb["knowledgeBaseId"], data_source_id
+        logger.info("  Knowledge Base does not exist. Creating new one...")
+    except Exception as e:
+        logger.debug(f"Error checking existing Knowledge Base: {e}")
+
+    logger.info("  Verifying Knowledge Base role configuration...")
+    try:
+        role_response = iam_client.get_role(
+            RoleName=f"role-knowledge-base-for-{project_name}-{region}"
+        )
+        policy_doc = role_response["Role"]["AssumeRolePolicyDocument"]
+        if isinstance(policy_doc, str):
+            trust_policy = json.loads(policy_doc)
+        else:
+            trust_policy = policy_doc
+        logger.debug(f"  Role trust policy: {json.dumps(trust_policy, indent=2)}")
+
+        statements = trust_policy.get("Statement", [])
+        bedrock_allowed = False
+        for statement in statements:
+            if statement.get("Effect") == "Allow":
+                principal = statement.get("Principal", {})
+                if principal.get("Service") == "bedrock.amazonaws.com":
+                    bedrock_allowed = True
+                    break
+
+        if not bedrock_allowed:
+            logger.error(
+                "  ✗ Knowledge Base role trust policy does not allow bedrock.amazonaws.com"
+            )
+            logger.error(
+                "  Please update the role trust policy manually or delete and recreate the role"
+            )
+            raise Exception("Knowledge Base role trust policy is incorrect")
+
+        logger.info("  ✓ Knowledge Base role trust policy is correct")
+    except ClientError as role_error:
+        logger.error(f"  ✗ Failed to verify Knowledge Base role: {role_error}")
+        raise
+
+    logger.debug(
+        f"Creating Knowledge Base with OpenSearch collection: {opensearch_info['arn']}"
+    )
+    response = bedrock_agent_client.create_knowledge_base(
+        name=project_name,
+        description="Knowledge base based on OpenSearch",
+        roleArn=knowledge_base_role_arn,
+        tags={project_name: "true"},
+        knowledgeBaseConfiguration={
+            "type": "VECTOR",
+            "vectorKnowledgeBaseConfiguration": {
+                "embeddingModelArn": f"arn:aws:bedrock:{region}::foundation-model/amazon.titan-embed-text-v2:0",
+                "embeddingModelConfiguration": {
+                    "bedrockEmbeddingModelConfiguration": {
+                        "dimensions": embedding_dimensions,
+                    }
+                },
+            },
+        },
+        storageConfiguration={
+            "type": "OPENSEARCH_SERVERLESS",
+            "opensearchServerlessConfiguration": {
+                "collectionArn": opensearch_info["arn"],
+                "fieldMapping": {
+                    "metadataField": "AMAZON_BEDROCK_METADATA",
+                    "textField": "AMAZON_BEDROCK_TEXT",
+                    "vectorField": "vector_field",
+                },
+                "vectorIndexName": vector_index_name,
+            },
+        },
+    )
+
+    knowledge_base_id = response["knowledgeBase"]["knowledgeBaseId"]
+    logger.info(f"✓ Knowledge Base created: {knowledge_base_id}")
+
+    logger.info("  Waiting for Knowledge Base to be active...")
+    while True:
+        kb_response = bedrock_agent_client.get_knowledge_base(
+            knowledgeBaseId=knowledge_base_id
+        )
+        status = kb_response["knowledgeBase"]["status"]
+
+        if status == "ACTIVE":
+            logger.info("  Knowledge Base is now active")
+            break
+        if status == "FAILED":
+            raise Exception("Knowledge Base creation failed")
+
+        logger.debug(f"  Knowledge Base status: {status} (waiting...)")
+        time.sleep(10)
+
+    data_source_id = ensure_data_source(
+        bedrock_agent_client, knowledge_base_id, s3_bucket_name
+    )
+    return knowledge_base_id, data_source_id
+
+
 def create_knowledge_base_with_s3_vectors(
     s3_vectors_info: Dict[str, str], knowledge_base_role_arn: str, s3_bucket_name: str
 ) -> Tuple[str, str]:
-    """Create Knowledge Base with S3 Vectors as the vector store."""
+    """Legacy: Create Knowledge Base with S3 Vectors as the vector store."""
     logger.info("[4.5/10] Creating Knowledge Base with S3 Vectors")
 
     bedrock_agent_client = boto3.client("bedrock-agent", region_name=region)
@@ -4111,7 +4407,7 @@ def _merge_runtime_agent_settings(app_config: Dict[str, str]) -> Dict[str, str]:
 
 def build_app_environment(
     knowledge_base_role_arn: str,
-    s3_vectors_info: Dict[str, str],
+    opensearch_info: Dict[str, str],
     s3_bucket_name: str,
     cloudfront_domain: str,
     knowledge_base_id: str,
@@ -4126,12 +4422,12 @@ def build_app_environment(
         "knowledge_base_id": knowledge_base_id,
         "data_source_id": data_source_id if data_source_id else "",
         "knowledge_base_role": knowledge_base_role_arn,
-        "collectionArn": "",
-        "opensearch_url": "",
-        "vector_bucket_name": s3_vectors_info["vectorBucketName"],
-        "vector_bucket_arn": s3_vectors_info["vectorBucketArn"],
-        "vector_index_name": s3_vectors_info["indexName"],
-        "vector_index_arn": s3_vectors_info["indexArn"],
+        "collectionArn": opensearch_info["arn"],
+        "opensearch_url": opensearch_info["endpoint"],
+        "vector_bucket_name": "",
+        "vector_bucket_arn": "",
+        "vector_index_name": vector_index_name,
+        "vector_index_arn": "",
         "s3_bucket": s3_bucket_name,
         "s3_arn": f"arn:aws:s3:::{s3_bucket_name}",
         "sharing_url": f"https://{cloudfront_domain}",
@@ -4189,7 +4485,7 @@ def build_config_from_deployment_state(
     knowledge_base_id: Optional[str] = None,
     data_source_id: Optional[str] = None,
     knowledge_base_role_arn: Optional[str] = None,
-    s3_vectors_info: Optional[Dict[str, str]] = None,
+    opensearch_info: Optional[Dict[str, str]] = None,
     s3_bucket_name: Optional[str] = None,
     cloudfront_info: Optional[Dict[str, str]] = None,
     s3_files_info: Optional[Dict[str, object]] = None,
@@ -4201,6 +4497,10 @@ def build_config_from_deployment_state(
         "region": region,
         "collectionArn": "",
         "opensearch_url": "",
+        "vector_bucket_name": "",
+        "vector_bucket_arn": "",
+        "vector_index_name": "",
+        "vector_index_arn": "",
     }
     if knowledge_base_id:
         config_data["knowledge_base_id"] = knowledge_base_id
@@ -4208,11 +4508,10 @@ def build_config_from_deployment_state(
         config_data["data_source_id"] = data_source_id
     if knowledge_base_role_arn:
         config_data["knowledge_base_role"] = knowledge_base_role_arn
-    if s3_vectors_info:
-        config_data["vector_bucket_name"] = s3_vectors_info.get("vectorBucketName", "")
-        config_data["vector_bucket_arn"] = s3_vectors_info.get("vectorBucketArn", "")
-        config_data["vector_index_name"] = s3_vectors_info.get("indexName", "")
-        config_data["vector_index_arn"] = s3_vectors_info.get("indexArn", "")
+    if opensearch_info:
+        config_data["collectionArn"] = opensearch_info.get("arn", "")
+        config_data["opensearch_url"] = opensearch_info.get("endpoint", "")
+        config_data["vector_index_name"] = vector_index_name
     if s3_bucket_name:
         config_data["s3_bucket"] = s3_bucket_name
         config_data["s3_arn"] = f"arn:aws:s3:::{s3_bucket_name}"
@@ -5596,7 +5895,7 @@ def run_setup_script_via_ssm(instance_id: str, environment: Dict[str, str], git_
 
 
 def create_ec2_instance(vpc_info: Dict[str, str], ec2_role_arn: str, 
-                       knowledge_base_role_arn: str, s3_vectors_info: Dict[str, str],
+                       knowledge_base_role_arn: str, opensearch_info: Dict[str, str],
                        s3_bucket_name: str, cloudfront_domain: str, knowledge_base_id: str,
                        data_source_id: str = None) -> str:
     """Create EC2 instance."""
@@ -5657,12 +5956,12 @@ def create_ec2_instance(vpc_info: Dict[str, str], ec2_role_arn: str,
         "knowledge_base_id": knowledge_base_id,
         "data_source_id": data_source_id if data_source_id else "",
         "knowledge_base_role": knowledge_base_role_arn,
-        "collectionArn": "",
-        "opensearch_url": "",
-        "vector_bucket_name": s3_vectors_info["vectorBucketName"],
-        "vector_bucket_arn": s3_vectors_info["vectorBucketArn"],
-        "vector_index_name": s3_vectors_info["indexName"],
-        "vector_index_arn": s3_vectors_info["indexArn"],
+        "collectionArn": opensearch_info["arn"],
+        "opensearch_url": opensearch_info["endpoint"],
+        "vector_bucket_name": "",
+        "vector_bucket_arn": "",
+        "vector_index_name": vector_index_name,
+        "vector_index_arn": "",
         "s3_bucket": s3_bucket_name,
         "s3_arn": f"arn:aws:s3:::{s3_bucket_name}",
         "sharing_url": f"https://{cloudfront_domain}"
@@ -6899,7 +7198,7 @@ def main():
 
     s3_bucket_name = None
     knowledge_base_role_arn = None
-    s3_vectors_info = None
+    opensearch_info = None
     knowledge_base_id = None
     data_source_id = None
     vpc_info = None
@@ -6948,13 +7247,15 @@ def main():
             )
         logger.info(f"IAM roles created...")
         
-        # 3. Create S3 Vectors store
-        s3_vectors_info = create_s3_vectors_store()
-        logger.info("S3 Vectors store created...")
+        # 3. Create OpenSearch Serverless collection
+        opensearch_info = create_opensearch_collection(
+            knowledge_base_role_arn=knowledge_base_role_arn
+        )
+        logger.info("OpenSearch collection created...")
         
-        # 4.5. Create Knowledge Base with S3 Vectors
-        knowledge_base_id, data_source_id = create_knowledge_base_with_s3_vectors(
-            s3_vectors_info, knowledge_base_role_arn, s3_bucket_name
+        # 4. Create Knowledge Base with OpenSearch
+        knowledge_base_id, data_source_id = create_knowledge_base_with_opensearch(
+            opensearch_info, knowledge_base_role_arn, s3_bucket_name
         )
         logger.info(f"Knowledge base created...")
         
@@ -6984,7 +7285,7 @@ def main():
         sync_application_capability_lists()
         app_environment = build_app_environment(
             knowledge_base_role_arn,
-            s3_vectors_info,
+            opensearch_info,
             s3_bucket_name,
             cloudfront_info["domain"],
             knowledge_base_id,
@@ -7058,8 +7359,8 @@ def main():
         logger.info(f"  ECR Image: {image_uri}")
         if image_build_tag:
             logger.info(f"  Build Number: {image_build_tag}")
-        logger.info(f"  S3 Vector Bucket: {s3_vectors_info['vectorBucketName']}")
-        logger.info(f"  S3 Vector Index ARN: {s3_vectors_info['indexArn']}")
+        logger.info(f"  OpenSearch Endpoint: {opensearch_info['endpoint']}")
+        logger.info(f"  OpenSearch Collection ARN: {opensearch_info['arn']}")
         logger.info(f"  Knowledge Base ID: {knowledge_base_id}")
         logger.info(f"  Knowledge Base Role: {knowledge_base_role_arn}")
         if agentcore_websearch_gateway_info:
@@ -7083,8 +7384,8 @@ def main():
         logger.info("Note: ECS service deployment and CloudFront distribution may take 15-20 minutes to fully deploy")
         logger.info("="*60)
         
-        logger.info(f"S3 Vector Bucket ARN: {s3_vectors_info['vectorBucketArn']}")
-        logger.info(f"S3 Vector Index ARN: {s3_vectors_info['indexArn']}")
+        logger.info(f"OpenSearch Endpoint: {opensearch_info['endpoint']}")
+        logger.info(f"OpenSearch Collection ARN: {opensearch_info['arn']}")
         
         logger.info("="*60)
         logger.info("")
@@ -7119,15 +7420,15 @@ def main():
                 knowledge_base_id=knowledge_base_id,
                 data_source_id=data_source_id,
                 knowledge_base_role_arn=knowledge_base_role_arn,
-                s3_vectors_info=s3_vectors_info,
+                opensearch_info=opensearch_info,
                 s3_bucket_name=s3_bucket_name,
                 cloudfront_info=cloudfront_info,
                 s3_files_info=s3_files_info,
             )
 
-        if s3_vectors_info:
-            logger.info(f"S3 Vector Bucket ARN: {s3_vectors_info.get('vectorBucketArn', 'N/A')}")
-            logger.info(f"S3 Vector Index ARN: {s3_vectors_info.get('indexArn', 'N/A')}")
+        if opensearch_info:
+            logger.info(f"OpenSearch Endpoint: {opensearch_info.get('endpoint', 'N/A')}")
+            logger.info(f"OpenSearch Collection ARN: {opensearch_info.get('arn', 'N/A')}")
 
         if write_application_config(config_data):
             if deployment_success:

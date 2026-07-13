@@ -134,7 +134,7 @@ def _load_application_config() -> dict:
 
 
 def _parse_s3_vectors_names(vector_bucket_arn: str, index_arn: str) -> dict:
-    """Derive vector bucket/index names from S3 Vectors ARNs."""
+    """Derive vector bucket/index names from S3 Vectors ARNs (legacy)."""
     vector_bucket_name = ""
     vector_index_name = ""
     if vector_bucket_arn and "/bucket/" in vector_bucket_arn:
@@ -145,6 +145,17 @@ def _parse_s3_vectors_names(vector_bucket_arn: str, index_arn: str) -> dict:
         "vector_bucket_name": vector_bucket_name,
         "vector_index_name": vector_index_name,
     }
+
+
+def _opensearch_endpoint_from_collection_arn(collection_arn: str, region: str) -> str:
+    """Best-effort OpenSearch Serverless endpoint from collection ARN."""
+    # arn:aws:aoss:region:account:collection/collection-id
+    if not collection_arn or ":collection/" not in collection_arn:
+        return ""
+    collection_id = collection_arn.rsplit(":collection/", 1)[1]
+    if not collection_id:
+        return ""
+    return f"https://{collection_id}.{region}.aoss.amazonaws.com"
 
 
 def _find_data_source_id(bedrock_agent_client, knowledge_base_id: str, s3_bucket_name: str = "") -> str:
@@ -208,6 +219,8 @@ def update_knowledge_base_config() -> bool:
                 "s3_bucket",
                 "s3_arn",
                 "sharing_url",
+                "collectionArn",
+                "opensearch_url",
                 "vector_bucket_name",
                 "vector_bucket_arn",
                 "vector_index_name",
@@ -223,10 +236,10 @@ def update_knowledge_base_config() -> bool:
             with open(config_path, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=2)
             if updates.get("knowledge_base_id"):
-                print(f"✓ config.json updated from application/config.json")
+                print(f"? config.json updated from application/config.json")
                 print(f"  - knowledge_base_id: {updates['knowledge_base_id']}")
             else:
-                print("✓ config.json updated with knowledge_base_name only")
+                print("? config.json updated with knowledge_base_name only")
             return True
 
         kb_details = bedrock_agent_client.get_knowledge_base(knowledgeBaseId=knowledge_base_id)
@@ -238,11 +251,24 @@ def update_knowledge_base_config() -> bool:
             "knowledge_base_role": knowledge_base.get("roleArn", ""),
             "collectionArn": "",
             "opensearch_url": "",
+            "vector_bucket_name": "",
+            "vector_bucket_arn": "",
+            "vector_index_name": "",
+            "vector_index_arn": "",
         }
  
         storage = knowledge_base.get("storageConfiguration", {})
         storage_type = storage.get("type", "")
-        if storage_type == "S3_VECTORS":
+        if storage_type == "OPENSEARCH_SERVERLESS":
+            opensearch_cfg = storage.get("opensearchServerlessConfiguration", {})
+            collection_arn = opensearch_cfg.get("collectionArn", "")
+            updates["collectionArn"] = collection_arn
+            updates["vector_index_name"] = opensearch_cfg.get("vectorIndexName", "")
+            updates["opensearch_url"] = (
+                app_config.get("opensearch_url")
+                or _opensearch_endpoint_from_collection_arn(collection_arn, region)
+            )
+        elif storage_type == "S3_VECTORS":
             s3_vectors_cfg = storage.get("s3VectorsConfiguration", {})
             vector_bucket_arn = s3_vectors_cfg.get("vectorBucketArn", "")
             vector_index_arn = s3_vectors_cfg.get("indexArn", "")
@@ -255,19 +281,14 @@ def update_knowledge_base_config() -> bool:
                     "vector_index_name": parsed_names["vector_index_name"],
                 }
             )
-        elif storage_type == "OPENSEARCH_SERVERLESS":
-            opensearch_cfg = storage.get("opensearchServerlessConfiguration", {})
-            updates["collectionArn"] = opensearch_cfg.get("collectionArn", "")
-            updates["vector_bucket_name"] = ""
-            updates["vector_bucket_arn"] = ""
-            updates["vector_index_name"] = ""
-            updates["vector_index_arn"] = ""
 
         for key in (
             "s3_bucket",
             "s3_arn",
             "sharing_url",
             "data_source_id",
+            "collectionArn",
+            "opensearch_url",
             "vector_bucket_name",
             "vector_bucket_arn",
             "vector_index_name",
@@ -292,10 +313,14 @@ def update_knowledge_base_config() -> bool:
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
 
-        print(f"✓ config.json updated for Knowledge Base: {knowledge_base_name}")
+        print(f"? config.json updated for Knowledge Base: {knowledge_base_name}")
         print(f"  - knowledge_base_id: {updates.get('knowledge_base_id', '')}")
         if updates.get("data_source_id"):
             print(f"  - data_source_id: {updates['data_source_id']}")
+        if updates.get("collectionArn"):
+            print(f"  - collectionArn: {updates['collectionArn']}")
+        if updates.get("opensearch_url"):
+            print(f"  - opensearch_url: {updates['opensearch_url']}")
         if updates.get("vector_index_arn"):
             print(f"  - vector_index_arn: {updates['vector_index_arn']}")
         return True
@@ -526,7 +551,7 @@ def create_bedrock_agentcore_policy(config):
                         PolicyArn=existing_policy['Policy']['Arn'],
                         VersionId=oldest_version['VersionId']
                     )
-                    print(f"✓ Deleted old policy version: {oldest_version['VersionId']}")
+                    print(f"? Deleted old policy version: {oldest_version['VersionId']}")
                 else:
                     # If all versions are default, we need to set a different version as default first
                     for version in versions[1:]:  # Skip the current default
@@ -540,7 +565,7 @@ def create_bedrock_agentcore_policy(config):
                                 PolicyArn=existing_policy['Policy']['Arn'],
                                 VersionId=versions[0]['VersionId']
                             )
-                            print(f"✓ Switched default version and deleted old version: {versions[0]['VersionId']}")
+                            print(f"? Switched default version and deleted old version: {versions[0]['VersionId']}")
                             break
                         except Exception as e:
                             print(f"Failed to switch version {version['VersionId']}: {e}")
@@ -552,7 +577,7 @@ def create_bedrock_agentcore_policy(config):
                 PolicyDocument=json.dumps(policy_document),
                 SetAsDefault=True
             )
-            print(f"✓ Policy update completed: {response['PolicyVersion']['VersionId']}")
+            print(f"? Policy update completed: {response['PolicyVersion']['VersionId']}")
             return existing_policy['Policy']['Arn']
             
         except iam_client.exceptions.NoSuchEntityException:
@@ -562,7 +587,7 @@ def create_bedrock_agentcore_policy(config):
                 PolicyDocument=json.dumps(policy_document),
                 Description=policy_description
             )
-            print(f"✓ New policy created: {response['Policy']['Arn']}")
+            print(f"? New policy created: {response['Policy']['Arn']}")
             return response['Policy']['Arn']
             
     except Exception as e:
@@ -579,7 +604,7 @@ def attach_policy_to_role(role_name, policy_arn):
             RoleName=role_name,
             PolicyArn=policy_arn
         )
-        print(f"✓ Policy attached successfully: {policy_arn}")
+        print(f"? Policy attached successfully: {policy_arn}")
         return True
         
     except Exception as e:
@@ -636,7 +661,7 @@ def create_bedrock_agentcore_role(config):
                 RoleName=role_name,
                 PolicyDocument=json.dumps(trust_policy)
             )
-            print("✓ Trust policy updated successfully")
+            print("? Trust policy updated successfully")
             
             # Attach policy
             attach_policy_to_role(role_name, policy_arn)
@@ -652,7 +677,7 @@ def create_bedrock_agentcore_role(config):
                 AssumeRolePolicyDocument=json.dumps(trust_policy),
                 Description="Role for Bedrock AgentCore MCP access"
             )
-            print(f"✓ New role created: {response['Role']['Arn']}")
+            print(f"? New role created: {response['Role']['Arn']}")
             
             # Attach policy
             attach_policy_to_role(role_name, policy_arn)
@@ -687,9 +712,9 @@ def create_iam_policies():
         # Update AgentCore configuration
         print("\n3. Updating AgentCore configuration...")
         update_config('agent_runtime_role', role_arn)
-        print(f"✓ AgentCore configuration updated: {role_arn}")
+        print(f"? AgentCore configuration updated: {role_arn}")
         
-        print("\n✓ IAM policies and roles creation completed")
+        print("\n? IAM policies and roles creation completed")
         return True
         
     except Exception as e:
@@ -768,11 +793,11 @@ def create_bedrock_guardrail() -> bool:
             "blocks sexual content and prompt attacks in user input."
         )
         blocked_input_message = (
-            "요청이 안전 정책엝 의해 차단띘었습니다. "
-            "성젝 표현 똝는 프롬프트 공격이 객지띘었습니다."
+            "??? ?? ??? ?? ???????. "
+            "?? ?? ?? ???? ??? ???????."
         )
         blocked_output_message = (
-            "응답이 안전 정책엝 의해 차단띘었습니다."
+            "??? ?? ??? ?? ???????."
         )
         content_policy = _bedrock_guardrail_content_policy()
 
@@ -790,7 +815,7 @@ def create_bedrock_guardrail() -> bool:
                 blockedInputMessaging=blocked_input_message,
                 blockedOutputsMessaging=blocked_output_message,
             )
-            print(f"✓ Guardrail updated: version {response.get('version', 'DRAFT')}")
+            print(f"? Guardrail updated: version {response.get('version', 'DRAFT')}")
         else:
             print(f"Creating guardrail: {name}")
             response = bedrock_client.create_guardrail(
@@ -801,7 +826,7 @@ def create_bedrock_guardrail() -> bool:
                 blockedOutputsMessaging=blocked_output_message,
             )
             guardrail_id = response["guardrailId"]
-            print(f"✓ Guardrail created: {guardrail_id}")
+            print(f"? Guardrail created: {guardrail_id}")
 
         guardrail_arn = response.get("guardrailArn") or existing.get("arn", "")
         guardrail_version = "DRAFT"
@@ -811,7 +836,7 @@ def create_bedrock_guardrail() -> bool:
         update_config("guardrail_arn", guardrail_arn)
         update_config("guardrail_name", name)
 
-        print(f"✓ Guardrail configuration saved to config.json")
+        print(f"? Guardrail configuration saved to config.json")
         print(f"  - guardrail_id: {guardrail_id}")
         print(f"  - guardrail_version: {guardrail_version}")
         print(f"  - guardrail_name: {name}")
@@ -917,7 +942,7 @@ def cleanup_docker_resources() -> None:
             if result.returncode == 0:
                 output = (result.stdout or result.stderr).strip().splitlines()
                 detail = output[-1] if output else "done"
-                print(f"  ✓ Pruned {label}: {detail}", flush=True)
+                print(f"  ? Pruned {label}: {detail}", flush=True)
             else:
                 err = (result.stderr or result.stdout).strip()
                 print(f"  Warning: Failed to prune {label}: {err}", flush=True)
@@ -934,7 +959,7 @@ def ensure_docker_disk_space(min_free_mb: int = DOCKER_MIN_FREE_MB) -> bool:
     free_mb = min(root_free, docker_free) if root_free >= 0 and docker_free >= 0 else max(root_free, docker_free)
 
     if free_mb >= min_free_mb:
-        print(f"  ✓ Sufficient disk space ({free_mb} MB >= {min_free_mb} MB)", flush=True)
+        print(f"  ? Sufficient disk space ({free_mb} MB >= {min_free_mb} MB)", flush=True)
         return True
 
     print(
@@ -949,7 +974,7 @@ def ensure_docker_disk_space(min_free_mb: int = DOCKER_MIN_FREE_MB) -> bool:
     free_mb = min(root_free, docker_free) if root_free >= 0 and docker_free >= 0 else max(root_free, docker_free)
 
     if free_mb >= DOCKER_REQUIRED_FREE_MB:
-        print(f"  ✓ Disk space available after cleanup ({free_mb} MB)", flush=True)
+        print(f"  ? Disk space available after cleanup ({free_mb} MB)", flush=True)
         return True
 
     print("Error: Not enough disk space for Docker build.", flush=True)
@@ -1003,7 +1028,7 @@ def check_docker_daemon(timeout: int = 30) -> bool:
 
     ok, detail = _reachable()
     if ok:
-        print("  ✓ Docker daemon is running", flush=True)
+        print("  ? Docker daemon is running", flush=True)
         return True
 
     print(f"  Docker daemon not reachable: {detail}", flush=True)
@@ -1031,7 +1056,7 @@ def check_docker_daemon(timeout: int = 30) -> bool:
     time.sleep(2)
     ok, detail = _reachable()
     if ok:
-        print("  ✓ Docker daemon is running", flush=True)
+        print("  ? Docker daemon is running", flush=True)
         return True
 
     print(f"Error: Docker daemon is not available: {detail}")
@@ -1078,7 +1103,7 @@ def docker_login(account_id, region):
         login_msg = docker_login_result.stdout.strip() or docker_login_result.stderr.strip()
         if login_msg:
             print(f"  {login_msg}", flush=True)
-        print("  ✓ ECR login successful", flush=True)
+        print("  ? ECR login successful", flush=True)
         return True
 
     except subprocess.TimeoutExpired:
@@ -1407,7 +1432,7 @@ def sync_ecs_app_config(app_config: dict) -> bool:
 
         response = ecs.register_task_definition(**register_kwargs)
         new_task_def_arn = response["taskDefinition"]["taskDefinitionArn"]
-        print(f"  ✓ Registered task definition: {new_task_def_arn}")
+        print(f"  ? Registered task definition: {new_task_def_arn}")
 
         ecs.update_service(
             cluster=cluster_name,
@@ -1416,7 +1441,7 @@ def sync_ecs_app_config(app_config: dict) -> bool:
             forceNewDeployment=True,
         )
         print(
-            f"  ✓ Updated ECS service '{service_name}' with agent_runtime_arn "
+            f"  ? Updated ECS service '{service_name}' with agent_runtime_arn "
             f"and forced new deployment"
         )
         print(f"  agent_runtime_arn: {agent_runtime_arn}")
@@ -1436,7 +1461,7 @@ def update_agentcore_json(agent_runtime_arn, image_tag=None):
         update_config('agent_runtime_arn', agent_runtime_arn)
         if image_tag:
             update_config('latest_image_tag', image_tag)
-        print(f"✓ config.json updated with agent_runtime_arn: {agent_runtime_arn}")
+        print(f"? config.json updated with agent_runtime_arn: {agent_runtime_arn}")
 
         app_config_path = os.path.join(_repo_root(), "application", "config.json")
         app_config = _load_application_config_file()
@@ -1446,7 +1471,7 @@ def update_agentcore_json(agent_runtime_arn, image_tag=None):
                 app_config["agent_latest_image_tag"] = image_tag
             with open(app_config_path, "w", encoding="utf-8") as f:
                 json.dump(app_config, f, ensure_ascii=False, indent=2)
-            print(f"✓ application/config.json synced (agent_latest_image_tag={image_tag})")
+            print(f"? application/config.json synced (agent_latest_image_tag={image_tag})")
 
             sync_ecs_app_config(app_config)
         else:
@@ -1518,7 +1543,7 @@ def verify_session_storage_config(client, agent_runtime_id: str, config: dict) -
             mount_path = s3_files.get("mountPath")
             if mount_path == SESSION_STORAGE_MOUNT_PATH:
                 print(
-                    "✓ s3FilesAccessPoint verified: "
+                    "? s3FilesAccessPoint verified: "
                     f"mountPath={mount_path}, arn={s3_files.get('accessPointArn')}"
                 )
                 return True
@@ -1526,12 +1551,12 @@ def verify_session_storage_config(client, agent_runtime_id: str, config: dict) -
             session_storage = cfg.get("sessionStorage") or {}
             mount_path = session_storage.get("mountPath")
             if mount_path == SESSION_STORAGE_MOUNT_PATH:
-                print(f"✓ sessionStorage verified: mountPath={mount_path}")
+                print(f"? sessionStorage verified: mountPath={mount_path}")
                 return True
 
     storage_type = "s3FilesAccessPoint" if _uses_s3_files_session_storage(config) else "sessionStorage"
     print(
-        f"⚠ {storage_type} not found in filesystemConfigurations. "
+        f"? {storage_type} not found in filesystemConfigurations. "
         f"Cold start may not restore {SESSION_STORAGE_MOUNT_PATH} checkpoint data."
     )
     print(f"  filesystemConfigurations: {filesystem_configs or None}")
@@ -1574,7 +1599,7 @@ def create_agent_runtime_func(config, repository_name, image_tag):
             roleArn=agent_runtime_role
         )
         
-        print(f"✓ Agent runtime created: {response['agentRuntimeArn']}")
+        print(f"? Agent runtime created: {response['agentRuntimeArn']}")
         return response['agentRuntimeArn']
         
     except ClientError as e:
@@ -1620,7 +1645,7 @@ def update_agent_runtime_func(config, repository_name, agent_runtime_id, image_t
             protocolConfiguration={"serverProtocol": "HTTP"}
         )
         
-        print(f"✓ Agent runtime updated: {response['agentRuntimeArn']}")
+        print(f"? Agent runtime updated: {response['agentRuntimeArn']}")
         return response['agentRuntimeArn']
         
     except Exception as e:
@@ -1699,7 +1724,7 @@ def create_agent_runtime():
         # Update config.json
         update_agentcore_json(agent_runtime_arn, image_tag)
         
-        print("\n✓ Agent runtime creation/update completed")
+        print("\n? Agent runtime creation/update completed")
         return True
         
     except Exception as e:
@@ -1730,7 +1755,7 @@ def setup_agentcore_observability():
         if warning:
             print(f"Warning: {warning}")
         else:
-            print("✓ AgentCore Observability configured")
+            print("? AgentCore Observability configured")
         return True
     except Exception as e:
         print(f"Warning: AgentCore Observability setup failed: {e}")
@@ -1786,7 +1811,7 @@ def setup_agentcore_evaluations():
         if warning:
             print(f"Warning: {warning}")
         elif result.get("status") != "skipped":
-            print("✓ AgentCore Evaluations configured")
+            print("? AgentCore Evaluations configured")
         return True
     except Exception as e:
         print(f"Warning: AgentCore Evaluations setup failed: {e}")
