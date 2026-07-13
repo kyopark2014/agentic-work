@@ -1,3 +1,4 @@
+import { useRef } from "react";
 import { formatBrandTitle } from "../formatBrandTitle";
 import type { AppConfig, Task } from "../types";
 import { ConfigDrawer } from "./ConfigDrawer";
@@ -39,6 +40,8 @@ export function Sidebar({
   onDeleteTask,
   onLogout,
 }: Props) {
+  const skillBtnRef = useRef<HTMLButtonElement>(null);
+  const mcpBtnRef = useRef<HTMLButtonElement>(null);
   const skills = activeTask?.skills ?? config?.default_skills ?? [];
   const mcpServers = activeTask?.mcp_servers ?? config?.default_mcp_servers ?? [];
   const brandTitle = formatBrandTitle(config?.projectName ?? "agent", userId);
@@ -58,6 +61,10 @@ export function Sidebar({
         onTogglePin={() => onPatchTask(task.id, { pinned: !task.pinned })}
       />
     );
+  }
+
+  function toggleDrawer(kind: Exclude<DrawerKind, null>) {
+    onOpenDrawer(drawer === kind ? null : kind);
   }
 
   return (
@@ -111,18 +118,24 @@ export function Sidebar({
         <div className="sidebar-section">
           <div className="section-label">Configuration</div>
           <button
+            ref={skillBtnRef}
             type="button"
-            className="sidebar-menu-btn"
-            onClick={() => onOpenDrawer("skill")}
+            className={`sidebar-menu-btn${drawer === "skill" ? " is-active" : ""}`}
+            aria-expanded={drawer === "skill"}
+            aria-haspopup="dialog"
+            onClick={() => toggleDrawer("skill")}
             disabled={!activeTask}
           >
             <SkillIcon className="sidebar-icon" />
             <span>Skill ({skills.length})</span>
           </button>
           <button
+            ref={mcpBtnRef}
             type="button"
-            className="sidebar-menu-btn"
-            onClick={() => onOpenDrawer("mcp")}
+            className={`sidebar-menu-btn${drawer === "mcp" ? " is-active" : ""}`}
+            aria-expanded={drawer === "mcp"}
+            aria-haspopup="dialog"
+            onClick={() => toggleDrawer("mcp")}
             disabled={!activeTask}
           >
             <McpIcon className="sidebar-icon" />
@@ -170,6 +183,7 @@ export function Sidebar({
           title="Skill"
           options={config.skills}
           selected={skills}
+          anchorEl={skillBtnRef.current}
           onChange={(next) => activeTask && onPatchTask(activeTask.id, { skills: next })}
           onClose={onCloseDrawer}
         />
@@ -179,6 +193,7 @@ export function Sidebar({
           title="MCP"
           options={config.mcp_servers}
           selected={mcpServers}
+          anchorEl={mcpBtnRef.current}
           onChange={(next) => activeTask && onPatchTask(activeTask.id, { mcp_servers: next })}
           onClose={onCloseDrawer}
         />

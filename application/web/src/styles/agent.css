@@ -125,6 +125,10 @@ select {
   cursor: not-allowed;
 }
 
+.sidebar-menu-btn.is-active {
+  background: var(--bg-hover);
+}
+
 .sidebar-icon {
   width: 16px;
   height: 16px;
@@ -917,59 +921,70 @@ select {
   gap: 8px;
 }
 
-.drawer-overlay {
+.config-popover {
   position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.45);
-  z-index: 90;
-}
-
-.drawer {
-  position: fixed;
-  top: 0;
-  left: var(--sidebar-width);
-  width: 320px;
-  height: 100%;
-  background: var(--bg-secondary);
-  border-right: 1px solid var(--border);
-  padding: 20px;
-  z-index: 91;
-  overflow-y: auto;
-}
-
-.drawer h3 {
-  margin: 0 0 16px;
-  font-size: 16px;
-}
-
-.checkbox-list {
+  transform: translateY(-100%);
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 8px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+  z-index: 1000;
+  overflow: hidden;
 }
 
-.checkbox-item {
+.config-popover-header {
+  padding: 8px 10px 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 4px;
+}
+
+.config-popover-list {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  gap: 2px;
+  overflow-y: auto;
+  min-height: 0;
+  padding: 2px 0;
+}
+
+.config-popover-empty {
+  padding: 10px 12px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.config-popover-item {
   display: flex;
   align-items: center;
   gap: 10px;
-  font-size: 14px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  font-size: 13px;
   color: var(--text-primary);
   cursor: pointer;
 }
 
-.checkbox-item input {
+.config-popover-item:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.config-popover-item span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.config-popover-item input {
   accent-color: var(--accent);
-}
-
-.drawer-close {
-  margin-top: 20px;
-  width: 100%;
-  padding: 10px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--bg-tertiary);
-  color: var(--text-primary);
-  cursor: pointer;
+  flex-shrink: 0;
 }
 
 .streaming-indicator {
@@ -1056,12 +1071,8 @@ select {
     max-width: 100%;
   }
 
-  .drawer {
-    left: 0;
-    width: 100%;
-    max-width: 100%;
-    padding-top: max(20px, env(safe-area-inset-top));
-    padding-bottom: max(20px, env(safe-area-inset-bottom));
+  .config-popover {
+    max-width: calc(100vw - 16px);
   }
 
   .chat-add-btn,
