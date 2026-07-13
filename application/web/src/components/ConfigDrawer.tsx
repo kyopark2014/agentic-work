@@ -6,6 +6,7 @@ interface Props {
   options: string[];
   selected: string[];
   anchorEl: HTMLElement | null;
+  mode?: "multi" | "single";
   onChange: (next: string[]) => void;
   onClose: () => void;
 }
@@ -18,6 +19,7 @@ export function ConfigDrawer({
   options,
   selected,
   anchorEl,
+  mode = "multi",
   onChange,
   onClose,
 }: Props) {
@@ -30,6 +32,11 @@ export function ConfigDrawer({
   } | null>(null);
 
   function toggle(option: string) {
+    if (mode === "single") {
+      onChange([option]);
+      onClose();
+      return;
+    }
     if (selected.includes(option)) {
       onChange(selected.filter((s) => s !== option));
     } else {
@@ -40,7 +47,7 @@ export function ConfigDrawer({
   function updatePosition() {
     if (!anchorEl) return;
     const rect = anchorEl.getBoundingClientRect();
-    const width = Math.max(rect.width, 220);
+    const width = Math.max(rect.width, 240);
     const left = Math.min(
       Math.max(8, rect.left),
       window.innerWidth - width - 8,
@@ -102,16 +109,34 @@ export function ConfigDrawer({
         {options.length === 0 ? (
           <div className="config-popover-empty">선택할 항목이 없습니다.</div>
         ) : (
-          options.map((option) => (
-            <label key={option} className="config-popover-item">
-              <input
-                type="checkbox"
-                checked={selected.includes(option)}
-                onChange={() => toggle(option)}
-              />
-              <span>{option}</span>
-            </label>
-          ))
+          options.map((option) => {
+            const isSelected = selected.includes(option);
+            if (mode === "single") {
+              return (
+                <button
+                  key={option}
+                  type="button"
+                  className={`config-popover-item config-popover-choice${isSelected ? " is-selected" : ""}`}
+                  role="menuitemradio"
+                  aria-checked={isSelected}
+                  onClick={() => toggle(option)}
+                >
+                  <span>{option}</span>
+                  {isSelected && <span className="config-popover-check" aria-hidden="true">✓</span>}
+                </button>
+              );
+            }
+            return (
+              <label key={option} className="config-popover-item">
+                <input
+                  type="checkbox"
+                  checked={isSelected}
+                  onChange={() => toggle(option)}
+                />
+                <span>{option}</span>
+              </label>
+            );
+          })
         )}
       </div>
     </div>,

@@ -987,6 +987,28 @@ select {
   flex-shrink: 0;
 }
 
+button.config-popover-choice {
+  width: 100%;
+  border: none;
+  background: transparent;
+  text-align: left;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: inherit;
+  color: inherit;
+}
+
+button.config-popover-choice.is-selected {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.config-popover-check {
+  margin-left: auto;
+  flex-shrink: 0;
+  color: var(--accent);
+  font-size: 12px;
+}
+
 .streaming-indicator {
   color: var(--text-muted);
   font-size: 13px;
