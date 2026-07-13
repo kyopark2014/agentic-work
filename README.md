@@ -56,7 +56,6 @@ flowchart TB
     TI["trade info stock trend"]
     WF["web_fetch npx"]
     IG[image generation]
-    UC["user config"]
   end
 
   subgraph MCPClient["langchain mcp adapters"]
@@ -751,7 +750,7 @@ runtime_agent/langgraph/
 ├── test_runtime_remote.py  # Runtime 원격 invoke 테스트
 ├── mcp.list                # 지원 MCP 목록
 ├── skills.list             # 지원 Skill 목록
-├── mcp.env                 # 사용자 설정 MCP 환경 변수 예시
+├── mcp.env                 # MCP 환경 변수 예시
 ├── Dockerfile              # AgentCore Runtime 컨테이너 이미지
 ├── config.json             # Knowledge Base ID, region, projectName 등
 └── skills/                 # Skill 정의 (아래 참조)
@@ -774,7 +773,7 @@ runtime_agent/langgraph/
 | **인증·모델** | `agentcore_sigv4_auth.py`, `bedrock_data_retention.py`, `info.py` | Gateway SigV4, Mantle bearer token, 모델 프로필 |
 | **설정·배포** | `utils.py`, `installer.py`, `config.json` | AWS 리소스 연동, Secrets Manager, Runtime/IAM 배포 |
 
-**MCP 목록 (`mcp.list`)**: knowledge base, aws documentation, trade info, websearch, web_fetch, image generation, 사용자 설정
+**MCP 목록 (`mcp.list`)**: knowledge base, aws documentation, trade info, websearch, web_fetch, image generation, korea_weather, tavily, notion, aws-drawio
 
 **Skill 목록 (`skills.list`)**: docx, pdf, pptx, xlsx, skill-creator, seoul-subway, usa-weather, kma-weather
 

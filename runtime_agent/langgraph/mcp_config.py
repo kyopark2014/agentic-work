@@ -28,8 +28,6 @@ contents_dir = os.path.join(parent_dir, "contents")
 logger.info(f"workingDir: {workingDir}")
 logger.info(f"contents_dir: {contents_dir}")
 
-mcp_user_config = {}    
-
 def get_agentcore_gateway_mcp_url(gateway_name: str, gateway_region: str) -> str | None:
     client = boto3.client("bedrock-agentcore-control", region_name=gateway_region)
     try:
@@ -196,10 +194,7 @@ def load_config(mcp_type):
                     "args": [f"{workingDir}/mcp_server_noaa.py"],
                 }
             }
-        }    
-    
-    elif mcp_type == "사용자 설정":
-        return mcp_user_config
+        }
 
 def load_selected_config(mcp_servers: dict):
     logger.info(f"mcp_servers: {mcp_servers}")
