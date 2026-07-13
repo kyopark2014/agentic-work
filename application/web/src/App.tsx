@@ -293,8 +293,20 @@ export default function App() {
     setSidebarOpen(false);
   }
 
-  if (!authReady || !userId) {
-    return <UserIdModal onSubmit={handleLogin} error={bootError} />;
+  // Wait for session check before showing login — otherwise a saved cookie
+  // briefly flashes the User ID modal, then the main app.
+  if (!authReady) {
+    return <div className="boot-loading">불러오는 중…</div>;
+  }
+
+  if (!userId) {
+    return (
+      <UserIdModal
+        onSubmit={handleLogin}
+        error={bootError}
+        projectName={config?.projectName}
+      />
+    );
   }
 
   return (
