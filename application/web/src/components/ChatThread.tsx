@@ -62,7 +62,10 @@ export function ChatThread({
                 />
               ) : (
                 <div className="message-row assistant">
-                  <div className="streaming-indicator">thinking...</div>
+                  <div className="streaming-indicator" aria-label="Thinking">
+                    Thinking
+                    <span className="thinking-ellipsis" aria-hidden="true" />
+                  </div>
                 </div>
               )}
             </>

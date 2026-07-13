@@ -977,6 +977,21 @@ select {
   font-size: 13px;
 }
 
+.thinking-ellipsis::after {
+  content: "...";
+  display: inline-block;
+  width: 0;
+  overflow: hidden;
+  vertical-align: bottom;
+  animation: thinking-ellipsis 1.2s steps(4, end) infinite;
+}
+
+@keyframes thinking-ellipsis {
+  to {
+    width: 1.2em;
+  }
+}
+
 @media (max-width: 768px) {
   .menu-btn {
     display: flex;
