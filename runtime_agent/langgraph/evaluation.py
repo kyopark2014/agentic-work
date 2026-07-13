@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+import time
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 import boto3
 from botocore.exceptions import ClientError
@@ -20,6 +22,13 @@ DEFAULT_SAMPLING_PERCENTAGE = 10.0
 DEFAULT_SESSION_TIMEOUT_MINUTES = 5
 # Agent runtime names previously used runtime_type (e.g. langgraph) instead of projectName.
 LEGACY_AGENT_RUNTIME_TYPE = "langgraph"
+# IAM role create/update can take a few seconds to become assumable by AgentCore.
+ROLE_PROPAGATION_INITIAL_WAIT_SECONDS = 5
+ROLE_PROPAGATION_MAX_ATTEMPTS = 8
+ROLE_PROPAGATION_BASE_DELAY_SECONDS = 2
+ROLE_PROPAGATION_MAX_DELAY_SECONDS = 15
+
+T = TypeVar("T")
 
 
 def agent_runtime_name(project_name: str) -> str:
@@ -164,11 +173,54 @@ def _upsert_iam_policy(
     return policy_arn
 
 
-def ensure_evaluation_execution_role(region: str, account_id: str, project_name: str) -> str:
-    """Create or update the IAM role used by AgentCore Evaluations."""
+def _is_execution_role_assume_error(error: ClientError) -> bool:
+    """Return True when AgentCore rejects a role that is not yet assumable."""
+    err = error.response.get("Error", {})
+    code = err.get("Code", "")
+    message = str(err.get("Message", "")).lower()
+    return code == "ValidationException" and "cannot be assumed" in message
+
+
+def _with_iam_propagation_retry(action: str, fn: Callable[[], T]) -> T:
+    """Retry AgentCore calls that fail while a newly created IAM role propagates."""
+    last_error: ClientError | None = None
+    for attempt in range(1, ROLE_PROPAGATION_MAX_ATTEMPTS + 1):
+        try:
+            return fn()
+        except ClientError as error:
+            if not _is_execution_role_assume_error(error):
+                raise
+            last_error = error
+            if attempt >= ROLE_PROPAGATION_MAX_ATTEMPTS:
+                break
+            delay = min(
+                ROLE_PROPAGATION_BASE_DELAY_SECONDS * (2 ** (attempt - 1)),
+                ROLE_PROPAGATION_MAX_DELAY_SECONDS,
+            )
+            print(
+                f"  Waiting {delay}s for evaluation role IAM propagation "
+                f"before retrying {action} "
+                f"(attempt {attempt}/{ROLE_PROPAGATION_MAX_ATTEMPTS})"
+            )
+            time.sleep(delay)
+    assert last_error is not None
+    raise last_error
+
+
+def ensure_evaluation_execution_role(
+    region: str,
+    account_id: str,
+    project_name: str,
+) -> tuple[str, bool]:
+    """Create or update the IAM role used by AgentCore Evaluations.
+
+    Returns:
+        (role_arn, newly_created)
+    """
     iam_client = boto3.client("iam")
     role_name = evaluation_role_name(project_name)
     policy_name = f"{role_name}Policy"
+    newly_created = False
 
     policy_arn = _upsert_iam_policy(
         iam_client,
@@ -191,10 +243,11 @@ def ensure_evaluation_execution_role(region: str, account_id: str, project_name:
             AssumeRolePolicyDocument=trust_policy,
             Description="Execution role for Amazon Bedrock AgentCore Evaluations",
         )
+        newly_created = True
         print(f"  Created evaluation role: {role_name}")
 
     iam_client.attach_role_policy(RoleName=role_name, PolicyArn=policy_arn)
-    return f"arn:aws:iam::{account_id}:role/{role_name}"
+    return f"arn:aws:iam::{account_id}:role/{role_name}", newly_created
 
 
 def _find_online_evaluation_config(client, config_name: str) -> dict[str, Any] | None:
@@ -300,13 +353,19 @@ def ensure_online_evaluation_config(
     existing = _find_online_evaluation_config(client, config_name)
     if existing:
         config_id = existing["onlineEvaluationConfigId"]
-        client.update_online_evaluation_config(
-            onlineEvaluationConfigId=config_id,
-            rule=rule,
-            dataSourceConfig=data_source_config,
-            evaluationExecutionRoleArn=execution_role_arn,
-            evaluators=[{"evaluatorId": evaluator_id} for evaluator_id in evaluator_ids],
-        )
+
+        def _update() -> None:
+            client.update_online_evaluation_config(
+                onlineEvaluationConfigId=config_id,
+                rule=rule,
+                dataSourceConfig=data_source_config,
+                evaluationExecutionRoleArn=execution_role_arn,
+                evaluators=[
+                    {"evaluatorId": evaluator_id} for evaluator_id in evaluator_ids
+                ],
+            )
+
+        _with_iam_propagation_retry("update_online_evaluation_config", _update)
         print(
             f"  Updated online evaluation config: {config_name} "
             f"(sessionTimeoutMinutes={session_timeout_minutes}, "
@@ -324,15 +383,18 @@ def ensure_online_evaluation_config(
             "session_timeout_minutes": session_timeout_minutes,
         }
 
-    response = client.create_online_evaluation_config(
-        onlineEvaluationConfigName=config_name,
-        description=f"Online evaluation for LangGraph runtime ({project_name})",
-        rule=rule,
-        dataSourceConfig=data_source_config,
-        evaluators=[{"evaluatorId": evaluator_id} for evaluator_id in evaluator_ids],
-        evaluationExecutionRoleArn=execution_role_arn,
-        enableOnCreate=True,
-    )
+    def _create() -> dict[str, Any]:
+        return client.create_online_evaluation_config(
+            onlineEvaluationConfigName=config_name,
+            description=f"Online evaluation for LangGraph runtime ({project_name})",
+            rule=rule,
+            dataSourceConfig=data_source_config,
+            evaluators=[{"evaluatorId": evaluator_id} for evaluator_id in evaluator_ids],
+            evaluationExecutionRoleArn=execution_role_arn,
+            enableOnCreate=True,
+        )
+
+    response = _with_iam_propagation_retry("create_online_evaluation_config", _create)
     print(
         f"  Created online evaluation config: {config_name} "
         f"(sessionTimeoutMinutes={session_timeout_minutes})"
@@ -365,8 +427,17 @@ def setup_agentcore_evaluation(
         return result
 
     print("  Creating evaluation execution role...")
-    execution_role_arn = ensure_evaluation_execution_role(region, account_id, project_name)
+    execution_role_arn, role_created = ensure_evaluation_execution_role(
+        region, account_id, project_name
+    )
     result["evaluation_execution_role_arn"] = execution_role_arn
+
+    if role_created:
+        print(
+            f"  Waiting {ROLE_PROPAGATION_INITIAL_WAIT_SECONDS}s for new evaluation "
+            "role to become assumable..."
+        )
+        time.sleep(ROLE_PROPAGATION_INITIAL_WAIT_SECONDS)
 
     print("  Cleaning up stale agent runtimes...")
     deleted_runtimes = cleanup_stale_agent_runtimes(
