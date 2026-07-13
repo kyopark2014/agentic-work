@@ -247,6 +247,12 @@ openai_gpt_54_models = [
 
 openai_gpt_55_models = [
     {
+        "bedrock_region": "us-east-1", # N.Virginia
+        "model_type": "openai",
+        "model_id": "openai.gpt-5.5",
+        "mantle_api": "responses",
+    },
+    {
         "bedrock_region": "us-east-2", # Ohio
         "model_type": "openai",
         "model_id": "openai.gpt-5.5",

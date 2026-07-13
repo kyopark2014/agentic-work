@@ -338,8 +338,10 @@ def create_bedrock_agentcore_policy(config):
                     "bedrock-mantle:List*",
                     "bedrock-mantle:CreateInference"
                 ],
+                # OpenAI Mantle models (e.g. gpt-5.5) call us-east-1/2 even when
+                # the AgentCore runtime itself runs in config['region'].
                 "Resource": [
-                    f"arn:aws:bedrock-mantle:{region}:{accountId}:project/*"
+                    f"arn:aws:bedrock-mantle:*:{accountId}:project/*"
                 ]
             },
             {
@@ -766,11 +768,11 @@ def create_bedrock_guardrail() -> bool:
             "blocks sexual content and prompt attacks in user input."
         )
         blocked_input_message = (
-            "요청이 안전 정책에 의해 차단되었습니다. "
-            "성적 표현 또는 프롬프트 공격이 감지되었습니다."
+            "요청이 안전 정책엝 의해 차단띘었습니다. "
+            "성젝 표현 똝는 프롬프트 공격이 객지띘었습니다."
         )
         blocked_output_message = (
-            "응답이 안전 정책에 의해 차단되었습니다."
+            "응답이 안전 정책엝 의해 차단띘었습니다."
         )
         content_policy = _bedrock_guardrail_content_policy()
 
