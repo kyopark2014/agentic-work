@@ -73,6 +73,29 @@ export function GuardrailIcon({ className }: IconProps) {
   );
 }
 
+export function MemoryIcon({ className }: IconProps) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 16 16"
+      aria-hidden="true"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.15"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <rect x="2.5" y="3.5" width="11" height="9" rx="1.25" />
+      <path d="M5 3.5v9" />
+      <path d="M11 3.5v9" />
+      <path d="M2.5 6.5h2.5" />
+      <path d="M2.5 9.5h2.5" />
+      <path d="M11 6.5h2.5" />
+      <path d="M11 9.5h2.5" />
+    </svg>
+  );
+}
+
 export function MenuIcon({ className }: IconProps) {
   return (
     <svg

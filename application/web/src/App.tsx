@@ -101,6 +101,7 @@ export default function App() {
               model_name: config.default_model,
               skills: config.default_skills,
               mcp_servers: config.default_mcp_servers,
+              memory_enabled: true,
             });
           })();
         }
@@ -186,6 +187,7 @@ export default function App() {
       skills: activeTask?.skills ?? config.default_skills,
       mcp_servers: activeTask?.mcp_servers ?? config.default_mcp_servers,
       guardrail_enabled: activeTask?.guardrail_enabled ?? false,
+      memory_enabled: activeTask?.memory_enabled ?? true,
     });
     setTasks((prev) => [task, ...prev]);
     setActiveTaskId(task.id);
@@ -217,6 +219,7 @@ export default function App() {
       model_name: config.default_model,
       skills: config.default_skills,
       mcp_servers: config.default_mcp_servers,
+      memory_enabled: true,
     });
     setTasks([task]);
     setActiveTaskId(task.id);

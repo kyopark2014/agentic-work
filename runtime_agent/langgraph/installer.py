@@ -229,6 +229,8 @@ def update_knowledge_base_config() -> bool:
                 "s3_files_file_system_id",
                 "agent_runtime_vpc_subnets",
                 "agent_runtime_security_groups",
+                "agentcore_memory_role",
+                "memory_id",
             ):
                 if app_config.get(key):
                     updates[key] = app_config[key]
@@ -297,6 +299,8 @@ def update_knowledge_base_config() -> bool:
             "s3_files_file_system_id",
             "agent_runtime_vpc_subnets",
             "agent_runtime_security_groups",
+            "agentcore_memory_role",
+            "memory_id",
         ):
             if app_config.get(key) and not updates.get(key):
                 updates[key] = app_config[key]

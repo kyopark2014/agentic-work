@@ -3,7 +3,7 @@ import { formatBrandTitle } from "../formatBrandTitle";
 import type { AppConfig, Task } from "../types";
 import { ConfigDrawer } from "./ConfigDrawer";
 import { TaskListItem } from "./TaskListItem";
-import { GuardrailIcon, LogoutIcon, McpIcon, ModelIcon, NewTaskIcon, SkillIcon, CloseIcon } from "./SidebarIcons";
+import { GuardrailIcon, LogoutIcon, McpIcon, MemoryIcon, ModelIcon, NewTaskIcon, SkillIcon, CloseIcon } from "./SidebarIcons";
 
 type DrawerKind = "skill" | "mcp" | "model" | null;
 
@@ -170,6 +170,19 @@ export function Sidebar({
               onChange={(e) =>
                 activeTask &&
                 onPatchTask(activeTask.id, { guardrail_enabled: e.target.checked })
+              }
+            />
+          </label>
+          <label className="sidebar-menu-btn settings-toggle">
+            <MemoryIcon className="sidebar-icon" />
+            <span>Memory</span>
+            <input
+              type="checkbox"
+              checked={activeTask?.memory_enabled ?? true}
+              disabled={!activeTask}
+              onChange={(e) =>
+                activeTask &&
+                onPatchTask(activeTask.id, { memory_enabled: e.target.checked })
               }
             />
           </label>

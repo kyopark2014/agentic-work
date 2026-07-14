@@ -1624,6 +1624,157 @@ reduction_% = sum(cache_read) / sum(input + cache_creation + cache_read)
 - 기본 LLM 경로를 `ChatBedrockConverse`로 강제 전환
 - skill 본문(`SKILL.md`)을 system에 넣는 구조 변경 (이미 `get_skill_instructions` tool로 로드)
 
+### Memory
+
+[AgentCore Memory](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/memory-getting-started.html)로 **단기(event) / 장기(strategy 추출 레코드)** 를 관리합니다. LangGraph **Session Storage(checkpointer)** 가 태스크별 대화 이력을 SQLite에 유지하는 것과 역할이 다릅니다. Memory는 슬라이딩 윈도우처럼 context에 항상 넣지 않고, Agent가 필요할 때 MCP로 조회해 씁니다.
+
+| 구분 | Session Storage (checkpointer) | AgentCore Memory |
+|------|-------------------------------|------------------|
+| 목적 | 같은 `runtimeSessionId`의 대화 turn 유지 | 사용자 선호·장기 선호 저장/검색 |
+| 저장소 | SQLite (`/mnt/workspace` 또는 `/tmp`) | Bedrock AgentCore Memory API |
+| UI | 태스크(세션) 단위 | 사이드바 **Memory** 토글 (`memory_enabled`) |
+| 조회 | checkpointer가 자동 복원 | MCP `recall_memory` (retrieve / list / get) |
+
+#### 동작 흐름
+
+1. 루트 [installer.py](./installer.py)가 Memory 실행 역할·Memory 리소스를 만들고 `memory_id` / `agentcore_memory_role`을 `application/config.json`·Runtime `config.json`에 기록합니다.
+2. Web UI에서 태스크의 Memory를 켜면 `memory_enabled=true`가 AgentCore Runtime payload로 전달됩니다 ([application/agentcore_client.py](./application/agentcore_client.py)).
+3. [runtime_agent/langgraph/agent.py](./runtime_agent/langgraph/agent.py)는 Memory가 켜져 있으면 MCP 목록에 `memory`를 넣고, 응답 후 `chat.save_to_memory(query, result)`로 event를 저장합니다.
+4. Agent는 대화 중 `recall_memory` 도구로 namespace `/users/{actorId}` 등에서 의미 검색·목록·단건 조회를 합니다.
+
+```mermaid
+flowchart LR
+  UI["Sidebar memory_enabled"] --> Client["agentcore_client.run_agent"]
+  Client --> Runtime["agent.py"]
+  Runtime -->|"memory MCP"| Recall["mcp_server_memory.recall_memory"]
+  Runtime -->|"응답 후"| Save["chat.save_to_memory"]
+  Save --> STM["create_event USER/ASSISTANT"]
+  STM --> LTM["customMemoryStrategy 추출"]
+  Recall --> API["retrieve / list / get memory records"]
+  LTM --> API
+```
+
+#### 배포 (installer)
+
+[installer.py](./installer.py)의 `create_agentcore_memory_role()` / `create_agentcore_memory()`가 다음을 수행합니다.
+
+- **IAM 역할** `role-agentcore-memory-for-{project}-{region}`  
+  - Trust: `bedrock-agentcore.amazonaws.com` + `aws:SourceAccount` / `aws:SourceArn`  
+    (`CreateMemory`는 이 Condition이 없으면 `valid trust policy` ValidationException)
+  - Permission: `bedrock:InvokeModel` / `InvokeModelWithResponseStream` (strategy 추출용 모델 호출)
+- **Memory** 이름: `projectName`의 `-` → `_` (예: `agentic_work`)  
+  - `customMemoryStrategy` + `userPreferenceOverride` (한국어 preference 추출 프롬프트)  
+  - namespace 예: `/users/installer` (생성 시), 런타임에는 `/users/{user_id}`  
+  - `event_expiry_days=365`, `memory_execution_role_arn` = 위 역할
+- 결과 키: `agentcore_memory_role`, `memory_id` → ECS Web UI와 Runtime 이미지 `config.json`에 복사
+
+#### Short-term (대화 event)
+
+응답이 끝나면 [chat.py](./runtime_agent/langgraph/chat.py) `save_to_memory()` → [agentcore_memory.py](./runtime_agent/langgraph/agentcore_memory.py) `save_conversation_to_memory()`가 USER/ASSISTANT 메시지를 `create_event`로 저장합니다. (내용 9,000자 초과 시 truncate)
+
+```python
+# runtime_agent/langgraph/agentcore_memory.py
+memory_client.create_event(
+    memory_id=memory_id,
+    actor_id=actor_id,
+    session_id=session_id,
+    event_timestamp=event_timestamp,
+    messages=[(query, "USER"), (result, "ASSISTANT")],
+)
+```
+
+사용자별 `memory_id` / `actor_id` / `session_id` / `namespace`는 `load_memory_variables(user_id)`가 `user_{user_id}.json`·`config.json`에서 읽고, 없으면 기존 Memory 조회 또는 생성합니다. `actor_id`는 항상 애플리케이션 `user_id`입니다.
+
+Short-term의 raw event는 `ListEvents` / `GetEvent`로 조회할 수 있습니다. 이 프로젝트의 Memory MCP(`recall_memory`)는 long-term **memory record** 조회에 초점을 둡니다.
+
+#### Short-term → Long-term 변환
+
+Short-term에 넣은 대화가 Long-term에서 **같은 원문으로 다시 읽히는 구조가 아닙니다.** Memory에 연결된 **strategy**가 event를 비동기로 가공해 **Memory Record**를 만들고, Agent는 그 레코드를 semantic search로 가져옵니다.
+
+참고: [Memory types](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/memory-types.html), [Memory strategies](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/memory-strategies.html)
+
+| | Short-term | Long-term |
+|---|---|---|
+| 무엇 | 원시 대화 **event** | 추출·통합된 **memory record** |
+| 저장 | 앱이 `CreateEvent` 호출 | strategy가 백그라운드에서 생성 (앱이 직접 write하지 않음) |
+| 조회 API | `ListEvents` / `GetEvent` | `RetrieveMemoryRecords` / `ListMemoryRecords` / `GetMemoryRecord` |
+| 범위 | 주로 같은 `sessionId` | 세션을 넘어 `actorId`·namespace 단위로 유지 |
+| 내용 | USER/ASSISTANT 원문 | 선호·사실·요약 등 **insight** |
+
+```text
+[대화 응답 후]
+save_conversation_to_memory()
+        │
+        ▼
+ CreateEvent  ──► Short-term (raw events)
+        │
+        │  (비동기, 백그라운드)
+        ▼
+ Memory Strategy (예: userPreferenceOverride)
+   1) Extraction  — 프롬프트+모델로 선호/사실 추출
+   2) Consolidation — 기존 long-term과 합치기(추가/갱신/스킵)
+        │
+        ▼
+ Memory Record  ──► namespace (예: /users/{actorId})
+        │
+        ▼
+ recall_memory(retrieve) → RetrieveMemoryRecords (semantic search)
+```
+
+핵심:
+
+1. **Short-term 저장이 트리거**입니다. `CreateEvent`로 event가 들어와야 strategy가 실행됩니다. strategy가 없으면 long-term record는 생기지 않습니다.
+2. **Extraction / Consolidation은 라이브 응답과 분리된 비동기**입니다. event 직후 long-term에 바로 안 보일 수 있습니다.
+3. Long-term에 남는 것은 전체 대화 스크립트 복사가 아니라, “선호 브랜드”, “커뮤니케이션 스타일” 같은 **구조화된 insight**입니다.
+4. 조회는 short-term event ID로 직접 연결하는 것이 아니라, namespace에 대한 **의미 검색**(query와 가까운 record)입니다.
+
+#### Long-term (strategy + namespace)
+
+Memory 생성·초기화 시 `customMemoryStrategy` + `userPreferenceOverride`로 사용자 선호를 추출합니다. `memory_execution_role`이 strategy용 Bedrock 모델(`InvokeModel`)을 호출합니다. `initiate_memory()`는 strategy가 없으면 `create_strategy_if_not_exists(memory_id, namespace, strategy_name=user_id)`로 추가합니다. 추출 결과는 namespace(기본 `/users/{actorId}`)에 쌓이고, MCP `retrieve` / `list` 대상이 됩니다.
+
+Long-term 조회가 잘 되려면:
+
+- Memory에 **strategy가 붙어 있어야** 함 (installer / `initiate_memory`)
+- `memory_execution_role` trust·권한이 올바르고 추출 모델 호출이 가능해야 함
+- 사용자가 preference로 뽑힐 만한 내용을 말해야 함 (잡담만이면 record가 비거나 적을 수 있음)
+- 추출은 **비동기**이므로 event 직후가 아니라 잠시 뒤 `retrieve` / `list`로 확인
+- 검색 namespace가 strategy에 지정한 것과 일치해야 함 (`/users/{user_id}`)
+
+#### MCP `recall_memory`
+
+| 파일 | 역할 |
+|------|------|
+| [mcp_server_memory.py](./runtime_agent/langgraph/mcp_server_memory.py) | FastMCP 도구 `recall_memory` (stdio) |
+| [mcp_memory.py](./runtime_agent/langgraph/mcp_memory.py) | `retrieve` / `list` / `get` → Bedrock AgentCore Data Plane |
+| [mcp_config.py](./runtime_agent/langgraph/mcp_config.py) | `mcp_type == "memory"` → `mcp_server_memory.py` |
+| [mcp.list](./runtime_agent/langgraph/mcp.list) | UI에서 선택 가능한 MCP에 `memory` 포함 |
+
+`create_agent()`는 memory MCP 프로세스 env에 `AGENTCORE_USER_ID`를 넣어 사용자 격리합니다. `memory_enabled`이면 UI에서 MCP를 고르지 않아도 Runtime이 `memory` MCP를 자동 첨부합니다.
+
+```python
+# runtime_agent/langgraph/agent.py
+if chat.memory_enabled and "memory" not in mcp_servers:
+    mcp_servers = list(mcp_servers) + ["memory"]
+
+# 응답 후
+if chat.memory_enabled:
+    chat.save_to_memory(query, result_text)
+```
+
+도구 action:
+
+- **retrieve** — namespace들(기본 `/users/{actorId}` + strategy namespace)에 대한 semantic search (`RetrieveMemoryRecords`)
+- **list** — 저장된 memory record 목록 (`ListMemoryRecords`)
+- **get** — `memory_record_id`로 단건 조회 (`GetMemoryRecord`)
+
+#### UI / API
+
+- 사이드바 체크박스 → [Sidebar.tsx](./application/web/src/components/Sidebar.tsx) `memory_enabled`
+- 태스크 DB 컬럼 → [task_store.py](./application/task_store.py)
+- 채팅 SSE → [routes_chat.py](./application/api/routes_chat.py) → `run_agent(..., memory_enabled=...)`
+
+로컬 테스트 시 Web UI를 8501로 띄운 뒤 Memory 토글을 켜고, 선호를 말한 다음(추출이 끝난 뒤) 이후 턴에서 Agent가 `recall_memory`로 불러오는지 확인하면 됩니다.
+
 ## 배포하기
 
 아래와 같이 EC2를 이용해 배포 환경을 구성합니다.

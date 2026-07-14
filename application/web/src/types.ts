@@ -7,6 +7,7 @@ export interface Task {
   skills: string[];
   mcp_servers: string[];
   guardrail_enabled: boolean;
+  memory_enabled: boolean;
   pinned: boolean;
   created_at: string;
   updated_at: string;

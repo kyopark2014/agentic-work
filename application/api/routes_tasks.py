@@ -12,6 +12,7 @@ class TaskCreate(BaseModel):
     skills: list[str] | None = None
     mcp_servers: list[str] | None = None
     guardrail_enabled: bool = False
+    memory_enabled: bool = True
     title: str = "New task"
 
 
@@ -21,6 +22,7 @@ class TaskPatch(BaseModel):
     skills: list[str] | None = None
     mcp_servers: list[str] | None = None
     guardrail_enabled: bool | None = None
+    memory_enabled: bool | None = None
     pinned: bool | None = None
 
 
@@ -39,6 +41,7 @@ def create_task(body: TaskCreate, request: Request):
         skills=body.skills,
         mcp_servers=body.mcp_servers,
         guardrail_enabled=body.guardrail_enabled,
+        memory_enabled=body.memory_enabled,
         title=body.title,
     )
     return task

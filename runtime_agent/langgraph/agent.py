@@ -158,9 +158,16 @@ async def agent_langgraph(payload):
         modelName=model_name if model_name else chat.model_name,
         debugMode=payload.get("debug_mode", chat.debug_mode),
         guardrailEnabled=payload.get("guardrail_enabled"),
+        memoryEnabled=payload.get("memory_enabled"),
     )
 
     logger.info(f"guardrail_enabled: {chat.guardrail_enabled}")
+    logger.info(f"memory_enabled: {chat.memory_enabled}")
+
+    # When memory is enabled, always attach the memory MCP for recall
+    if chat.memory_enabled and "memory" not in mcp_servers:
+        mcp_servers = list(mcp_servers) + ["memory"]
+        logger.info("memory_enabled: appended 'memory' MCP server")
 
     runtime_session_id = payload.get("runtime_session_id")
     if not runtime_session_id:
@@ -461,6 +468,9 @@ async def agent_langgraph(payload):
 
         if not result_text.strip():
             result_text = "답변을 찾지 못하였습니다."
+
+        if chat.memory_enabled:
+            chat.save_to_memory(query, result_text)
 
         final_output = {
             "messages": [{"role": "assistant", "content": result_text}],
