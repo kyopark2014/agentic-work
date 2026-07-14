@@ -210,6 +210,11 @@ def recall_memory(
         )
         
         # Execute the appropriate action
+        action = (action or "retrieve").strip().lower()
+        if action == "retrieve" and not (query or "").strip():
+            query = "집 회사 주소 통근 교통 선호 프로필 user preferences home office commute"
+            logger.info(f"retrieve query was empty; using default profile query: {query}")
+
         logger.info(f"###### action: {action} ######")
         try:
             if action == "retrieve":

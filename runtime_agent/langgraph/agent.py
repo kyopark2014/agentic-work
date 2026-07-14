@@ -164,10 +164,15 @@ async def agent_langgraph(payload):
     logger.info(f"guardrail_enabled: {chat.guardrail_enabled}")
     logger.info(f"memory_enabled: {chat.memory_enabled}")
 
-    # When memory is enabled, always attach the memory MCP for recall
+    # Normalize selected MCP names and always attach memory when Memory toggle is on
+    mcp_servers = [str(s).strip() for s in (mcp_servers or []) if str(s).strip()]
     if chat.memory_enabled and "memory" not in mcp_servers:
-        mcp_servers = list(mcp_servers) + ["memory"]
+        mcp_servers = mcp_servers + ["memory"]
         logger.info("memory_enabled: appended 'memory' MCP server")
+    elif chat.memory_enabled:
+        logger.info("memory_enabled: 'memory' MCP already selected")
+    elif "memory" in mcp_servers:
+        logger.info("memory MCP selected via MCP picker (memory_enabled=False)")
 
     runtime_session_id = payload.get("runtime_session_id")
     if not runtime_session_id:
