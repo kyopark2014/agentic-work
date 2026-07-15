@@ -697,7 +697,11 @@ async def call_model(state: State, config):
             )
             messages = trimmed
 
-        if chat.uses_adaptive_thinking(active_model_id):
+        # Strip thinking/reasoning blocks before Bedrock Claude/Nova (GPT history
+        # leaves type='reasoning'; which Bedrock rejects with ValidationException).
+        if active_model_type in ("claude", "nova") or chat.uses_adaptive_thinking(
+            active_model_id
+        ):
             messages = chat.sanitize_adaptive_thinking_messages(messages)
 
         if use_prompt_cache:
@@ -721,7 +725,9 @@ async def call_model(state: State, config):
             response = merged if isinstance(merged, AIMessage) else AIMessage(
                 content=getattr(merged, "content", str(merged))
             )
-        if chat.uses_adaptive_thinking(active_model_id):
+        if active_model_type in ("claude", "nova") or chat.uses_adaptive_thinking(
+            active_model_id
+        ):
             response = chat.sanitize_adaptive_thinking_messages([response])[0]
         logger.info(f"response of call_model: {response}")
         _log_prompt_cache_usage(response)

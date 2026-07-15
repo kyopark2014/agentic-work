@@ -482,8 +482,17 @@ def uses_adaptive_thinking(model_id: str | None = None) -> bool:
     return "fable" in model_id or "claude-sonnet-5" in model_id
 
 
+# Content block types that Bedrock Claude/Nova reject on replay (e.g. after
+# OpenAI Responses API turns leave type='reasoning', or signed thinking is gone).
+_BEDROCK_NON_REPLAYABLE_CONTENT_TYPES = frozenset({"thinking", "reasoning"})
+
+
 def sanitize_adaptive_thinking_messages(messages: list) -> list:
-    """Remove thinking blocks that cannot be replayed to Bedrock on later turns."""
+    """Remove content blocks that cannot be replayed to Bedrock on later turns.
+
+    Strips Anthropic ``thinking`` and OpenAI Responses ``reasoning`` blocks so
+    model switches (e.g. GPT → Claude) do not hit ValidationException.
+    """
     sanitized = []
     for msg in messages:
         if not isinstance(msg, AIMessage):
@@ -497,7 +506,10 @@ def sanitize_adaptive_thinking_messages(messages: list) -> list:
 
         cleaned = [
             block for block in content
-            if not (isinstance(block, dict) and block.get("type") == "thinking")
+            if not (
+                isinstance(block, dict)
+                and block.get("type") in _BEDROCK_NON_REPLAYABLE_CONTENT_TYPES
+            )
         ]
         if not cleaned:
             cleaned = ""
