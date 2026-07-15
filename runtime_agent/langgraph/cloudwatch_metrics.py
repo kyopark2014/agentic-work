@@ -5,11 +5,61 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any
 
 import boto3
 
 logger = logging.getLogger(__name__)
+
+# Strip inference-profile / vendor prefixes before publishing ModelId dimension.
+_MODEL_ID_PREFIXES = (
+    "us.anthropic.",
+    "us.amazon.",
+    "eu.anthropic.",
+    "eu.amazon.",
+    "apac.anthropic.",
+    "apac.amazon.",
+    "global.anthropic.",
+    "openai.",
+    "anthropic.",
+    "amazon.",
+)
+_MODEL_ID_REGION_VENDORS = frozenset(
+    {"anthropic", "amazon", "meta", "mistral", "cohere", "ai21", "openai"}
+)
+# e.g. claude-haiku-4-5-20251001-v1:0 → claude-haiku-4-5
+_MODEL_ID_DATED_VERSION_RE = re.compile(r"-\d{8}-v\d+(?::\d+)?$")
+_MODEL_ID_VERSION_SUFFIX_RE = re.compile(r"-v\d+:\d+$")
+
+
+def _short_model_id(model_id: str) -> str:
+    """Human-readable ModelId for CloudWatch dimensions and legends.
+
+    Do not use ``rsplit('.', 1)`` — OpenAI IDs like ``openai.gpt-5.4`` and
+    ``openai.gpt-5.6-terra`` would collapse to ``4`` / ``6-terra``.
+    """
+    if not model_id:
+        return "unknown"
+
+    short = model_id
+    lowered = short.lower()
+    for prefix in _MODEL_ID_PREFIXES:
+        if lowered.startswith(prefix):
+            short = short[len(prefix) :]
+            break
+    else:
+        parts = short.split(".", 2)
+        if (
+            len(parts) == 3
+            and parts[0] in ("us", "eu", "apac", "global")
+            and parts[1].lower() in _MODEL_ID_REGION_VENDORS
+        ):
+            short = parts[2]
+
+    short = _MODEL_ID_DATED_VERSION_RE.sub("", short)
+    short = _MODEL_ID_VERSION_SUFFIX_RE.sub("", short)
+    return short[:64] or "unknown"
 
 METRIC_NAMESPACE = "LangGraph/AgentCoreRuntime"
 AGENTCORE_NAMESPACE = "AWS/Bedrock-AgentCore"
@@ -231,7 +281,7 @@ def publish_token_metrics(model_id: str, message: Any) -> None:
     )
 
     context = _load_runtime_context()
-    model_short = model_id.rsplit(".", 1)[-1][:64] if model_id else "unknown"
+    model_short = _short_model_id(model_id)
     dimensions = [
         {"Name": "ProjectName", "Value": context["ProjectName"]},
         {"Name": "AgentRuntimeName", "Value": context["AgentRuntimeName"]},
@@ -398,6 +448,39 @@ def _custom_model_metric_query(
     ]
 
 
+def _tokens_by_model_pie_metrics(
+    project_name: str,
+    period: int = 86400,
+    region: str | None = None,
+) -> list[list[dict[str, Any]]]:
+    """Aggregate TotalTokens by ModelId for a pie chart.
+
+    SEARCH on ProjectName+AgentRuntimeName+ModelId splits one model across
+    runtimes and blank/zeros the pie. A single Metrics Insights
+    ``GROUP BY ModelId`` aggregates correctly.
+
+    Do not add ``ORDER BY`` — CloudWatch then prefixes legend labels with
+    ``1 - ``, ``2 - ``. Do not use multiple Insights queries in one widget —
+    that raises "error while trying to get graph data".
+    """
+    del region
+    return [
+        [
+            {
+                "expression": (
+                    f'SELECT SUM(TotalTokens) FROM SCHEMA("{METRIC_NAMESPACE}", '
+                    f"ProjectName, AgentRuntimeName, ModelId) "
+                    f"WHERE ProjectName = '{project_name}' "
+                    f"GROUP BY ModelId"
+                ),
+                "label": "",
+                "id": "q1",
+                "period": period,
+            }
+        ]
+    ]
+
+
 def _custom_project_metric(
     metric_name: str,
     project_name: str,
@@ -444,10 +527,15 @@ def _estimated_cost_source_metrics(
     ]
 
 
-def _round_cost_expression(expression: str) -> str:
+def _round_expression(expression: str, decimals: int = COST_DISPLAY_DECIMALS) -> str:
     """Round to fixed decimals using FLOOR (CloudWatch has no ROUND function)."""
-    multiplier = 10**COST_DISPLAY_DECIMALS
+    multiplier = 10**decimals
     return f"FLOOR(({expression}) * {multiplier} + 0.5) / {multiplier}"
+
+
+def _round_cost_expression(expression: str) -> str:
+    """Round USD cost displays to COST_DISPLAY_DECIMALS."""
+    return _round_expression(expression, COST_DISPLAY_DECIMALS)
 
 
 def _summary_cost_widget_options() -> dict[str, Any]:
@@ -859,8 +947,10 @@ def build_dashboard_body(
                 {
                     **pie_base,
                     "title": "🥧 Tokens by Model",
-                    "metrics": _custom_model_metric_query(
-                        "TotalTokens", project_name, 86400
+                    "labels": {"visible": True},
+                    "legend": {"position": "bottom"},
+                    "metrics": _tokens_by_model_pie_metrics(
+                        project_name, 86400, region=region
                     ),
                 },
             ),
@@ -941,9 +1031,10 @@ def build_dashboard_body(
             [
                 [
                     {
-                        "expression": (
+                        "expression": _round_expression(
                             "IF((IF(m1, m1, 0) + IF(m2, m2, 0) + IF(m3, m3, 0)) > 0, "
-                            "100 * IF(m1, m1, 0) / (IF(m1, m1, 0) + IF(m2, m2, 0) + IF(m3, m3, 0)), 0)"
+                            "100 * IF(m1, m1, 0) / (IF(m1, m1, 0) + IF(m2, m2, 0) + IF(m3, m3, 0)), 0)",
+                            decimals=2,
                         ),
                         "label": "Hit %",
                         "id": "e1",
@@ -994,7 +1085,6 @@ def build_dashboard_body(
             props["yAxis"] = {
                 "left": {"min": 0, "max": 100, "label": "%", "showUnits": False}
             }
-            props["singleValueFullPrecision"] = True
         widgets.append(_dashboard_metric_widget(x, y, 6, 5, props))
     y += 5
 
