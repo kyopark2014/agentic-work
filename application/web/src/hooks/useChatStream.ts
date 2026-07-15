@@ -59,12 +59,29 @@ export interface ChatFinalMessage {
   tool_events: ToolEvent[];
 }
 
+interface TaskStreamState {
+  text: string;
+  events: ToolEvent[];
+}
+
+const EMPTY_STREAM: TaskStreamState = { text: "", events: [] };
+
 export function useChatStream() {
-  const [streaming, setStreaming] = useState(false);
-  const [streamingTaskId, setStreamingTaskId] = useState<string | null>(null);
-  const [streamText, setStreamText] = useState("");
-  const [streamEvents, setStreamEvents] = useState<ToolEvent[]>([]);
-  const streamTextRef = useRef("");
+  const [streamsByTaskId, setStreamsByTaskId] = useState<
+    Record<string, TaskStreamState>
+  >({});
+  const streamTextRefs = useRef<Record<string, string>>({});
+  const streamingTaskIdsRef = useRef<Set<string>>(new Set());
+
+  const patchStream = useCallback(
+    (taskId: string, updater: (prev: TaskStreamState) => TaskStreamState) => {
+      setStreamsByTaskId((prev) => {
+        const current = prev[taskId] ?? EMPTY_STREAM;
+        return { ...prev, [taskId]: updater(current) };
+      });
+    },
+    [],
+  );
 
   const sendMessage = useCallback(
     async (
@@ -72,50 +89,71 @@ export function useChatStream() {
       prompt: string,
       onDone: (final?: ChatFinalMessage) => void | Promise<void>,
     ) => {
+      if (streamingTaskIdsRef.current.has(taskId)) {
+        uiWarn("chat:send skipped — task already streaming", { taskId });
+        return;
+      }
+
       uiLog("chat:send start", { taskId, prompt });
-      setStreaming(true);
-      setStreamingTaskId(taskId);
-      streamTextRef.current = "";
-      setStreamText("");
-      setStreamEvents([]);
+      streamingTaskIdsRef.current.add(taskId);
+      streamTextRefs.current[taskId] = "";
+      setStreamsByTaskId((prev) => ({
+        ...prev,
+        [taskId]: { text: "", events: [] },
+      }));
 
       let finalMessage: ChatFinalMessage | undefined;
 
       const flushTextSegment = () => {
-        const text = streamTextRef.current.trim();
+        const text = (streamTextRefs.current[taskId] ?? "").trim();
         if (!text) return;
-        setStreamEvents((prev) => appendTextSegment(prev, text));
-        streamTextRef.current = "";
-        setStreamText("");
+        patchStream(taskId, (s) => ({
+          ...s,
+          text: "",
+          events: appendTextSegment(s.events, text),
+        }));
+        streamTextRefs.current[taskId] = "";
       };
 
       const teardownStreaming = () => {
-        setStreaming(false);
-        setStreamingTaskId(null);
-        streamTextRef.current = "";
-        setStreamText("");
-        setStreamEvents([]);
+        streamingTaskIdsRef.current.delete(taskId);
+        delete streamTextRefs.current[taskId];
+        setStreamsByTaskId((prev) => {
+          if (!(taskId in prev)) return prev;
+          const next = { ...prev };
+          delete next[taskId];
+          return next;
+        });
       };
 
       try {
         for await (const event of api.streamChat(taskId, prompt)) {
           if (event.type === "token" && event.data !== undefined) {
-            const previous = streamTextRef.current;
+            const previous = streamTextRefs.current[taskId] ?? "";
             const next = event.data;
             if (isSegmentReset(previous, next)) {
               flushTextSegment();
             }
-            streamTextRef.current = next;
-            setStreamText(next);
+            streamTextRefs.current[taskId] = next;
+            patchStream(taskId, (s) => ({ ...s, text: next }));
           } else if (event.type === "text" && event.data) {
-            setStreamEvents((prev) => appendTextSegment(prev, event.data!));
-            streamTextRef.current = "";
-            setStreamText("");
+            patchStream(taskId, (s) => ({
+              ...s,
+              text: "",
+              events: appendTextSegment(s.events, event.data!),
+            }));
+            streamTextRefs.current[taskId] = "";
           } else if (event.type === "tool") {
             flushTextSegment();
-            setStreamEvents((prev) => upsertToolEvent(prev, event as ToolEvent));
+            patchStream(taskId, (s) => ({
+              ...s,
+              events: upsertToolEvent(s.events, event as ToolEvent),
+            }));
           } else if (event.type === "tool_result" || event.type === "info") {
-            setStreamEvents((prev) => upsertToolEvent(prev, event as ToolEvent));
+            patchStream(taskId, (s) => ({
+              ...s,
+              events: upsertToolEvent(s.events, event as ToolEvent),
+            }));
           } else if (event.type === "error") {
             const msg = event.data ?? "Unknown error";
             uiError("chat:send stream error", msg);
@@ -139,7 +177,7 @@ export function useChatStream() {
         }
 
         if (!finalMessage) {
-          const partial = streamTextRef.current.trim();
+          const partial = (streamTextRefs.current[taskId] ?? "").trim();
           uiError("chat:send stream closed before done", {
             partialLength: partial.length,
           });
@@ -181,8 +219,26 @@ export function useChatStream() {
         }
       }
     },
-    [],
+    [patchStream],
   );
 
-  return { streaming, streamingTaskId, streamText, streamEvents, sendMessage };
+  const getStreamForTask = useCallback(
+    (taskId: string | null) => {
+      if (!taskId) {
+        return { streaming: false, streamText: "", streamEvents: [] as ToolEvent[] };
+      }
+      const stream = streamsByTaskId[taskId];
+      if (!stream) {
+        return { streaming: false, streamText: "", streamEvents: [] as ToolEvent[] };
+      }
+      return {
+        streaming: true,
+        streamText: stream.text,
+        streamEvents: stream.events,
+      };
+    },
+    [streamsByTaskId],
+  );
+
+  return { getStreamForTask, sendMessage };
 }

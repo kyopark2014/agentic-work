@@ -51,14 +51,14 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [drawer, setDrawer] = useState<DrawerKind>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const { streaming, streamingTaskId, streamText, streamEvents, sendMessage } = useChatStream();
+  const { getStreamForTask, sendMessage } = useChatStream();
   // Survives React Strict Mode remount so empty-list bootstrap creates only one task.
   const emptyTaskBootstrapRef = useRef<Promise<Task> | null>(null);
   const tasksBootstrappedForUserRef = useRef<string | null>(null);
   const activeTaskIdRef = useRef<string | null>(null);
 
   const activeTask = tasks.find((t) => t.id === activeTaskId) ?? null;
-  const streamForActiveTask = streaming && streamingTaskId === activeTaskId;
+  const activeStream = getStreamForTask(activeTaskId);
 
   useEffect(() => {
     activeTaskIdRef.current = activeTaskId;
@@ -360,14 +360,14 @@ export default function App() {
       <div className="main-panel">
         <ChatThread
           messages={messages}
-          streaming={streamForActiveTask}
-          streamText={streamForActiveTask ? streamText : ""}
-          streamEvents={streamForActiveTask ? streamEvents : []}
+          streaming={activeStream.streaming}
+          streamText={activeStream.streamText}
+          streamEvents={activeStream.streamEvents}
           taskTitle={activeTask?.title ?? "New task"}
           onMenuClick={() => setSidebarOpen(true)}
           footer={
             <ChatInput
-              disabled={!activeTask || streaming}
+              disabled={!activeTask || activeStream.streaming}
               onSend={handleSend}
               onRagUploadComplete={handleRagUploadComplete}
             />
