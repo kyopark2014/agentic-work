@@ -3,6 +3,7 @@ import { api } from "./api";
 import { uiError, uiLog } from "./debug";
 import { formatBrandTitle } from "./formatBrandTitle";
 import { useChatStream } from "./hooks/useChatStream";
+import { randomUUID } from "./randomUUID";
 import type { AppConfig, Message, Task } from "./types";
 import { Sidebar } from "./components/Sidebar";
 import { ChatThread } from "./components/ChatThread";
@@ -229,7 +230,7 @@ export default function App() {
   async function handleRagUploadComplete(message: string) {
     if (!activeTaskId) return;
     const notice: Message = {
-      id: `rag-upload-${crypto.randomUUID()}`,
+      id: `rag-upload-${randomUUID()}`,
       task_id: activeTaskId,
       role: "assistant",
       content: message,
@@ -249,7 +250,7 @@ export default function App() {
     const taskId = activeTaskId;
     uiLog("chat:handleSend", { taskId, prompt });
     const optimistic: Message = {
-      id: `pending-${crypto.randomUUID()}`,
+      id: `pending-${randomUUID()}`,
       task_id: taskId,
       role: "user",
       content: prompt,
@@ -275,7 +276,7 @@ export default function App() {
           setMessages((prev) => [
             ...prev,
             {
-              id: `pending-assistant-${crypto.randomUUID()}`,
+              id: `pending-assistant-${randomUUID()}`,
               task_id: taskId,
               role: "assistant",
               content: final.content,
