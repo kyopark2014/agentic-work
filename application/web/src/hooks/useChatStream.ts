@@ -89,8 +89,7 @@ export function useChatStream() {
         setStreamText("");
       };
 
-      const clearStreaming = () => {
-        flushTextSegment();
+      const teardownStreaming = () => {
         setStreaming(false);
         setStreamingTaskId(null);
         streamTextRef.current = "";
@@ -125,7 +124,6 @@ export function useChatStream() {
               images: [],
               tool_events: [],
             };
-            clearStreaming();
           } else if (event.type === "done") {
             uiLog("chat:send done event", {
               contentLength: event.content?.length ?? 0,
@@ -137,10 +135,6 @@ export function useChatStream() {
               images: event.images ?? [],
               tool_events: event.tool_events ?? [],
             };
-            setStreaming(false);
-            setStreamingTaskId(null);
-            streamTextRef.current = "";
-            setStreamText("");
           }
         }
 
@@ -156,10 +150,6 @@ export function useChatStream() {
             images: [],
             tool_events: [],
           };
-          setStreaming(false);
-          setStreamingTaskId(null);
-          streamTextRef.current = "";
-          setStreamText("");
         }
       } catch (err) {
         uiError("chat:send failed", err);
@@ -168,17 +158,25 @@ export function useChatStream() {
           images: [],
           tool_events: [],
         };
-        clearStreaming();
       } finally {
+        // Call onDone first so setMessages is scheduled in this same turn,
+        // then tear down streaming — React 18 batches both into one commit
+        // and avoids an empty frame between stream UI and the final bubble.
+        let refresh: void | Promise<void> | undefined = undefined;
         try {
           uiLog("chat:send refreshing messages");
-          await onDone(finalMessage);
+          refresh = onDone(finalMessage);
+        } catch (err) {
+          uiWarn("chat:send refresh failed", err);
+        } finally {
+          teardownStreaming();
+        }
+        try {
+          await refresh;
           uiLog("chat:send refresh complete");
         } catch (err) {
           uiWarn("chat:send refresh failed", err);
         } finally {
-          setStreamEvents([]);
-          setStreamingTaskId(null);
           uiLog("chat:send finished", { taskId });
         }
       }

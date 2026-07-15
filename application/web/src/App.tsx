@@ -23,6 +23,24 @@ function titleFromPrompt(prompt: string): string {
   return prompt.trim().slice(0, 50) || "New task";
 }
 
+/** Keep optimistic `pending-*` ids when server rows match, to avoid remount flicker. */
+function stabilizeMessageKeys(prev: Message[], next: Message[]): Message[] {
+  if (prev.length === 0) return next;
+  const used = new Set<string>();
+  return next.map((msg) => {
+    const match = prev.find(
+      (p) =>
+        !used.has(p.id) &&
+        p.id.startsWith("pending") &&
+        p.role === msg.role &&
+        p.content === msg.content,
+    );
+    if (!match) return msg;
+    used.add(match.id);
+    return { ...msg, id: match.id };
+  });
+}
+
 export default function App() {
   const [userId, setUserId] = useState<string | null>(null);
   const [authReady, setAuthReady] = useState(false);
@@ -50,7 +68,7 @@ export default function App() {
     uiLog("messages:load start", { taskId });
     const { messages: rows } = await api.getMessages(taskId);
     uiLog("messages:load complete", { taskId, count: rows.length, roles: rows.map((m) => m.role) });
-    setMessages(rows);
+    setMessages((prev) => stabilizeMessageKeys(prev, rows));
   }, []);
 
   const refreshTasks = useCallback(async () => {
