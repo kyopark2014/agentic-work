@@ -376,6 +376,30 @@ async def agent_langgraph(payload):
                                             yield payload
                                     except json.JSONDecodeError:
                                         pass
+                        elif item.get("type") == "function_call":
+                            # OpenAI Responses API
+                            tool_use_id = item.get("call_id") or item.get("id", "")
+                            tool_name = item.get("name", "") or tool_name_by_id.get(tool_use_id, "")
+                            if tool_use_id and tool_name:
+                                tool_name_by_id[tool_use_id] = tool_name
+                                tool_input_list.setdefault(tool_use_id, "")
+                            if "arguments" in item and tool_use_id:
+                                arguments = item.get("arguments", "")
+                                if not isinstance(arguments, str):
+                                    arguments = str(arguments)
+                                tool_input_list[tool_use_id] = arguments
+                                if arguments:
+                                    try:
+                                        args_obj = json.loads(arguments)
+                                        payload = yield_tool_args(
+                                            tool_use_id,
+                                            tool_name_by_id.get(tool_use_id, tool_name),
+                                            args_obj,
+                                        )
+                                        if payload:
+                                            yield payload
+                                    except json.JSONDecodeError:
+                                        pass
                 if getattr(chunk, "tool_calls", None):
                     for tc in chunk.tool_calls:
                         if isinstance(tc, dict):
@@ -413,6 +437,21 @@ async def agent_langgraph(payload):
                                 payload = yield_tool_args(tool_use_id, tool_name, input_val)
                                 if payload:
                                     yield payload
+                        elif isinstance(item, dict) and item.get("type") == "function_call":
+                            tool_use_id = item.get("call_id") or item.get("id", "")
+                            tool_name = item.get("name", "") or tool_name_by_id.get(tool_use_id, "")
+                            arguments = item.get("arguments", "")
+                            if tool_use_id and tool_name:
+                                tool_name_by_id[tool_use_id] = tool_name
+                                if isinstance(arguments, str) and arguments:
+                                    try:
+                                        input_val = json.loads(arguments)
+                                    except json.JSONDecodeError:
+                                        input_val = None
+                                    if isinstance(input_val, dict) and input_val:
+                                        payload = yield_tool_args(tool_use_id, tool_name, input_val)
+                                        if payload:
+                                            yield payload
                 for text_part in text_parts:
                     if tool_used:
                         result_text = text_part

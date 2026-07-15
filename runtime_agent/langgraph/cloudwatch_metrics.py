@@ -39,6 +39,9 @@ MODEL_PRICING_PER_MILLION: dict[str, dict[str, float]] = {
     "us.amazon.nova-2-lite-v1:0": {"input": 0.06, "output": 0.24},
     "openai.gpt-5.4": {"input": 1.25, "output": 10.0},
     "openai.gpt-5.5": {"input": 1.25, "output": 10.0},
+    "openai.gpt-5.6-sol": {"input": 5.0, "output": 30.0},
+    "openai.gpt-5.6-terra": {"input": 2.5, "output": 15.0},
+    "openai.gpt-5.6-luna": {"input": 1.0, "output": 6.0},
     "openai.gpt-oss-120b-1:0": {"input": 0.30, "output": 0.60},
     "openai.gpt-oss-20b-1:0": {"input": 0.10, "output": 0.30},
 }
