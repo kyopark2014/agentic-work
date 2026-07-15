@@ -4521,16 +4521,69 @@ def _project_root() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def _skill_name_from_skill_md(skill_md_path: str, fallback: str) -> str:
+    """Read SKILL.md YAML frontmatter `name`, falling back to the directory name."""
+    try:
+        with open(skill_md_path, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except OSError:
+        return fallback
+
+    if not raw.startswith("---"):
+        return fallback
+
+    parts = raw.split("---", 2)
+    if len(parts) < 3:
+        return fallback
+
+    for line in parts[1].splitlines():
+        stripped = line.strip()
+        if stripped.startswith("name:"):
+            value = stripped.split(":", 1)[1].strip().strip("'\"")
+            return value or fallback
+    return fallback
+
+
+def update_skills_list_from_directory() -> List[str]:
+    """Rewrite runtime_agent/langgraph/skills.list from skills/*/SKILL.md names."""
+    skills_dir = os.path.join(_project_root(), "runtime_agent", "langgraph", "skills")
+    list_path = os.path.join(_project_root(), "runtime_agent", "langgraph", "skills.list")
+
+    if not os.path.isdir(skills_dir):
+        raise FileNotFoundError(f"Missing skills directory: {skills_dir}")
+
+    skill_names: List[str] = []
+    for entry in os.listdir(skills_dir):
+        skill_md = os.path.join(skills_dir, entry, "SKILL.md")
+        if os.path.isfile(skill_md):
+            skill_names.append(_skill_name_from_skill_md(skill_md, entry))
+
+    ordered_names = sorted(set(skill_names))
+
+    os.makedirs(os.path.dirname(list_path), exist_ok=True)
+    with open(list_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(ordered_names))
+        if ordered_names:
+            f.write("\n")
+
+    logger.info(
+        f"  ✓ Updated skills.list from {skills_dir} "
+        f"({len(ordered_names)} skill(s)): {', '.join(ordered_names)}"
+    )
+    return ordered_names
+
+
 def sync_application_capability_lists() -> None:
-    """Copy runtime_agent/langgraph/*.list into application/ before container build."""
+    """Update skills.list from skills/, then overwrite application/*.list from langgraph."""
+    update_skills_list_from_directory()
     for filename in ("mcp.list", "skills.list"):
         src = os.path.join(_project_root(), "runtime_agent", "langgraph", filename)
         dst = os.path.join(_project_root(), "application", filename)
         if not os.path.isfile(src):
             raise FileNotFoundError(f"Missing capability list: {src}")
         os.makedirs(os.path.dirname(dst), exist_ok=True)
-        shutil.copy2(src, dst)
-        logger.info(f"  ✓ Synced {filename}: {src} -> {dst}")
+        shutil.copyfile(src, dst)
+        logger.info(f"  ✓ Overwrote application/{filename} from runtime_agent/langgraph/{filename}")
 
 
 def write_application_config(config_data: Dict, *, merge_existing: bool = True) -> bool:
@@ -5157,6 +5210,9 @@ def build_and_push_docker_image(
 ) -> Tuple[str, str]:
     """Build Docker image from Dockerfile and push to ECR."""
     logger.info("[8/10] Building and pushing Docker image to ECR")
+
+    # Overwrite application mcp.list / skills.list from runtime before image build.
+    sync_application_capability_lists()
 
     if shutil.which("docker") is None:
         raise RuntimeError("Docker CLI is required to build and push the container image")
