@@ -259,20 +259,23 @@ export default function App() {
     setMessages((prev) => [...prev, notice]);
   }
 
-  async function handleSend(prompt: string) {
+  async function handleSend(prompt: string, files: string[] = []) {
     if (!activeTaskId) {
       uiError("chat:send skipped — no active task");
       return;
     }
 
     const taskId = activeTaskId;
-    uiLog("chat:handleSend", { taskId, prompt });
+    const displayPrompt =
+      prompt.trim() ||
+      (files.length > 0 ? "첨부한 이미지를 분석해주세요." : "");
+    uiLog("chat:handleSend", { taskId, prompt: displayPrompt, files });
     const optimistic: Message = {
       id: `pending-${randomUUID()}`,
       task_id: taskId,
       role: "user",
-      content: prompt,
-      images: [],
+      content: displayPrompt,
+      images: files,
       tool_events: [],
       created_at: new Date().toISOString(),
     };
@@ -281,33 +284,42 @@ export default function App() {
       sortTasks(
         prev.map((task) =>
           task.id === taskId && (task.title === "New task" || !task.title)
-            ? { ...task, title: titleFromPrompt(prompt), updated_at: new Date().toISOString() }
+            ? {
+                ...task,
+                title: titleFromPrompt(displayPrompt),
+                updated_at: new Date().toISOString(),
+              }
             : task,
         ),
       ),
     );
 
-    await sendMessage(taskId, prompt, async (final) => {
-      // Only update the open thread if the user is still viewing this task.
-      if (activeTaskIdRef.current === taskId) {
-        if (final && (final.content || final.tool_events.length > 0)) {
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: `pending-assistant-${randomUUID()}`,
-              task_id: taskId,
-              role: "assistant",
-              content: final.content,
-              images: final.images,
-              tool_events: final.tool_events,
-              created_at: new Date().toISOString(),
-            },
-          ]);
+    await sendMessage(
+      taskId,
+      displayPrompt,
+      async (final) => {
+        // Only update the open thread if the user is still viewing this task.
+        if (activeTaskIdRef.current === taskId) {
+          if (final && (final.content || final.tool_events.length > 0)) {
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: `pending-assistant-${randomUUID()}`,
+                task_id: taskId,
+                role: "assistant",
+                content: final.content,
+                images: final.images,
+                tool_events: final.tool_events,
+                created_at: new Date().toISOString(),
+              },
+            ]);
+          }
+          await loadMessages(taskId);
         }
-        await loadMessages(taskId);
-      }
-      await refreshTasks();
-    });
+        await refreshTasks();
+      },
+      files,
+    );
   }
 
   async function handleNewTaskAndCloseSidebar() {

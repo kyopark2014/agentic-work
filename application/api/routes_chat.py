@@ -7,7 +7,7 @@ import time
 from typing import Any, Generator
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from application.api.routes_auth import require_user_id
 from application import task_store
@@ -22,6 +22,7 @@ router = APIRouter(prefix="/api/tasks", tags=["chat"])
 
 SSE_HEARTBEAT_INTERVAL_SECONDS = 15
 AGENT_STREAM_TIMEOUT_SECONDS = 300
+DEFAULT_IMAGE_PROMPT = "첨부한 이미지를 분석해주세요."
 
 _TOOL_INPUT_RE = re.compile(r"^Tool: (.+?), Input:\s*(.*)$", re.DOTALL)
 _TOOL_RESULT_RE = re.compile(r"^Tool Result: (.+)$", re.DOTALL)
@@ -38,7 +39,14 @@ def _parse_tool_input(raw_input: str) -> Any:
 
 
 class ChatRequest(BaseModel):
-    prompt: str = Field(min_length=1)
+    prompt: str = ""
+    files: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def require_prompt_or_files(self):
+        if not self.prompt.strip() and not self.files:
+            raise ValueError("prompt or files is required")
+        return self
 
 
 def _sse_event(payload: dict[str, Any]) -> str:
@@ -232,6 +240,7 @@ def _run_agent_thread(
     guardrail_enabled: bool,
     memory_enabled: bool,
     runtime_session_id: str,
+    files: list[str],
     message_queue: queue.Queue,
     result_holder: dict[str, Any],
 ) -> None:
@@ -249,6 +258,7 @@ def _run_agent_thread(
             skill_list=skill_list,
             guardrail_enabled=guardrail_enabled,
             memory_enabled=memory_enabled,
+            files=files,
         )
         if not isinstance(response, str):
             response = json.dumps(response, ensure_ascii=False)
@@ -268,11 +278,15 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
+    files = [url.strip() for url in (body.files or []) if url and url.strip()]
     prompt = body.prompt.strip()
+    if not prompt and files:
+        prompt = DEFAULT_IMAGE_PROMPT
+
     chat.user_id = user_id
     chat.update(task["model_name"])
 
-    task_store.add_message(task_id, "user", prompt)
+    task_store.add_message(task_id, "user", prompt, images=files)
 
     message_queue: queue.Queue = queue.Queue()
     result_holder: dict[str, Any] = {"content": "", "images": []}
@@ -288,6 +302,7 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
             "guardrail_enabled": task["guardrail_enabled"],
             "memory_enabled": task["memory_enabled"],
             "runtime_session_id": task["runtime_session_id"],
+            "files": files,
             "message_queue": message_queue,
             "result_holder": result_holder,
         },

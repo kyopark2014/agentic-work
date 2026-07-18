@@ -78,28 +78,33 @@ data_source_id = config.get('data_source_id')
 
 
 def get_contents_type(file_name: str) -> str:
-    if file_name.lower().endswith((".jpg", ".jpeg")):
+    lower = file_name.lower()
+    if lower.endswith((".jpg", ".jpeg")):
         content_type = "image/jpeg"
-    elif file_name.lower().endswith((".pdf")):
-        content_type = "application/pdf"
-    elif file_name.lower().endswith((".txt")):
-        content_type = "text/plain"
-    elif file_name.lower().endswith((".csv")):
-        content_type = "text/csv"
-    elif file_name.lower().endswith((".ppt", ".pptx")):
-        content_type = "application/vnd.ms-powerpoint"
-    elif file_name.lower().endswith((".doc", ".docx")):
-        content_type = "application/msword"
-    elif file_name.lower().endswith((".xls")):
-        content_type = "application/vnd.ms-excel"
-    elif file_name.lower().endswith((".py")):
-        content_type = "text/x-python"
-    elif file_name.lower().endswith((".js")):
-        content_type = "application/javascript"
-    elif file_name.lower().endswith((".md")):
-        content_type = "text/markdown"
-    elif file_name.lower().endswith((".png")):
+    elif lower.endswith(".png"):
         content_type = "image/png"
+    elif lower.endswith(".webp"):
+        content_type = "image/webp"
+    elif lower.endswith(".gif"):
+        content_type = "image/gif"
+    elif lower.endswith(".pdf"):
+        content_type = "application/pdf"
+    elif lower.endswith(".txt"):
+        content_type = "text/plain"
+    elif lower.endswith(".csv"):
+        content_type = "text/csv"
+    elif lower.endswith((".ppt", ".pptx")):
+        content_type = "application/vnd.ms-powerpoint"
+    elif lower.endswith((".doc", ".docx")):
+        content_type = "application/msword"
+    elif lower.endswith(".xls"):
+        content_type = "application/vnd.ms-excel"
+    elif lower.endswith(".py"):
+        content_type = "text/x-python"
+    elif lower.endswith(".js"):
+        content_type = "application/javascript"
+    elif lower.endswith(".md"):
+        content_type = "text/markdown"
     else:
         content_type = "no info"
     return content_type
@@ -116,7 +121,7 @@ def upload_to_s3(file_bytes: bytes, file_name: str) -> dict | None:
         content_type = get_contents_type(file_name)
         logger.info("content_type: %s", content_type)
 
-        if content_type in ("image/jpeg", "image/png"):
+        if content_type.startswith("image/"):
             prefix = s3_image_prefix
         else:
             prefix = s3_prefix

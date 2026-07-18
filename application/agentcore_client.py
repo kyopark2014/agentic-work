@@ -595,7 +595,7 @@ def get_tool_info(tool_name, tool_content):
 
     return content, urls, tool_references
 
-def run_agent(prompt, user_id, mcp_servers, model_name, runtime_session_id, notification_queue=None, skill_list=None, guardrail_enabled=None, memory_enabled=None):
+def run_agent(prompt, user_id, mcp_servers, model_name, runtime_session_id, notification_queue=None, skill_list=None, guardrail_enabled=None, memory_enabled=None, files=None):
     tool_info_list.clear()
     tool_result_list.clear()
     tool_name_list.clear()
@@ -616,6 +616,7 @@ def run_agent(prompt, user_id, mcp_servers, model_name, runtime_session_id, noti
         "guardrail_enabled": bool(guardrail_enabled) if guardrail_enabled is not None else True,
         "memory_enabled": bool(memory_enabled) if memory_enabled is not None else True,
         "runtime_session_id": runtime_session_id,
+        "files": files or [],
     })
 
     agent_type = "langgraph"

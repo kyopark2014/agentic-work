@@ -141,6 +141,12 @@ async def agent_langgraph(payload):
     query = payload.get("prompt")
     logger.info(f"query: {query}")
 
+    files = payload.get("files") or []
+    if not isinstance(files, list):
+        files = [files] if files else []
+    files = [str(f).strip() for f in files if str(f).strip()]
+    logger.info(f"files: {files}")
+
     mcp_servers = payload.get("mcp_servers", [])
     logger.info(f"mcp_servers: {mcp_servers}")
 
@@ -214,9 +220,28 @@ async def agent_langgraph(payload):
         if app is None:
             yield {"result": {"messages": [{"role": "assistant", "content": "사용 가능한 도구가 없습니다."}], "image_url": []}}
             return
-        
+
+        message_content = query or ""
+        if files:
+            file_summaries = []
+            for file_ref in files:
+                file_name = chat._file_name_from_ref(file_ref)
+                logger.info(f"analyzing uploaded file: {file_ref}")
+                try:
+                    summary = chat.get_summary_of_uploaded_file(file_ref, prompt=query or "")
+                except Exception as e:
+                    logger.error(f"Failed to summarize file {file_ref}: {traceback.format_exc()}")
+                    summary = f"파일 분석 중 오류가 발생했습니다: {e}"
+                file_summaries.append(
+                    f"선택한 파일({file_name})의 내용을 요약하면 아래와 같습니다.\n\n{summary}"
+                )
+            message_content = (message_content + "\n\n" if message_content else "") + "\n\n".join(
+                file_summaries
+            )
+            logger.info(f"message_content with file summaries length: {len(message_content)}")
+
         inputs = {
-            "messages": [HumanMessage(content=query)]
+            "messages": [HumanMessage(content=message_content)]
         }
 
         result_text = ""

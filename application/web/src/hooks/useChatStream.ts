@@ -88,13 +88,14 @@ export function useChatStream() {
       taskId: string,
       prompt: string,
       onDone: (final?: ChatFinalMessage) => void | Promise<void>,
+      files: string[] = [],
     ) => {
       if (streamingTaskIdsRef.current.has(taskId)) {
         uiWarn("chat:send skipped — task already streaming", { taskId });
         return;
       }
 
-      uiLog("chat:send start", { taskId, prompt });
+      uiLog("chat:send start", { taskId, prompt, files });
       streamingTaskIdsRef.current.add(taskId);
       streamTextRefs.current[taskId] = "";
       setStreamsByTaskId((prev) => ({
@@ -127,7 +128,7 @@ export function useChatStream() {
       };
 
       try {
-        for await (const event of api.streamChat(taskId, prompt)) {
+        for await (const event of api.streamChat(taskId, prompt, files)) {
           if (event.type === "token" && event.data !== undefined) {
             const previous = streamTextRefs.current[taskId] ?? "";
             const next = event.data;

@@ -1,4 +1,5 @@
 import {
+  ClipboardEvent,
   FormEvent,
   KeyboardEvent,
   useEffect,
@@ -9,15 +10,28 @@ import {
 import { createPortal } from "react-dom";
 import { api } from "../api";
 
+interface AttachedImage {
+  url: string;
+  name: string;
+  previewUrl: string;
+}
+
 interface Props {
   disabled?: boolean;
-  onSend: (text: string) => void;
+  onSend: (text: string, files?: string[]) => void;
   onRagUploadComplete?: (message: string) => void;
 }
 
 const RAG_ACCEPT = ".pdf,.txt,.md,.csv,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.html,.htm,.json,.py,.js";
 const MIN_INPUT_HEIGHT = 24;
 const MAX_INPUT_HEIGHT = 160;
+
+function extensionFromMime(mime: string): string {
+  if (mime === "image/jpeg") return ".jpg";
+  if (mime === "image/webp") return ".webp";
+  if (mime === "image/gif") return ".gif";
+  return ".png";
+}
 
 export function ChatInput({ disabled, onSend, onRagUploadComplete }: Props) {
   const [value, setValue] = useState("");
@@ -29,12 +43,16 @@ export function ChatInput({ disabled, onSend, onRagUploadComplete }: Props) {
   } | null>(null);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [attachments, setAttachments] = useState<AttachedImage[]>([]);
+  const attachmentsRef = useRef<AttachedImage[]>([]);
   const addWrapRef = useRef<HTMLDivElement>(null);
   const menuPortalRef = useRef<HTMLDivElement>(null);
   const addBtnRef = useRef<HTMLButtonElement>(null);
   const inputWrapRef = useRef<HTMLFormElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  attachmentsRef.current = attachments;
 
   function adjustInputHeight() {
     const el = textareaRef.current;
@@ -50,6 +68,16 @@ export function ChatInput({ disabled, onSend, onRagUploadComplete }: Props) {
   useLayoutEffect(() => {
     adjustInputHeight();
   }, [value]);
+
+  useEffect(() => {
+    return () => {
+      for (const item of attachmentsRef.current) {
+        if (item.previewUrl.startsWith("blob:")) {
+          URL.revokeObjectURL(item.previewUrl);
+        }
+      }
+    };
+  }, []);
 
   function updateMenuPosition() {
     const rect = inputWrapRef.current?.getBoundingClientRect();
@@ -93,9 +121,18 @@ export function ChatInput({ disabled, onSend, onRagUploadComplete }: Props) {
 
   function submit() {
     const text = value.trim();
-    if (!text || disabled || uploading) return;
-    onSend(text);
+    const files = attachments.map((item) => item.url);
+    if ((!text && files.length === 0) || disabled || uploading) return;
+    onSend(text, files);
     setValue("");
+    setAttachments((prev) => {
+      for (const item of prev) {
+        if (item.previewUrl.startsWith("blob:")) {
+          URL.revokeObjectURL(item.previewUrl);
+        }
+      }
+      return [];
+    });
   }
 
   function onKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
@@ -108,6 +145,72 @@ export function ChatInput({ disabled, onSend, onRagUploadComplete }: Props) {
   function onSubmit(e: FormEvent) {
     e.preventDefault();
     submit();
+  }
+
+  async function uploadImageFile(file: File) {
+    setUploading(true);
+    setUploadError(null);
+    const previewUrl = URL.createObjectURL(file);
+    try {
+      const result = await api.uploadFile(file);
+      setAttachments((prev) => [
+        ...prev,
+        {
+          url: result.url,
+          name: result.file_name,
+          previewUrl,
+        },
+      ]);
+    } catch (err) {
+      URL.revokeObjectURL(previewUrl);
+      const message = err instanceof Error ? err.message : String(err);
+      setUploadError(message);
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  async function onPaste(e: ClipboardEvent<HTMLTextAreaElement>) {
+    const items = e.clipboardData?.items;
+    if (!items || disabled || uploading) return;
+
+    const imageFiles: File[] = [];
+    for (const item of Array.from(items)) {
+      if (!item.type.startsWith("image/")) continue;
+      const blob = item.getAsFile();
+      if (!blob) continue;
+      const ext = extensionFromMime(item.type || blob.type);
+      const named =
+        blob.name && blob.name !== "image.png"
+          ? blob
+          : new File([blob], `pasted_screenshot${ext}`, {
+              type: item.type || blob.type || "image/png",
+            });
+      imageFiles.push(named);
+    }
+
+    if (imageFiles.length === 0) return;
+
+    e.preventDefault();
+    for (const file of imageFiles) {
+      await uploadImageFile(file);
+    }
+  }
+
+  function removeAttachment(url: string) {
+    setAttachments((prev) => {
+      const next: AttachedImage[] = [];
+      for (const item of prev) {
+        if (item.url === url) {
+          if (item.previewUrl.startsWith("blob:")) {
+            URL.revokeObjectURL(item.previewUrl);
+          }
+          continue;
+        }
+        next.push(item);
+      }
+      return next;
+    });
   }
 
   function openRagUpload() {
@@ -135,6 +238,7 @@ export function ChatInput({ disabled, onSend, onRagUploadComplete }: Props) {
   }
 
   const inputDisabled = disabled || uploading;
+  const canSend = !inputDisabled && (value.trim().length > 0 || attachments.length > 0);
 
   const menu =
     menuOpen && menuPosition
@@ -192,7 +296,7 @@ export function ChatInput({ disabled, onSend, onRagUploadComplete }: Props) {
       )}
       {uploading && (
         <div className="chat-upload-status" role="status">
-          RAG에 업로드하고 동기화하는 중...
+          업로드 중...
         </div>
       )}
       <form className="chat-input-wrap" ref={inputWrapRef} onSubmit={onSubmit}>
@@ -205,15 +309,34 @@ export function ChatInput({ disabled, onSend, onRagUploadComplete }: Props) {
           tabIndex={-1}
           aria-hidden="true"
         />
+        {attachments.length > 0 && (
+          <div className="chat-attachments" aria-label="첨부 이미지">
+            {attachments.map((item) => (
+              <div key={item.url} className="chat-attachment">
+                <img src={item.previewUrl} alt={item.name} />
+                <button
+                  type="button"
+                  className="chat-attachment-remove"
+                  aria-label={`${item.name} 제거`}
+                  onClick={() => removeAttachment(item.url)}
+                  disabled={inputDisabled}
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
         <textarea
           ref={textareaRef}
           className="chat-input"
           rows={1}
-          placeholder="메시지를 입력하세요..."
+          placeholder="메시지를 입력하거나 이미지를 붙여넣으세요..."
           value={value}
           disabled={inputDisabled}
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={onKeyDown}
+          onPaste={onPaste}
         />
         <div className="chat-input-toolbar">
           <div className="chat-input-add-wrap" ref={addWrapRef}>
@@ -240,7 +363,7 @@ export function ChatInput({ disabled, onSend, onRagUploadComplete }: Props) {
             className="chat-send-btn"
             type="submit"
             aria-label="전송"
-            disabled={inputDisabled || !value.trim()}
+            disabled={!canSend}
           >
             <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
               <path

@@ -13,6 +13,14 @@ export interface RagUploadResult {
   };
 }
 
+export interface FileUploadResult {
+  ok: boolean;
+  file_name: string;
+  s3_key: string;
+  url: string;
+  content_type?: string;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const method = init?.method ?? "GET";
   uiLog(`api:${method} ${path}`);
@@ -94,16 +102,38 @@ export const api = {
     uiLog("rag:upload complete", data);
     return data;
   },
+  uploadFile: async (file: File): Promise<FileUploadResult> => {
+    uiLog("file:upload start", { name: file.name, size: file.size, type: file.type });
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch("/api/files/upload", {
+      method: "POST",
+      credentials: "include",
+      body: form,
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      uiError("file:upload failed", { status: res.status, body: text });
+      throw new Error(text || res.statusText);
+    }
+    const data = (await res.json()) as FileUploadResult;
+    if (!data.url) {
+      throw new Error("Upload succeeded but no URL was returned");
+    }
+    uiLog("file:upload complete", data);
+    return data;
+  },
   streamChat: async function* (
     taskId: string,
     prompt: string,
+    files: string[] = [],
   ): AsyncGenerator<StreamEvent> {
-    uiLog("chat:stream start", { taskId, prompt });
+    uiLog("chat:stream start", { taskId, prompt, files });
     const res = await fetch(`/api/tasks/${taskId}/chat`, {
       method: "POST",
       credentials: "include",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt }),
+      body: JSON.stringify({ prompt, files }),
     });
     if (!res.ok || !res.body) {
       const body = await res.text();

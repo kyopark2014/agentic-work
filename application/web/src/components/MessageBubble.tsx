@@ -117,12 +117,19 @@ export function MessageBubble({ role, content, images = [], toolEvents = [] }: P
           ))}
         </div>
       )}
+      {role === "user" && images.length > 0 && (
+        <div className="message-images">
+          {images.map((url) => (
+            <img key={url} src={url} alt="" />
+          ))}
+        </div>
+      )}
       {content.trim() && (
         <div className="message-bubble">
           {role === "assistant" ? <MarkdownText content={content} /> : content}
         </div>
       )}
-      {images.length > 0 && (
+      {role !== "user" && images.length > 0 && (
         <div className="message-images">
           {images.map((url) => (
             <img key={url} src={url} alt="" />
