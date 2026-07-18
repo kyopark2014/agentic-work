@@ -54,6 +54,12 @@ export function ChatInput({ disabled, onSend, onRagUploadComplete }: Props) {
 
   attachmentsRef.current = attachments;
 
+  useEffect(() => {
+    if (!uploadError) return;
+    const timer = window.setTimeout(() => setUploadError(null), 5000);
+    return () => window.clearTimeout(timer);
+  }, [uploadError]);
+
   function adjustInputHeight() {
     const el = textareaRef.current;
     if (!el) return;

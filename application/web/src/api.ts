@@ -96,7 +96,16 @@ export const api = {
     if (!res.ok) {
       const text = await res.text();
       uiError("rag:upload failed", { status: res.status, body: text });
-      throw new Error(text || res.statusText);
+      let message = text || res.statusText;
+      try {
+        const parsed = JSON.parse(text) as { detail?: string };
+        if (typeof parsed.detail === "string" && parsed.detail) {
+          message = parsed.detail;
+        }
+      } catch {
+        // keep raw text
+      }
+      throw new Error(message);
     }
     const data = (await res.json()) as RagUploadResult;
     uiLog("rag:upload complete", data);

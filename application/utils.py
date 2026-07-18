@@ -158,6 +158,57 @@ def upload_to_s3(file_bytes: bytes, file_name: str) -> dict | None:
         return None
 
 
+ACTIVE_INGESTION_STATUSES = ("STARTING", "IN_PROGRESS")
+
+
+def _bedrock_agent_client():
+    return boto3.client(
+        service_name="bedrock-agent",
+        region_name=bedrock_region,
+    )
+
+
+def get_active_ingestion_job() -> dict | None:
+    """Return an in-flight ingestion job if Knowledge Base sync is already running."""
+    if not knowledge_base_id or not data_source_id:
+        logger.error("knowledge_base_id or data_source_id is not configured")
+        return None
+
+    try:
+        bedrock_client = _bedrock_agent_client()
+        for status in ACTIVE_INGESTION_STATUSES:
+            response = bedrock_client.list_ingestion_jobs(
+                knowledgeBaseId=knowledge_base_id,
+                dataSourceId=data_source_id,
+                filters=[
+                    {
+                        "attribute": "STATUS",
+                        "operator": "EQ",
+                        "values": [status],
+                    }
+                ],
+                maxResults=1,
+                sortBy={
+                    "attribute": "STARTED_AT",
+                    "order": "DESCENDING",
+                },
+            )
+            summaries = response.get("ingestionJobSummaries") or []
+            if not summaries:
+                continue
+            job = summaries[0]
+            logger.info("Active ingestion job found: %s", job)
+            return {
+                "ingestion_job_id": job.get("ingestionJobId"),
+                "status": job.get("status"),
+                "started_at": str(job["startedAt"]) if job.get("startedAt") else None,
+            }
+        return None
+    except Exception:
+        logger.error("Error listing ingestion jobs: %s", traceback.format_exc())
+        raise
+
+
 def sync_data_source() -> dict | None:
     """Start a Knowledge Base ingestion job for the configured data source."""
     if not knowledge_base_id or not data_source_id:
@@ -165,10 +216,7 @@ def sync_data_source() -> dict | None:
         return None
 
     try:
-        bedrock_client = boto3.client(
-            service_name="bedrock-agent",
-            region_name=bedrock_region,
-        )
+        bedrock_client = _bedrock_agent_client()
         response = bedrock_client.start_ingestion_job(
             knowledgeBaseId=knowledge_base_id,
             dataSourceId=data_source_id,

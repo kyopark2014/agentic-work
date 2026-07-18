@@ -51,6 +51,19 @@ async def upload_to_rag(request: Request, file: UploadFile = File(...)):
     if not file_bytes:
         raise HTTPException(status_code=400, detail="Empty file")
 
+    try:
+        active_job = utils.get_active_ingestion_job()
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to check Knowledge Base sync status. Please try again later.",
+        )
+    if active_job:
+        raise HTTPException(
+            status_code=409,
+            detail="현재 이전에 업로드된 파일을 처리하고 있습니다. 조금후 다시 시도해주세요.",
+        )
+
     upload_result = utils.upload_to_s3(file_bytes, file_name)
     if not upload_result:
         raise HTTPException(status_code=500, detail="Failed to upload file to S3")
