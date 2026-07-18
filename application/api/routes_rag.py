@@ -89,6 +89,6 @@ async def upload_to_rag(request: Request, file: UploadFile = File(...)):
         "url": upload_result.get("url"),
         "sync": sync_result,
         "message": (
-            f'"{file_name}" was uploaded to S3 and Knowledge Base sync was started.'
+            f'"{file_name}"가 S3에 업로드 되었고 Knowledge Base와 동기화를 시작합니다.'
         ),
     }
