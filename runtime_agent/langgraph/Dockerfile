@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install boto3 botocore --upgrade
 RUN pip install langchain_aws langchain langchain_community langgraph langchain-openai langchain-anthropic "openai>=2.41.0" aws-bedrock-token-generator
 RUN pip install langgraph-checkpoint-sqlite aiosqlite
-RUN pip install mcp langchain-mcp-adapters
+RUN pip install mcp langchain-mcp-adapters awslabs.aws-documentation-mcp-server
 RUN pip install bedrock-agentcore uv
 RUN pip install Pillow pytz tavily-python langchain-text-splitters
 RUN pip install requests beautifulsoup4
