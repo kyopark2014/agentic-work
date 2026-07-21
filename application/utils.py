@@ -17,6 +17,7 @@ logger = logging.getLogger("utils")
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 config_path = os.path.join(script_dir, "config.json")
+favorite_tools_path = os.path.join(script_dir, "favorite_tools.json")
     
 def _account_id_from_config(config: dict) -> str | None:
     for value in config.values():
@@ -63,6 +64,52 @@ def load_config():
         logger.error(f"Error loading config: {e}")
         config = _fill_missing_config_defaults({})
     return config
+
+
+def load_favorite_tools() -> dict[str, list[str]]:
+    fallback = {"MCP": [], "SKILL": []}
+    try:
+        with open(favorite_tools_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        logger.warning("favorite_tools.json not found: %s", favorite_tools_path)
+        return fallback
+    except Exception as e:
+        logger.warning("Failed to load favorite_tools.json: %s", e)
+        return fallback
+
+    if not isinstance(data, dict):
+        return fallback
+
+    favorites: dict[str, list[str]] = {}
+    for key in ("MCP", "SKILL"):
+        values = data.get(key, [])
+        if isinstance(values, list):
+            favorites[key] = [v for v in values if isinstance(v, str) and v.strip()]
+        else:
+            favorites[key] = []
+    return favorites
+
+
+def save_favorite_tools(
+    *, skills: list[str] | None = None, mcp_servers: list[str] | None = None
+) -> dict[str, list[str]]:
+    favorites = load_favorite_tools()
+    if skills is not None:
+        favorites["SKILL"] = [v for v in skills if isinstance(v, str) and v.strip()]
+    if mcp_servers is not None:
+        favorites["MCP"] = [v for v in mcp_servers if isinstance(v, str) and v.strip()]
+
+    with open(favorite_tools_path, "w", encoding="utf-8") as f:
+        json.dump(favorites, f, ensure_ascii=False, indent=2)
+    return favorites
+
+
+def get_initial_tool_defaults() -> tuple[list[str], list[str]]:
+    favorite_tools = load_favorite_tools()
+    default_skills = favorite_tools.get("SKILL") or []
+    default_mcp_servers = favorite_tools.get("MCP") or []
+    return default_skills, default_mcp_servers
 
 config = load_config()
 
