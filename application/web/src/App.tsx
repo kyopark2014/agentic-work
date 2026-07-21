@@ -8,7 +8,7 @@ import type { AppConfig, Message, Task } from "./types";
 import { Sidebar } from "./components/Sidebar";
 import { ChatThread } from "./components/ChatThread";
 import { ChatInput } from "./components/ChatInput";
-import { UserIdModal } from "./components/UserIdModal";
+import { GoogleLoginModal } from "./components/GoogleLoginModal";
 
 type DrawerKind = "skill" | "mcp" | "model" | null;
 
@@ -176,15 +176,25 @@ export default function App() {
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
-  async function handleLogin(id: string) {
+  const handleGoogleCredential = useCallback(async (credential: string) => {
     setBootError(null);
     try {
-      await api.setSession(id);
-      setUserId(id.trim());
+      const session = await api.setSession(credential);
+      setUserId(session.user_id.trim());
     } catch (err) {
       setBootError(err instanceof Error ? err.message : String(err));
     }
-  }
+  }, []);
+
+  const handleLocalUserId = useCallback(async (id: string) => {
+    setBootError(null);
+    try {
+      const session = await api.setLocalSession(id.trim());
+      setUserId(session.user_id.trim());
+    } catch (err) {
+      setBootError(err instanceof Error ? err.message : String(err));
+    }
+  }, []);
 
   async function handleLogout() {
     setBootError(null);
@@ -192,6 +202,11 @@ export default function App() {
       await api.clearSession();
     } catch (err) {
       uiError("logout failed", err);
+    }
+    try {
+      window.google?.accounts?.id?.disableAutoSelect();
+    } catch {
+      // GSI may not be loaded yet
     }
     tasksBootstrappedForUserRef.current = null;
     emptyTaskBootstrapRef.current = null;
@@ -335,15 +350,18 @@ export default function App() {
   }
 
   // Wait for session check before showing login — otherwise a saved cookie
-  // briefly flashes the User ID modal, then the main app.
+  // briefly flashes the login modal, then the main app.
   if (!authReady) {
     return <div className="boot-loading">불러오는 중…</div>;
   }
 
   if (!userId) {
     return (
-      <UserIdModal
-        onSubmit={handleLogin}
+      <GoogleLoginModal
+        clientId={config?.google_client_id ?? ""}
+        onCredential={handleGoogleCredential}
+        onLocalUserId={handleLocalUserId}
+        localAuthBypass={Boolean(config?.local_auth_bypass)}
         error={bootError}
         projectName={config?.projectName}
       />

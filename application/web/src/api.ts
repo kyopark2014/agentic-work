@@ -48,7 +48,16 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!res.ok) {
     const text = await res.text();
     uiError(`api:${method} ${path} failed`, { status: res.status, body: text });
-    throw new Error(text || res.statusText);
+    let message = text || res.statusText;
+    try {
+      const parsed = JSON.parse(text) as { detail?: string | { msg?: string }[] };
+      if (typeof parsed.detail === "string" && parsed.detail) {
+        message = parsed.detail;
+      }
+    } catch {
+      // keep raw text
+    }
+    throw new Error(message);
   }
   if (res.status === 204) {
     uiLog(`api:${method} ${path} -> 204`);
@@ -66,7 +75,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   getSession: () => request<{ user_id: string } | null>("/api/session"),
-  setSession: (user_id: string) =>
+  setSession: (credential: string) =>
+    request<{ user_id: string; name?: string | null; picture?: string | null }>(
+      "/api/session",
+      {
+        method: "POST",
+        body: JSON.stringify({ credential }),
+      },
+    ),
+  setLocalSession: (user_id: string) =>
     request<{ user_id: string }>("/api/session", {
       method: "POST",
       body: JSON.stringify({ user_id }),

@@ -38,4 +38,6 @@ fi
 
 echo "==> Starting uvicorn on 0.0.0.0:${PORT}"
 echo "    Open http://localhost:${PORT}"
+# Local-only Google auth bypass (never set this in ECS/production).
+export ALLOW_LOCAL_AUTH_BYPASS=1
 exec uvicorn application.server:app --host 0.0.0.0 --port "${PORT}"

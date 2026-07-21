@@ -4591,10 +4591,24 @@ def write_application_config(config_data: Dict, *, merge_existing: bool = True) 
     config_path = _application_config_path()
     data = dict(config_data)
 
+    # Keys managed outside installer infrastructure steps (must survive redeploy).
+    preserve_keys = (
+        "google_client_id",
+        "llm_gateway_url",
+        "llm_gateway_key",
+        "sharing_url",
+    )
+
     if merge_existing:
         try:
             with open(config_path, "r") as f:
-                data = {**json.load(f), **data}
+                existing = json.load(f)
+            preserved = {
+                key: existing[key]
+                for key in preserve_keys
+                if isinstance(existing.get(key), str) and existing.get(key).strip()
+            }
+            data = {**existing, **data, **preserved}
         except FileNotFoundError:
             logger.info(f"Creating new {config_path}")
         except Exception as e:
@@ -4608,6 +4622,16 @@ def write_application_config(config_data: Dict, *, merge_existing: bool = True) 
     except Exception as e:
         logger.warning(f"Could not write {config_path}: {e}")
         return False
+
+
+def load_application_config() -> Dict:
+    """Load application/config.json (merged deploy source of truth)."""
+    config_path = _application_config_path()
+    with open(config_path, "r") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"{config_path} must contain a JSON object")
+    return data
 
 
 def build_config_from_deployment_state(
@@ -7305,6 +7329,11 @@ def main():
         help="Skip local Docker build/push and reuse the latest image tag in ECR.",
     )
     parser.add_argument(
+        "--skip-agent-runtime",
+        action="store_true",
+        help="Skip AgentCore Runtime rebuild (Web UI / ECS image only).",
+    )
+    parser.add_argument(
         "--install-agent-runtime",
         metavar="RUNTIME_TYPE",
         nargs="?",
@@ -7453,7 +7482,15 @@ def main():
 
         # LangGraph agent runtime (MCP servers run in-process inside this container;
         # separate runtime_mcp installers are not used in this repository).
-        if install_agent_runtime("langgraph"):
+        if args.skip_agent_runtime:
+            logger.warning("Skipping Agent Runtime rebuild (--skip-agent-runtime)")
+            app_environment = _merge_runtime_agent_settings(app_environment)
+            if write_application_config(app_environment):
+                logger.info(
+                    "✓ Kept existing agent_runtime_arn in application config for ECS: "
+                    f"{app_environment.get('agent_runtime_arn', '')}"
+                )
+        elif install_agent_runtime("langgraph"):
             logger.info("Langgraph agent runtime installed...")
             app_environment = _merge_runtime_agent_settings(app_environment)
             if write_application_config(app_environment):
@@ -7478,6 +7515,16 @@ def main():
             app_environment["build_number"] = image_build_tag
             if write_application_config(app_environment):
                 logger.info(f"✓ Updated {_application_config_path()} with build number: {image_build_tag}")
+        # ECS injects APP_CONFIG_JSON over config.json at boot — use the merged
+        # on-disk config so keys like google_client_id / sharing_url are kept.
+        try:
+            app_environment = load_application_config()
+            logger.info(
+                "✓ Loaded merged application config for ECS APP_CONFIG_JSON "
+                f"({len(app_environment)} keys)"
+            )
+        except Exception as e:
+            logger.warning(f"Could not reload merged application config: {e}")
         log_group_name = create_ecs_log_group()
         ecs_info = deploy_ecs_service(
             vpc_info,

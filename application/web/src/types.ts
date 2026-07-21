@@ -34,6 +34,8 @@ export interface Message {
 
 export interface AppConfig {
   projectName: string;
+  google_client_id?: string;
+  local_auth_bypass?: boolean;
   skills: string[];
   mcp_servers: string[];
   models: string[];

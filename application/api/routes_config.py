@@ -3,14 +3,16 @@ import os
 import json
 
 import httpx
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
 try:
     from application import utils
+    from application.api.routes_auth import local_auth_bypass_enabled
     from application.llm_gateway_models import ui_models_for_gateway_ids
 except ImportError:
     import utils
+    from routes_auth import local_auth_bypass_enabled  # type: ignore
     from llm_gateway_models import ui_models_for_gateway_ids  # type: ignore
 
 logger = logging.getLogger("routes_config")
@@ -159,7 +161,7 @@ def _gateway_ui_models() -> list[str]:
 
 
 @router.get("")
-def get_config():
+def get_config(request: Request):
     skill_options = load_capability_list("skills.list")
     mcp_options = load_capability_list("mcp.list")
     default_skills, default_mcp = utils.get_initial_tool_defaults()
@@ -179,6 +181,8 @@ def get_config():
     )
     return {
         "projectName": config.get("projectName", "agent"),
+        "google_client_id": (config.get("google_client_id") or "").strip(),
+        "local_auth_bypass": local_auth_bypass_enabled(request),
         "skills": skill_options,
         "mcp_servers": mcp_options,
         "models": MODELS,
