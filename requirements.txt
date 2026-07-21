@@ -16,6 +16,7 @@ opentelemetry-instrumentation-langchain
 langchain
 langchain_aws
 langchain-openai
+langchain-anthropic
 langchain_community
 langchain-mcp-adapters
 langchain-text-splitters

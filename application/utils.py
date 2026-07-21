@@ -124,6 +124,35 @@ knowledge_base_id = config.get('knowledge_base_id')
 data_source_id = config.get('data_source_id')
 
 
+def persist_config_updates(updates):
+    """Merge values into in-memory config and write application/config.json."""
+    global config
+    if not updates:
+        return
+    changed = False
+    for key, value in updates.items():
+        if value is None:
+            continue
+        s = value.strip() if isinstance(value, str) else str(value)
+        if not s:
+            continue
+        if config.get(key) != s:
+            config[key] = s
+            changed = True
+    if not changed:
+        return
+    try:
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        logger.info(
+            "Saved config.json updates: %s",
+            ", ".join(str(k) for k in updates if updates.get(k)),
+        )
+    except Exception as e:
+        logger.warning("Failed to write config.json: %s", e)
+
+
 def get_contents_type(file_name: str) -> str:
     lower = file_name.lower()
     if lower.endswith((".jpg", ".jpeg")):

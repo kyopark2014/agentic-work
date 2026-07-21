@@ -41,13 +41,23 @@ def run_agent(
     skill_list=None,
     guardrail_enabled=None,
     memory_enabled=None,
+    llm_gateway_enabled=None,
     files=None,
 ):
     """Dispatch agent calls to AgentCore runtime only."""
     from application import agentcore_client
+    from application import utils as app_utils
 
     if not use_agentcore_runtime():
         raise RuntimeError("AgentCore runtime is required for agent execution")
+
+    gateway_url = ""
+    gateway_key = ""
+    if llm_gateway_enabled:
+        cfg = app_utils.load_config()
+        gateway_url = (cfg.get("llm_gateway_url") or "").strip().rstrip("/")
+        gateway_key = (cfg.get("llm_gateway_key") or "").strip()
+
     return agentcore_client.run_agent(
         prompt,
         user_id,
@@ -58,5 +68,8 @@ def run_agent(
         skill_list=skill_list,
         guardrail_enabled=guardrail_enabled,
         memory_enabled=memory_enabled,
+        llm_gateway_enabled=llm_gateway_enabled,
+        llm_gateway_url=gateway_url or None,
+        llm_gateway_key=gateway_key or None,
         files=files,
     )

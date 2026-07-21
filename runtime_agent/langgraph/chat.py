@@ -15,6 +15,11 @@ import langgraph_agent
 import mcp_config
 import skill
 
+try:
+    from llm_gateway_models import LLM_GATEWAY_MODEL_MAP
+except ImportError:
+    from application.llm_gateway_models import LLM_GATEWAY_MODEL_MAP  # type: ignore
+
 from langchain_core.documents import Document
 from urllib import parse
 from io import BytesIO
@@ -22,6 +27,7 @@ from PIL import Image
 from langchain_aws import ChatBedrock
 from langchain_aws import ChatBedrockConverse
 from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate
@@ -80,13 +86,26 @@ debug_mode = "Enable"
 user_id = "agent"
 guardrail_enabled = True
 memory_enabled = False
+llm_gateway_enabled = False
+llm_gateway_url: str | None = None
+llm_gateway_key: str | None = None
 memory_id = None
 actor_id = None
 session_id = None
 
-def update(userId, modelName, debugMode, guardrailEnabled=None, memoryEnabled=None):    
+def update(
+    userId,
+    modelName,
+    debugMode,
+    guardrailEnabled=None,
+    memoryEnabled=None,
+    llmGatewayEnabled=None,
+    llmGatewayUrl=None,
+    llmGatewayKey=None,
+):
     global model_name, model_id, model_type, debug_mode, reasoning_mode
     global models, user_id, guardrail_enabled, memory_enabled
+    global llm_gateway_enabled, llm_gateway_url, llm_gateway_key
 
     if userId != user_id:
         user_id = userId
@@ -111,6 +130,27 @@ def update(userId, modelName, debugMode, guardrailEnabled=None, memoryEnabled=No
     if memoryEnabled is not None and memory_enabled != memoryEnabled:
         memory_enabled = memoryEnabled
         logger.info(f"memory_enabled: {memory_enabled}")
+
+    if llmGatewayEnabled is not None and llm_gateway_enabled != llmGatewayEnabled:
+        llm_gateway_enabled = llmGatewayEnabled
+        logger.info(f"llm_gateway_enabled: {llm_gateway_enabled}")
+
+    if llmGatewayUrl is not None:
+        llm_gateway_url = (llmGatewayUrl or "").strip().rstrip("/") or None
+    if llmGatewayKey is not None:
+        llm_gateway_key = (llmGatewayKey or "").strip() or None
+
+
+def _llm_gateway_settings() -> tuple[str, str] | None:
+    """Resolve gateway URL/key from request payload override or config.json."""
+    if llm_gateway_url and llm_gateway_key:
+        return llm_gateway_url, llm_gateway_key
+    runtime_config = config or utils.load_config()
+    url = (runtime_config.get("llm_gateway_url") or "").strip().rstrip("/")
+    key = (runtime_config.get("llm_gateway_key") or "").strip()
+    if not url or not key:
+        return None
+    return url, key
 
 def _guardrail_config() -> dict | None:
     if not guardrail_enabled:
@@ -586,6 +626,58 @@ def _build_openai_chat(profile: dict, max_output_tokens: int):
     chat.streaming = False
     return chat
 
+
+def _build_llm_gateway_chat(profile: dict, max_output_tokens: int):
+    """Build chat model via LiteLLM gateway (ChatAnthropic / ChatOpenAI)."""
+    settings = _llm_gateway_settings()
+    if not settings:
+        logger.warning(
+            "LLM Gateway enabled but llm_gateway_url/llm_gateway_key missing; "
+            "falling back to Bedrock"
+        )
+        return None
+    gateway_url, gateway_key = settings
+
+    gw_model = LLM_GATEWAY_MODEL_MAP.get(model_name)
+    if not gw_model:
+        logger.warning(
+            "LLM Gateway enabled but no model mapping for %s; falling back to Bedrock",
+            model_name,
+        )
+        return None
+
+    model_kind = profile.get("model_type")
+    logger.info(
+        "Using LLM Gateway: url=%s model=%s type=%s",
+        gateway_url,
+        gw_model,
+        model_kind,
+    )
+
+    if model_kind == "openai":
+        return ChatOpenAI(
+            model=gw_model,
+            api_key=gateway_key,
+            base_url=f"{gateway_url}/v1",
+            max_tokens=max_output_tokens,
+        )
+
+    if model_kind == "claude":
+        # Do not pass temperature: newer Claude models reject it via LiteLLM.
+        return ChatAnthropic(
+            model=gw_model,
+            api_key=gateway_key,
+            base_url=gateway_url,
+            max_tokens=max_output_tokens,
+        )
+
+    logger.warning(
+        "LLM Gateway does not support model_type=%s for %s; falling back to Bedrock",
+        model_kind,
+        model_name,
+    )
+    return None
+
 def get_chat():
     global model_type
 
@@ -601,6 +693,11 @@ def get_chat():
         maxOutputTokens = 5120 # 5k
 
     logger.info(f"modelId: {modelId}, model_type: {model_type}, bedrock_region: {bedrock_region}")
+
+    if llm_gateway_enabled:
+        gateway_chat = _build_llm_gateway_chat(profile, maxOutputTokens)
+        if gateway_chat is not None:
+            return gateway_chat
 
     if is_fable_model(modelId):
         bedrock_data_retention.ensure_fable_data_retention(

@@ -165,10 +165,14 @@ async def agent_langgraph(payload):
         debugMode=payload.get("debug_mode", chat.debug_mode),
         guardrailEnabled=payload.get("guardrail_enabled"),
         memoryEnabled=payload.get("memory_enabled"),
+        llmGatewayEnabled=payload.get("llm_gateway_enabled"),
+        llmGatewayUrl=payload.get("llm_gateway_url"),
+        llmGatewayKey=payload.get("llm_gateway_key"),
     )
 
     logger.info(f"guardrail_enabled: {chat.guardrail_enabled}")
     logger.info(f"memory_enabled: {chat.memory_enabled}")
+    logger.info(f"llm_gateway_enabled: {chat.llm_gateway_enabled}")
 
     # Normalize selected MCP names and always attach memory when Memory toggle is on
     mcp_servers = [str(s).strip() for s in (mcp_servers or []) if str(s).strip()]

@@ -21,6 +21,7 @@ RUN pip install \
     boto3 \
     langchain_aws \
     langchain-openai \
+    langchain-anthropic \
     "openai>=2.41.0" \
     aws-bedrock-token-generator \
     requests

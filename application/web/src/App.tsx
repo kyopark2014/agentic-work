@@ -77,6 +77,12 @@ export default function App() {
     return sortTasks(rows);
   }, []);
 
+  const refreshConfig = useCallback(async () => {
+    const cfg = await api.getConfig();
+    setConfig(cfg);
+    return cfg;
+  }, []);
+
   useEffect(() => {
     (async () => {
       try {
@@ -207,6 +213,7 @@ export default function App() {
       mcp_servers: activeTask?.mcp_servers ?? config.default_mcp_servers,
       guardrail_enabled: activeTask?.guardrail_enabled ?? false,
       memory_enabled: activeTask?.memory_enabled ?? true,
+      llm_gateway_enabled: activeTask?.llm_gateway_enabled ?? false,
     });
     setTasks((prev) => [task, ...prev]);
     setActiveTaskId(task.id);
@@ -368,6 +375,7 @@ export default function App() {
         onPatchTask={handlePatchTask}
         onDeleteTask={handleDeleteTask}
         onLogout={handleLogout}
+        onRefreshConfig={refreshConfig}
       />
       <div className="main-panel">
         <ChatThread
