@@ -1,4 +1,4 @@
-import type { AppConfig, Message, StreamEvent, Task } from "./types";
+import type { AppConfig, DashboardStats, Message, StreamEvent, Task } from "./types";
 import { uiError, uiLog } from "./debug";
 
 export interface RagUploadResult {
@@ -83,6 +83,14 @@ export const api = {
         body: JSON.stringify({ credential }),
       },
     ),
+  setSessionWithAccessToken: (access_token: string) =>
+    request<{ user_id: string; name?: string | null; picture?: string | null }>(
+      "/api/session",
+      {
+        method: "POST",
+        body: JSON.stringify({ access_token }),
+      },
+    ),
   setLocalSession: (user_id: string) =>
     request<{ user_id: string }>("/api/session", {
       method: "POST",
@@ -90,6 +98,7 @@ export const api = {
     }),
   clearSession: () => request<void>("/api/session", { method: "DELETE" }),
   getConfig: () => request<AppConfig>("/api/config"),
+  getAdminDashboard: () => request<DashboardStats>("/api/admin/dashboard"),
   getLlmGateway: () =>
     request<LlmGatewayConfig>("/api/config/llm-gateway"),
   verifyLlmGateway: (body: { url: string; key: string }) =>

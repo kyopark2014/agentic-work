@@ -2143,6 +2143,39 @@ def delete_secrets(skip_confirmation: bool = False) -> bool:
     return True
 
 
+def delete_user_access_cloudwatch_dashboard() -> None:
+    """Delete the application user-access CloudWatch dashboard if present."""
+    logger.info("Deleting CloudWatch user-access dashboard")
+    dash_name = None
+    try:
+        cfg_path = _application_config_path()
+        if os.path.exists(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            dash_name = cfg.get("cloudwatch_user_access_dashboard")
+            project = cfg.get("projectName") or project_name
+        else:
+            project = project_name
+    except Exception:
+        project = project_name
+
+    if not dash_name:
+        dash_name = f"{project}-user-access"
+
+    try:
+        cw = boto3.client("cloudwatch", region_name=region)
+        cw.delete_dashboards(DashboardNames=[dash_name])
+        logger.info(f"  ✓ Deleted CloudWatch dashboard: {dash_name}")
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in {"ResourceNotFound", "ResourceNotFoundException"}:
+            logger.info(f"  Dashboard not found (already deleted): {dash_name}")
+        else:
+            logger.warning(f"  Could not delete dashboard {dash_name}: {e}")
+    except Exception as e:
+        logger.warning(f"  Could not delete dashboard {dash_name}: {e}")
+
+
 def delete_local_config_files() -> None:
     """Remove local config files written by installer/runtime installers."""
     logger.info("[10/10] Deleting local config files")
@@ -2274,6 +2307,7 @@ def main():
         else:
             logger.warning("Langgraph agent runtime uninstall failed or was skipped.")
 
+        delete_user_access_cloudwatch_dashboard()
         delete_ecs_resources()
         delete_alb_resources()
         delete_ec2_instances()

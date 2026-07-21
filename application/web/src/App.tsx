@@ -9,6 +9,7 @@ import { Sidebar } from "./components/Sidebar";
 import { ChatThread } from "./components/ChatThread";
 import { ChatInput } from "./components/ChatInput";
 import { GoogleLoginModal } from "./components/GoogleLoginModal";
+import { Dashboard } from "./components/Dashboard";
 
 type DrawerKind = "skill" | "mcp" | "model" | null;
 
@@ -51,6 +52,7 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [drawer, setDrawer] = useState<DrawerKind>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [view, setView] = useState<"chat" | "dashboard">("chat");
   const { getStreamForTask, sendMessage } = useChatStream();
   // Survives React Strict Mode remount so empty-list bootstrap creates only one task.
   const emptyTaskBootstrapRef = useRef<Promise<Task> | null>(null);
@@ -181,20 +183,33 @@ export default function App() {
     try {
       const session = await api.setSession(credential);
       setUserId(session.user_id.trim());
+      await refreshConfig();
     } catch (err) {
       setBootError(err instanceof Error ? err.message : String(err));
     }
-  }, []);
+  }, [refreshConfig]);
+
+  const handleGoogleAccessToken = useCallback(async (accessToken: string) => {
+    setBootError(null);
+    try {
+      const session = await api.setSessionWithAccessToken(accessToken);
+      setUserId(session.user_id.trim());
+      await refreshConfig();
+    } catch (err) {
+      setBootError(err instanceof Error ? err.message : String(err));
+    }
+  }, [refreshConfig]);
 
   const handleLocalUserId = useCallback(async (id: string) => {
     setBootError(null);
     try {
       const session = await api.setLocalSession(id.trim());
       setUserId(session.user_id.trim());
+      await refreshConfig();
     } catch (err) {
       setBootError(err instanceof Error ? err.message : String(err));
     }
-  }, []);
+  }, [refreshConfig]);
 
   async function handleLogout() {
     setBootError(null);
@@ -215,6 +230,7 @@ export default function App() {
     setActiveTaskId(null);
     setMessages([]);
     setDrawer(null);
+    setView("chat");
     if (config?.projectName) {
       document.title = formatBrandTitle(config.projectName);
     }
@@ -236,6 +252,7 @@ export default function App() {
   }
 
   async function handleSelectTask(id: string) {
+    setView("chat");
     setActiveTaskId(id);
     setSidebarOpen(false);
     await loadMessages(id);
@@ -360,6 +377,7 @@ export default function App() {
       <GoogleLoginModal
         clientId={config?.google_client_id ?? ""}
         onCredential={handleGoogleCredential}
+        onAccessToken={handleGoogleAccessToken}
         onLocalUserId={handleLocalUserId}
         localAuthBypass={Boolean(config?.local_auth_bypass)}
         error={bootError}
@@ -393,24 +411,36 @@ export default function App() {
         onPatchTask={handlePatchTask}
         onDeleteTask={handleDeleteTask}
         onLogout={handleLogout}
+        onOpenDashboard={
+          config?.is_admin
+            ? () => {
+                setView("dashboard");
+                setSidebarOpen(false);
+              }
+            : undefined
+        }
         onRefreshConfig={refreshConfig}
       />
       <div className="main-panel">
-        <ChatThread
-          messages={messages}
-          streaming={activeStream.streaming}
-          streamText={activeStream.streamText}
-          streamEvents={activeStream.streamEvents}
-          taskTitle={activeTask?.title ?? "New task"}
-          onMenuClick={() => setSidebarOpen(true)}
-          footer={
-            <ChatInput
-              disabled={!activeTask || activeStream.streaming}
-              onSend={handleSend}
-              onRagUploadComplete={handleRagUploadComplete}
-            />
-          }
-        />
+        {view === "dashboard" ? (
+          <Dashboard onBack={() => setView("chat")} />
+        ) : (
+          <ChatThread
+            messages={messages}
+            streaming={activeStream.streaming}
+            streamText={activeStream.streamText}
+            streamEvents={activeStream.streamEvents}
+            taskTitle={activeTask?.title ?? "New task"}
+            onMenuClick={() => setSidebarOpen(true)}
+            footer={
+              <ChatInput
+                disabled={!activeTask || activeStream.streaming}
+                onSend={handleSend}
+                onRagUploadComplete={handleRagUploadComplete}
+              />
+            }
+          />
+        )}
       </div>
     </div>
   );

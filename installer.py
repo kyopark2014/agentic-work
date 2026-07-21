@@ -17,7 +17,7 @@ import shutil
 import os
 import sys
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 from botocore.exceptions import ClientError, NoCredentialsError, ParamValidationError
 import urllib.request
@@ -4598,6 +4598,7 @@ def write_application_config(config_data: Dict, *, merge_existing: bool = True) 
         "llm_gateway_key",
         "sharing_url",
     )
+    preserve_list_keys = ("admin_emails",)
 
     if merge_existing:
         try:
@@ -4608,6 +4609,10 @@ def write_application_config(config_data: Dict, *, merge_existing: bool = True) 
                 for key in preserve_keys
                 if isinstance(existing.get(key), str) and existing.get(key).strip()
             }
+            for key in preserve_list_keys:
+                value = existing.get(key)
+                if isinstance(value, list) and value:
+                    preserved[key] = value
             data = {**existing, **data, **preserved}
         except FileNotFoundError:
             logger.info(f"Creating new {config_path}")
@@ -5306,6 +5311,37 @@ def create_ecs_log_group() -> str:
             raise
         logger.warning(f"  Log group already exists: {log_group_name}")
     return log_group_name
+
+
+def create_user_access_cloudwatch_dashboard(config: Dict[str, Any] | None = None) -> str | None:
+    """Create/update CloudWatch dashboard for app login & signup metrics."""
+    cfg = config or {}
+    project = str(cfg.get("projectName") or project_name).strip() or project_name
+    dash_region = str(cfg.get("region") or region).strip() or region
+    logger.info("Creating CloudWatch user-access dashboard...")
+    try:
+        # Import from application package (same tree as ECS image).
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from application.cloudwatch_user_metrics import (
+            create_user_access_dashboard,
+            user_access_dashboard_name,
+        )
+
+        name = create_user_access_dashboard(project, dash_region)
+        if not name:
+            name = user_access_dashboard_name(project)
+            logger.warning(f"  User-access dashboard create returned None (expected {name})")
+            return None
+        url = (
+            f"https://{dash_region}.console.aws.amazon.com/cloudwatch/home"
+            f"?region={dash_region}#dashboards/dashboard/{name}"
+        )
+        logger.info(f"  ✓ CloudWatch user-access dashboard: {name}")
+        logger.info(f"  URL: {url}")
+        return name
+    except Exception as e:
+        logger.warning(f"  Could not create user-access CloudWatch dashboard: {e}")
+        return None
 
 
 ECS_SERVICE_LINKED_ROLE_NAME = "AWSServiceRoleForECS"
@@ -7536,6 +7572,14 @@ def main():
             s3_files_info=s3_files_info,
         )
         logger.info("ECS service deployed...")
+
+        user_dash = create_user_access_cloudwatch_dashboard(app_environment)
+        if user_dash:
+            app_environment["cloudwatch_user_access_dashboard"] = user_dash
+            if write_application_config(app_environment):
+                logger.info(
+                    f"✓ Saved cloudwatch_user_access_dashboard={user_dash} to application config"
+                )
         
         # Check whether the application is ready
         logger.info(f"Checking if application is ready: {cloudfront_info['domain']}")
@@ -7560,6 +7604,12 @@ def main():
         logger.info(f"  ECR Image: {image_uri}")
         if image_build_tag:
             logger.info(f"  Build Number: {image_build_tag}")
+        if user_dash:
+            logger.info(f"  User Access Dashboard: {user_dash}")
+            logger.info(
+                f"    https://{region}.console.aws.amazon.com/cloudwatch/home"
+                f"?region={region}#dashboards/dashboard/{user_dash}"
+            )
         logger.info(f"  OpenSearch Endpoint: {opensearch_info['endpoint']}")
         logger.info(f"  OpenSearch Collection ARN: {opensearch_info['arn']}")
         logger.info(f"  Knowledge Base ID: {knowledge_base_id}")

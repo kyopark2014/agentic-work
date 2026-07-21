@@ -9,10 +9,12 @@ from pydantic import BaseModel
 try:
     from application import utils
     from application.api.routes_auth import local_auth_bypass_enabled
+    from application.api.routes_admin import is_admin_user
     from application.llm_gateway_models import ui_models_for_gateway_ids
 except ImportError:
     import utils
     from routes_auth import local_auth_bypass_enabled  # type: ignore
+    from routes_admin import is_admin_user  # type: ignore
     from llm_gateway_models import ui_models_for_gateway_ids  # type: ignore
 
 logger = logging.getLogger("routes_config")
@@ -179,10 +181,12 @@ def get_config(request: Request):
         if DEFAULT_GATEWAY_MODEL in gateway_models
         else (gateway_models[0] if gateway_models else DEFAULT_MODEL)
     )
+    session_user = (request.cookies.get("agent_user_id") or "").strip()
     return {
         "projectName": config.get("projectName", "agent"),
         "google_client_id": (config.get("google_client_id") or "").strip(),
         "local_auth_bypass": local_auth_bypass_enabled(request),
+        "is_admin": bool(session_user and is_admin_user(session_user)),
         "skills": skill_options,
         "mcp_servers": mcp_options,
         "models": MODELS,

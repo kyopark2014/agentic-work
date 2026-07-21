@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -23,6 +24,9 @@ TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo"
 class SessionRequest(BaseModel):
     credential: str | None = Field(
         default=None, description="Google ID Token (JWT)"
+    )
+    access_token: str | None = Field(
+        default=None, description="Google OAuth access token"
     )
     user_id: str | None = Field(
         default=None,
@@ -63,8 +67,15 @@ def is_loopback_request(request: Request) -> bool:
 
 
 def local_auth_bypass_enabled(request: Request) -> bool:
-    """Dev-only bypass: env flag AND loopback Host. Never trust proxies alone."""
-    return _env_bypass_flag() and is_loopback_request(request)
+    """Dev-only bypass for local development.
+
+    True when:
+    - ALLOW_LOCAL_AUTH_BYPASS is set (./run_local.sh), or
+    - the request Host is loopback (localhost / 127.0.0.1)
+
+    ECS/production must not set ALLOW_LOCAL_AUTH_BYPASS.
+    """
+    return _env_bypass_flag() or is_loopback_request(request)
 
 
 def verify_google_token(token: str, client_id: str) -> dict:
@@ -92,6 +103,51 @@ def verify_google_token(token: str, client_id: str) -> dict:
     return idinfo
 
 
+def verify_google_access_token(token: str, client_id: str) -> dict:
+    """Verify Google OAuth access token and load profile (email/name/picture)."""
+    info_url = f"{TOKENINFO_URL}?access_token={urllib.parse.quote(token)}"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(info_url), timeout=5) as resp:
+            tokeninfo = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise ValueError(f"Access token verification failed ({e.code}): {body}") from e
+    except Exception as e:
+        raise ValueError(f"Access token verification request failed: {e}") from e
+
+    audience = (tokeninfo.get("aud") or tokeninfo.get("azp") or "").strip()
+    if audience != client_id:
+        raise ValueError(f"Invalid access token audience: {audience}")
+
+    userinfo_req = urllib.request.Request(
+        "https://www.googleapis.com/oauth2/v3/userinfo",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urllib.request.urlopen(userinfo_req, timeout=5) as resp:
+            profile = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise ValueError(f"Userinfo request failed ({e.code}): {body}") from e
+    except Exception as e:
+        raise ValueError(f"Userinfo request failed: {e}") from e
+
+    email = (profile.get("email") or tokeninfo.get("email") or "").strip()
+    if not email:
+        raise ValueError("Access token profile does not contain email")
+    verified = profile.get("email_verified", tokeninfo.get("email_verified"))
+    if verified in ("false", False):
+        raise ValueError("Email is not verified")
+
+    return {
+        "email": email,
+        "name": profile.get("name"),
+        "picture": profile.get("picture"),
+        "sub": profile.get("sub") or tokeninfo.get("sub"),
+        "email_verified": True,
+    }
+
+
 def _cookie_secure(request: Request) -> bool:
     proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "").lower()
     return proto == "https"
@@ -111,17 +167,32 @@ def _set_user_cookie(response: Response, request: Request, user_id: str) -> None
 @router.post("", response_model=SessionResponse)
 def set_session(body: SessionRequest, request: Request, response: Response) -> SessionResponse:
     credential = (body.credential or "").strip()
+    access_token = (body.access_token or "").strip()
     local_user_id = (body.user_id or "").strip()
 
-    if credential:
+    if credential or access_token:
         try:
-            idinfo = verify_google_token(credential, _google_client_id())
+            if credential:
+                idinfo = verify_google_token(credential, _google_client_id())
+            else:
+                idinfo = verify_google_access_token(access_token, _google_client_id())
         except ValueError as e:
             logger.warning("Google login rejected: %s", e)
             raise HTTPException(status_code=401, detail="Invalid Google credential") from e
 
         user_id = idinfo["email"].strip()
         _set_user_cookie(response, request, user_id)
+        try:
+            from application import task_store
+
+            task_store.record_login(
+                user_id,
+                method="google",
+                name=(idinfo.get("name") or None),
+                picture=(idinfo.get("picture") or None),
+            )
+        except Exception:
+            logger.exception("Failed to record Google login event")
         logger.info("Google login success: %s", user_id)
         return SessionResponse(
             user_id=user_id,
@@ -136,10 +207,18 @@ def set_session(body: SessionRequest, request: Request, response: Response) -> S
                 detail="Local auth bypass is disabled",
             )
         _set_user_cookie(response, request, local_user_id)
+        try:
+            from application import task_store
+
+            task_store.record_login(local_user_id, method="local")
+        except Exception:
+            logger.exception("Failed to record local login event")
         logger.warning("Local auth bypass login: %s", local_user_id)
         return SessionResponse(user_id=local_user_id)
 
-    raise HTTPException(status_code=400, detail="credential or user_id is required")
+    raise HTTPException(
+        status_code=400, detail="credential, access_token, or user_id is required"
+    )
 
 
 @router.get("", response_model=SessionResponse | None)

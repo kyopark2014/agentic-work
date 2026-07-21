@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import sqlite3
 import uuid
@@ -10,6 +11,8 @@ from application.task_store_persistence import (
     schedule_persist,
     working_db_path,
 )
+
+logger = logging.getLogger(__name__)
 
 _APPLICATION_DIR = os.path.dirname(os.path.abspath(__file__))
 _DATA_DIR = os.path.join(_APPLICATION_DIR, "data")
@@ -65,6 +68,19 @@ def init_db() -> None:
               ON tasks(user_id, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_messages_task_created
               ON messages(task_id, created_at ASC);
+
+            CREATE TABLE IF NOT EXISTS login_events (
+              id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              method TEXT NOT NULL,
+              name TEXT,
+              picture TEXT,
+              logged_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_login_events_logged
+              ON login_events(logged_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_login_events_user
+              ON login_events(user_id, logged_at DESC);
             """
         )
         try:
@@ -324,3 +340,236 @@ def add_message(
             "SELECT * FROM messages WHERE id = ?", (message_id,)
         ).fetchone()
     return _row_to_message(row) if row else {}
+
+
+def record_login(
+    user_id: str,
+    *,
+    method: str = "google",
+    name: str | None = None,
+    picture: str | None = None,
+) -> dict[str, Any]:
+    """Record a login for dashboard access metrics."""
+    event_id = str(uuid.uuid4())
+    now = _now_iso()
+    uid = user_id.strip()
+    with _connect() as conn:
+        prior = conn.execute(
+            "SELECT 1 FROM login_events WHERE user_id = ? LIMIT 1",
+            (uid,),
+        ).fetchone()
+        is_new_user = prior is None
+        conn.execute(
+            """
+            INSERT INTO login_events (id, user_id, method, name, picture, logged_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (event_id, uid, method, name, picture, now),
+        )
+    _after_write()
+    try:
+        from application.cloudwatch_user_metrics import publish_login_metrics
+
+        publish_login_metrics(method=method, is_new_user=is_new_user)
+    except Exception:
+        logger.exception("CloudWatch login metrics publish failed")
+    return {
+        "id": event_id,
+        "user_id": uid,
+        "method": method,
+        "name": name,
+        "picture": picture,
+        "logged_at": now,
+        "is_new_user": is_new_user,
+    }
+
+
+def get_dashboard_stats(*, recent_limit: int = 50, daily_days: int = 14) -> dict[str, Any]:
+    """Aggregate registrant + access metrics for the admin dashboard."""
+    with _connect() as conn:
+        task_users = conn.execute(
+            """
+            SELECT
+              user_id,
+              COUNT(*) AS task_count,
+              MIN(created_at) AS first_task_at,
+              MAX(updated_at) AS last_task_at
+            FROM tasks
+            GROUP BY user_id
+            """
+        ).fetchall()
+
+        message_counts = {
+            row["user_id"]: row["message_count"]
+            for row in conn.execute(
+                """
+                SELECT t.user_id AS user_id, COUNT(m.id) AS message_count
+                FROM tasks t
+                LEFT JOIN messages m ON m.task_id = t.id
+                GROUP BY t.user_id
+                """
+            ).fetchall()
+        }
+
+        login_users = conn.execute(
+            """
+            SELECT
+              user_id,
+              COUNT(*) AS login_count,
+              MIN(logged_at) AS first_login_at,
+              MAX(logged_at) AS last_login_at,
+              GROUP_CONCAT(DISTINCT method) AS methods
+            FROM login_events
+            GROUP BY user_id
+            """
+        ).fetchall()
+
+        total_tasks = conn.execute("SELECT COUNT(*) AS c FROM tasks").fetchone()["c"]
+        total_messages = conn.execute("SELECT COUNT(*) AS c FROM messages").fetchone()["c"]
+        total_logins = conn.execute("SELECT COUNT(*) AS c FROM login_events").fetchone()["c"]
+
+        recent_logins = [
+            {
+                "id": row["id"],
+                "user_id": row["user_id"],
+                "method": row["method"],
+                "name": row["name"],
+                "picture": row["picture"],
+                "logged_at": row["logged_at"],
+            }
+            for row in conn.execute(
+                """
+                SELECT id, user_id, method, name, picture, logged_at
+                FROM login_events
+                ORDER BY logged_at DESC
+                LIMIT ?
+                """,
+                (recent_limit,),
+            ).fetchall()
+        ]
+
+        daily_rows = conn.execute(
+            """
+            SELECT
+              substr(logged_at, 1, 10) AS day,
+              COUNT(*) AS logins,
+              COUNT(DISTINCT user_id) AS unique_users
+            FROM login_events
+            WHERE substr(logged_at, 1, 10) >= date('now', ?)
+            GROUP BY substr(logged_at, 1, 10)
+            ORDER BY day ASC
+            """,
+            (f"-{max(daily_days, 1)} days",),
+        ).fetchall()
+
+        logins_today = conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM login_events
+            WHERE substr(logged_at, 1, 10) = date('now')
+            """
+        ).fetchone()["c"]
+        active_today = conn.execute(
+            """
+            SELECT COUNT(DISTINCT user_id) AS c
+            FROM login_events
+            WHERE substr(logged_at, 1, 10) = date('now')
+            """
+        ).fetchone()["c"]
+        logins_7d = conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM login_events
+            WHERE substr(logged_at, 1, 10) >= date('now', '-7 days')
+            """
+        ).fetchone()["c"]
+        active_7d = conn.execute(
+            """
+            SELECT COUNT(DISTINCT user_id) AS c
+            FROM login_events
+            WHERE substr(logged_at, 1, 10) >= date('now', '-7 days')
+            """
+        ).fetchone()["c"]
+
+    by_user: dict[str, dict[str, Any]] = {}
+    for row in task_users:
+        uid = row["user_id"]
+        by_user[uid] = {
+            "user_id": uid,
+            "task_count": int(row["task_count"] or 0),
+            "message_count": int(message_counts.get(uid, 0) or 0),
+            "login_count": 0,
+            "first_seen": row["first_task_at"],
+            "last_active": row["last_task_at"],
+            "last_login": None,
+            "auth_methods": [],
+            "is_google": "@" in uid,
+        }
+    for row in login_users:
+        uid = row["user_id"]
+        methods = [
+            m.strip()
+            for m in (row["methods"] or "").split(",")
+            if m and m.strip()
+        ]
+        entry = by_user.get(uid)
+        if not entry:
+            entry = {
+                "user_id": uid,
+                "task_count": 0,
+                "message_count": 0,
+                "login_count": 0,
+                "first_seen": row["first_login_at"],
+                "last_active": row["last_login_at"],
+                "last_login": row["last_login_at"],
+                "auth_methods": methods,
+                "is_google": "google" in methods or "@" in uid,
+            }
+            by_user[uid] = entry
+        else:
+            entry["login_count"] = int(row["login_count"] or 0)
+            entry["last_login"] = row["last_login_at"]
+            entry["auth_methods"] = methods
+            entry["is_google"] = entry["is_google"] or ("google" in methods)
+            if row["first_login_at"] and (
+                not entry["first_seen"] or row["first_login_at"] < entry["first_seen"]
+            ):
+                entry["first_seen"] = row["first_login_at"]
+            if row["last_login_at"] and (
+                not entry["last_active"] or row["last_login_at"] > entry["last_active"]
+            ):
+                entry["last_active"] = row["last_login_at"]
+        entry["login_count"] = int(row["login_count"] or 0)
+
+    users = sorted(
+        by_user.values(),
+        key=lambda u: u.get("last_active") or "",
+        reverse=True,
+    )
+    google_users = sum(1 for u in users if u.get("is_google"))
+    legacy_users = len(users) - google_users
+
+    return {
+        "summary": {
+            "total_users": len(users),
+            "google_users": google_users,
+            "legacy_users": legacy_users,
+            "total_tasks": int(total_tasks or 0),
+            "total_messages": int(total_messages or 0),
+            "total_logins": int(total_logins or 0),
+            "logins_today": int(logins_today or 0),
+            "active_users_today": int(active_today or 0),
+            "logins_7d": int(logins_7d or 0),
+            "active_users_7d": int(active_7d or 0),
+        },
+        "users": users,
+        "recent_logins": recent_logins,
+        "daily_logins": [
+            {
+                "date": row["day"],
+                "logins": int(row["logins"] or 0),
+                "unique_users": int(row["unique_users"] or 0),
+            }
+            for row in daily_rows
+        ],
+    }
