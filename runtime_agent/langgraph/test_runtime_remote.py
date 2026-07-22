@@ -50,7 +50,7 @@ async def main():
 
     prompt = "서울 날씨는?"
     mcp_servers = ["tavily", "web_fetch"]
-    skill_list = ["skill-creator", "kma-weather"]
+    skill_list = ["skill-creator", "korea-weather"]
     model_name = "Claude 4.5 Haiku"
     user_id = target
 

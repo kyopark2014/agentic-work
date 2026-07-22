@@ -52,8 +52,6 @@ def load_config(mcp_type):
         mcp_type = "aws_documentation"    
     elif mcp_type == "trade info":
         mcp_type = "trade_info"
-    elif mcp_type == "weather":
-        mcp_type = "korea_weather"
     elif mcp_type == "image generation":
         mcp_type = "image_generation"
     
@@ -103,18 +101,6 @@ def load_config(mcp_type):
             }
         }
 
-    elif mcp_type == "korea_weather":
-        return {
-            "mcpServers": {
-                "korea-weather": {
-                    "command": "python",
-                    "args": [f"{workingDir}/mcp_server_korea_weather.py"],
-                    # AGENTCORE_USER_ID is injected at runtime in chat.create_agent()
-                    # so home-address fallback via memory can use the same user namespace.
-                }
-            }
-        }
-        
     elif mcp_type == "kb-retriever":
         return {
             "mcpServers": {

@@ -739,7 +739,6 @@ runtime_agent/langgraph/
 ├── mcp_server_retrieve.py  # Knowledge Base retrieve MCP
 ├── mcp_server_trade_info.py
 ├── mcp_server_image_generation.py
-├── mcp_server_korea_weather.py
 ├── mcp_retrieve.py         # retrieve MCP 헬퍼
 ├── trade_info.py           # trade info 데이터 로더
 ├── agentcore_sigv4_auth.py # AgentCore Gateway MCP용 SigV4 httpx Auth
@@ -760,8 +759,7 @@ runtime_agent/langgraph/
     ├── xlsx/
     ├── skill-creator/
     ├── subway/             # skills.list의 seoul-subway
-    ├── usa-weather/
-    └── kma-weather/
+    └── korea-weather/
 ```
 
 | 구분 | 모듈 | 설명 |
@@ -773,9 +771,9 @@ runtime_agent/langgraph/
 | **인증·모델** | `agentcore_sigv4_auth.py`, `bedrock_data_retention.py`, `info.py` | Gateway SigV4, Mantle bearer token, 모델 프로필 |
 | **설정·배포** | `utils.py`, `installer.py`, `config.json` | AWS 리소스 연동, Secrets Manager, Runtime/IAM 배포 |
 
-**MCP 목록 (`mcp.list`)**: knowledge base, aws documentation, trade info, websearch, web_fetch, image generation, korea_weather, tavily, notion, aws-drawio
+**MCP 목록 (`mcp.list`)**: knowledge base, aws documentation, trade info, websearch, web_fetch, image generation, tavily, notion, aws-drawio, memory
 
-**Skill 목록 (`skills.list`)**: docx, pdf, pptx, xlsx, skill-creator, seoul-subway, usa-weather, kma-weather
+**Skill 목록 (`skills.list`)**: docx, pdf, pptx, xlsx, skill-creator, seoul-subway, korea-weather, myslide, …
 
 > OpenAI GPT 5.4/5.5는 Bedrock Mantle Responses API(`mantle_api: "responses"`)를 사용합니다. Runtime IAM 정책(`installer.py`의 `BedrockMantleAccess`)에 모델이 호출하는 Mantle 리전(예: `us-east-2`)이 포함되어야 합니다.
 
@@ -798,11 +796,11 @@ skills/
 │   └── SKILL.md
 ├── subway/               # seoul-subway
 │   └── SKILL.md
-├── usa-weather/
-│   └── SKILL.md
-└── kma-weather/
+└── korea-weather/
     ├── SKILL.md
     └── scripts/
+        ├── get_weather.py
+        └── recall_home_location.py
 ```
 
 ## Runtime Agent
