@@ -1958,7 +1958,7 @@ def initiate_memory():
     )
     # actor_id is the sanitized/aliased memory identity (not raw email)
     if not namespace:
-        namespace = f"/users/{actor_id}"
+        namespace = f"/users/{actor_id}/preferences"
     logger.info(
         f"memory_id: {memory_id}, actor_id: {actor_id}, "
         f"session_id: {session_id}, namespace: {namespace}"
@@ -1968,14 +1968,12 @@ def initiate_memory():
         memory_id = agentcore_memory.retrieve_memory_id()
         if memory_id is None:
             logger.info("Memory will be created...")
-            memory_id = agentcore_memory.create_memory(namespace, actor_id)
+            memory_id = agentcore_memory.create_memory()
             logger.info(f"Memory was created... {memory_id}")
 
-    agentcore_memory.create_strategy_if_not_exists(
-        memory_id=memory_id,
-        namespace=namespace,
-        strategy_name=actor_id,
-    )
+    # Shared strategies per memory_id (UserPreference / Summary / Semantic).
+    # Namespace templates use {actorId}/{sessionId} — not one strategy per user.
+    agentcore_memory.create_strategy_if_not_exists(memory_id)
 
 
 def save_to_memory(query, result):

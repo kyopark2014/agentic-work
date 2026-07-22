@@ -65,10 +65,12 @@ def _namespace_belongs_to_actor(namespace: str, actor_id: str) -> bool:
     """
     if not namespace or not actor_id:
         return False
+    if namespace == f"/users/{actor_id}/preferences":
+        return True
     if namespace == f"/users/{actor_id}":
         return True
     # Allow nested paths that include this actor as a path segment
-    # e.g. /users/{actorId}/preferences after formatting
+    # e.g. /users/{actorId}/preferences|/facts|/sessions/... after formatting
     parts = [p for p in namespace.split("/") if p]
     return actor_id in parts
 
@@ -80,7 +82,7 @@ def get_search_namespaces(
 ) -> List[str]:
     """
     Build namespaces to search for the current actor only.
-    Always includes the user profile namespace; strategy namespaces are included
+    Always includes the user preference namespace; strategy namespaces are included
     only when they resolve to this actor (literal /users/<other> are skipped).
     """
     namespaces: Set[str] = set()
@@ -92,8 +94,8 @@ def get_search_namespaces(
             f"Ignoring default_namespace not owned by actor {actor_id}: {default_namespace}"
         )
 
-    # Always include user profile preference namespace
-    user_profile_namespace = f"/users/{actor_id}"
+    # Leaf preference path — do NOT use bare /users/{actorId} (prefixes /facts and /sessions)
+    user_profile_namespace = f"/users/{actor_id}/preferences"
     namespaces.add(user_profile_namespace)
 
     try:
@@ -237,7 +239,7 @@ def recall_memory(
         # Execute the appropriate action
         action = (action or "retrieve").strip().lower()
         if action == "retrieve" and not (query or "").strip():
-            query = "집 회사 주소 통근 교통 선호 프로필 user preferences home office commute"
+            query = "집 회사 주소 통근 교통 선호 프로필 요약 사실 user preferences home office commute summary facts"
             logger.info(f"retrieve query was empty; using default profile query: {query}")
 
         logger.info(f"###### action: {action} ######")

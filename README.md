@@ -1638,7 +1638,7 @@ reduction_% = sum(cache_read) / sum(input + cache_creation + cache_read)
 1. 루트 [installer.py](./installer.py)가 Memory 실행 역할·Memory 리소스를 만들고 `memory_id` / `agentcore_memory_role`을 `application/config.json`·Runtime `config.json`에 기록합니다.
 2. Web UI에서 태스크의 Memory를 켜면 `memory_enabled=true`가 AgentCore Runtime payload로 전달됩니다 ([application/agentcore_client.py](./application/agentcore_client.py)).
 3. [runtime_agent/langgraph/agent.py](./runtime_agent/langgraph/agent.py)는 Memory가 켜져 있으면 MCP 목록에 `memory`를 넣고, 응답 후 `chat.save_to_memory(query, result)`로 event를 저장합니다.
-4. Agent는 대화 중 `recall_memory` 도구로 namespace `/users/{actorId}` 등에서 의미 검색·목록·단건 조회를 합니다.
+4. Agent는 대화 중 `recall_memory` 도구로 namespace `/users/{actorId}/preferences` 등에서 의미 검색·목록·단건 조회를 합니다.
 
 ```mermaid
 flowchart LR
@@ -1661,8 +1661,11 @@ flowchart LR
     (`CreateMemory`는 이 Condition이 없으면 `valid trust policy` ValidationException)
   - Permission: `bedrock:InvokeModel` / `InvokeModelWithResponseStream` (strategy 추출용 모델 호출)
 - **Memory** 이름: `projectName`의 `-` → `_` (예: `agentic_work`)  
-  - `customMemoryStrategy` + `userPreferenceOverride` (한국어 preference 추출 프롬프트)  
-  - namespace 예: `/users/installer` (생성 시), 런타임에는 `/users/{user_id}`  
+  - 공용 strategy 3개: **UserPreference** / **Summary** / **Semantic** (`customMemoryStrategy` + 한국어 override 프롬프트)  
+  - namespace 템플릿:  
+    - Preference: `/users/{actorId}/preferences` (leaf path — `/facts`·`/sessions`와 prefix 충돌 방지)  
+    - Summary: `/users/{actorId}/sessions/{sessionId}` (Summary는 `{sessionId}` 필수)  
+    - Semantic: `/users/{actorId}/facts`  
   - `event_expiry_days=365`, `memory_execution_role_arn` = 위 역할
 - 결과 키: `agentcore_memory_role`, `memory_id` → ECS Web UI와 Runtime 이미지 `config.json`에 복사
 
@@ -1713,7 +1716,7 @@ save_conversation_to_memory()
    2) Consolidation — 기존 long-term과 합치기(추가/갱신/스킵)
         │
         ▼
- Memory Record  ──► namespace (예: /users/{actorId})
+ Memory Record  ──► namespace (예: /users/{actorId}/preferences)
         │
         ▼
  recall_memory(retrieve) → RetrieveMemoryRecords (semantic search)
@@ -1728,16 +1731,37 @@ save_conversation_to_memory()
 
 #### Long-term (strategy + namespace)
 
-Memory 생성·초기화 시 `customMemoryStrategy` + `userPreferenceOverride`로 사용자 선호를 추출합니다. `memory_execution_role`이 strategy용 Bedrock 모델(`InvokeModel`)을 호출합니다. `initiate_memory()`는 strategy가 없으면 `create_strategy_if_not_exists(memory_id, namespace, strategy_name=user_id)`로 추가합니다. 추출 결과는 namespace(기본 `/users/{actorId}`)에 쌓이고, MCP `retrieve` / `list` 대상이 됩니다.
+Memory 생성·초기화 시 **memory_id당 공용 strategy 3개**를 둡니다. 사용자마다 strategy를 복제하지 않고, `{actorId}` / `{sessionId}` 템플릿으로 격리합니다. 변수는 `CreateEvent`의 `actor_id`·`session_id`(sanitize된 user id)로 치환됩니다.
+
+| Strategy | Override | Namespace 템플릿 | 용도 |
+|----------|----------|------------------|------|
+| **UserPreference** | `userPreferenceOverride` (extraction) | `/users/{actorId}/preferences` | 선호·프로필 |
+| **Summary** | `summaryOverride` (consolidation만) | `/users/{actorId}/sessions/{sessionId}` | 세션 대화 요약 (`{sessionId}` API 필수) |
+| **Semantic** | `semanticOverride` (extraction+consolidation) | `/users/{actorId}/facts` | 사실·지식 추출 |
+
+```text
+memory_id (예: agentic_work-…)
+  ├── UserPreference  → /users/{actorId}/preferences
+  ├── Summary         → /users/{actorId}/sessions/{sessionId}
+  └── Semantic        → /users/{actorId}/facts
+```
+
+`memory_execution_role`이 strategy용 Bedrock 모델(`InvokeModel`)을 호출합니다. `initiate_memory()`는 빠진 strategy가 있으면 `create_strategy_if_not_exists(memory_id)`로 추가합니다. 추출 결과는 위 namespace에 쌓이고, MCP `recall_memory`의 `retrieve` / `list`가 strategy namespace를 포맷해 검색합니다.
 
 Long-term 조회가 잘 되려면:
 
-- Memory에 **strategy가 붙어 있어야** 함 (installer / `initiate_memory`)
+- Memory에 **공용 strategy 3종**이 있어야 함 (installer / `initiate_memory`)
 - `memory_execution_role` trust·권한이 올바르고 추출 모델 호출이 가능해야 함
-- 사용자가 preference로 뽑힐 만한 내용을 말해야 함 (잡담만이면 record가 비거나 적을 수 있음)
+- Preference/Semantic은 추출할 만한 발화가 있어야 하고, Summary는 세션 대화가 쌓여야 함
 - 추출은 **비동기**이므로 event 직후가 아니라 잠시 뒤 `retrieve` / `list`로 확인
-- 검색 namespace가 strategy에 지정한 것과 일치해야 함 (`/users/{user_id}`)
+- 검색 시 해석된 namespace가 strategy 템플릿과 일치해야 함
 
+#### Limitation
+
+- **Memory당 strategy 최대 6개**: AgentCore Memory는 하나의 `memory_id`에 붙일 수 있는 strategy 수가 **최대 6개**입니다. 한도를 넘기면 `UpdateMemory`가 `ServiceQuotaExceededException` (`Resource limit exceeded for memory strategies … Max allowed: 6`)으로 실패합니다.
+- 이 한도는 **사용자 수**가 아니라 **strategy 종류**(UserPreference / Summary / Semantic / Episodic 등)에 대한 제한입니다. 사용자 격리는 strategy를 늘리는 게 아니라 namespace의 `{actorId}`로 합니다. 현재 기본 구성은 3개라 여유(최대 6)가 있습니다.
+- 과거 구현처럼 actor마다 strategy를 만들면 6명에서 막히고, 신규 사용자는 short-term(`CreateEvent`)만 되고 long-term 추출·`recall_memory`가 비게 됩니다.
+- **기존 Memory 마이그레이션**: actor 이름 strategy가 6개까지 채워진 경우, 미사용 strategy를 삭제한 뒤 Runtime을 재기동하면 `create_strategy_if_not_exists`가 `UserPreference` / `Summary` / `Semantic`을 추가합니다. 리터럴 `/users/<old_actor>`에 있던 과거 record는 그대로이며, 신규 추출부터 템플릿 경로로 쌓입니다.
 #### MCP `recall_memory`
 
 | 파일 | 역할 |
@@ -1761,7 +1785,7 @@ if chat.memory_enabled:
 
 도구 action:
 
-- **retrieve** — namespace들(기본 `/users/{actorId}` + strategy namespace)에 대한 semantic search (`RetrieveMemoryRecords`)
+- **retrieve** — namespace들(기본 `/users/{actorId}/preferences` + strategy namespace)에 대한 semantic search (`RetrieveMemoryRecords`)
 - **list** — 저장된 memory record 목록 (`ListMemoryRecords`)
 - **get** — `memory_record_id`로 단건 조회 (`GetMemoryRecord`)
 
