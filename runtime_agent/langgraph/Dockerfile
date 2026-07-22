@@ -16,6 +16,7 @@ RUN pip install bedrock-agentcore uv
 RUN pip install Pillow pytz tavily-python langchain-text-splitters
 RUN pip install requests beautifulsoup4
 RUN pip install python-docx openpyxl reportlab matplotlib pandas finance-datareader pypdf pdfplumber pyyaml
+RUN pip install colorama rich
 
 # Skills that use docx-js / pptxgenjs via bash/node (local install for require())
 RUN npm install docx pptxgenjs
