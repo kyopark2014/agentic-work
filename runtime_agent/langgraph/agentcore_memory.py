@@ -5,9 +5,9 @@ import sys
 import uuid
 import time
 
-from typing import Dict, Optional
 from bedrock_agentcore.memory import MemoryClient
 from datetime import datetime, timezone
+import re
 
 logging.basicConfig(
     level=logging.INFO,  # Default to INFO level
@@ -35,102 +35,73 @@ bedrock_region = config.get('region')
 projectName = config.get('projectName')
 agentcore_memory_role = config.get('agentcore_memory_role')
 
-memory_client = MemoryClient(region_name=bedrock_region)    
+memory_client = MemoryClient(region_name=bedrock_region)
+
+# AgentCore Memory namespace pattern:
+# [a-zA-Z0-9/*][a-zA-Z0-9-_/*]*(?::[a-zA-Z0-9-_/*]+)*[a-zA-Z0-9-_/*]*
+# Emails (@, .) are invalid and cause ValidationException on retrieve.
+_INVALID_ACTOR_CHARS = re.compile(r"[^a-zA-Z0-9_-]+")
+
+
+def sanitize_memory_actor_id(user_id: str) -> str:
+    """Make a user id safe for AgentCore Memory actor_id / namespace / strategy name."""
+    raw = (user_id or "").strip() or "default"
+    cleaned = _INVALID_ACTOR_CHARS.sub("_", raw).strip("_")
+    cleaned = re.sub(r"_+", "_", cleaned)
+    if not cleaned:
+        cleaned = "default"
+    if not re.match(r"^[a-zA-Z0-9]", cleaned):
+        cleaned = f"u_{cleaned}"
+    return cleaned[:128]
+
+
+def resolve_memory_actor_id(user_id: str) -> str:
+    """
+    Map application user_id → AgentCore Memory actor_id.
+
+    Optional config.json:
+      "memory_actor_aliases": {"kyopark2014@gmail.com": "ksdyb"}
+    Then sanitize so namespaces never contain @ / .
+    """
+    raw = (user_id or "").strip() or "default"
+    aliases = config.get("memory_actor_aliases") or {}
+    if isinstance(aliases, dict) and raw in aliases and aliases[raw]:
+        mapped = str(aliases[raw]).strip()
+        logger.info(f"memory actor alias: {raw!r} -> {mapped!r}")
+        raw = mapped
+    actor_id = sanitize_memory_actor_id(raw)
+    if actor_id != (user_id or "").strip():
+        logger.info(f"memory actor_id sanitized: {user_id!r} -> {actor_id!r}")
+    return actor_id
+
 
 def load_memory_variables(user_id: str):
-    memory_id = actor_id = session_id = namespace = None
-    try:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        agentcore_path = os.path.join(script_dir, f"user_{user_id}.json")
-        with open(agentcore_path, "r", encoding="utf-8") as f:
-            json_data = json.load(f)
+    """
+    Resolve AgentCore memory identifiers for a user.
 
-            if 'memory_id' in json_data:
-                memory_id = json_data['memory_id']
-                logger.info(f"memory_id: {memory_id}")
+    memory_id comes from config.json (installer) or is retrieved/created.
+    actor_id / namespace are derived from user_id (alias + sanitize).
+    session_id is ephemeral — no per-user JSON cache file.
+    """
+    actor_id = resolve_memory_actor_id(user_id)
+    session_id = uuid.uuid4().hex
+    namespace = f"/users/{actor_id}"
 
-            if 'actor_id' in json_data:
-                actor_id = json_data['actor_id']
-                logger.info(f"actor_id: {actor_id}")
-            
-            if 'session_id' in json_data:
-                session_id = json_data['session_id']
-                logger.info(f"session_id: {session_id}")
-            
-            if 'namespace' in json_data:
-                namespace = json_data['namespace']
-                logger.info(f"namespace: {namespace}")
-                
-    except Exception as e:        
-        logger.error(f"Error loading agentcore config: {e}")
-        pass
-
-    # actor_id is always the application user_id
-    actor_id = user_id
-    if session_id is None:
-        session_id = uuid.uuid4().hex
-    if namespace is None:
-        namespace = f"/users/{actor_id}"
-
-    # Prefer installer-written memory_id from config.json
-    if memory_id is None:
-        memory_id = config.get("memory_id")
-        if memory_id:
-            logger.info(f"memory_id from config.json: {memory_id}")
-
-    # If memory_id is None, try to retrieve existing memory or create a new one
-    if memory_id is None:
-        logger.info(f"memory_id is None, attempting to retrieve existing memory...")
+    memory_id = config.get("memory_id")
+    if memory_id:
+        logger.info(f"memory_id from config.json: {memory_id}")
+    else:
+        logger.info("memory_id is None, attempting to retrieve existing memory...")
         memory_id = retrieve_memory_id()
         if memory_id is None:
-            logger.info(f"No existing memory found, creating new memory...")
-            memory_id = create_memory(namespace, user_id)
-            update_memory_variables(user_id, memory_id=memory_id, actor_id=actor_id, session_id=session_id, namespace=namespace)
-        else:
-            update_memory_variables(user_id, memory_id=memory_id, actor_id=actor_id, session_id=session_id, namespace=namespace)
-    else:
-        update_memory_variables(user_id, memory_id=memory_id, actor_id=actor_id, session_id=session_id, namespace=namespace)
+            logger.info("No existing memory found, creating new memory...")
+            memory_id = create_memory(namespace, actor_id)
 
+    logger.info(
+        f"memory_id: {memory_id}, actor_id: {actor_id}, "
+        f"session_id: {session_id}, namespace: {namespace}"
+    )
     return memory_id, actor_id, session_id, namespace
-
-def update_memory_variables(
-    user_id: str,
-    memory_id: Optional[str]=None, 
-    actor_id: Optional[str]=None, 
-    session_id: Optional[str]=None, 
-    namespace: Optional[str]=None):
-    
-    logger.info(f"###### update_memory_variables ######")
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_path = os.path.join(script_dir, f"user_{user_id}.json")    
-    if os.path.exists(config_path):
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
-    else:
-        config = {}
-    
-    # Update config with new values
-    if memory_id is not None:
-        config['memory_id'] = memory_id
-    if actor_id is not None:
-        config['actor_id'] = actor_id
-    if session_id is not None:
-        config['session_id'] = session_id
-    else:
-        if 'session_id' in config:
-            session_id = config['session_id']        
-        if session_id is None:
-            session_id = uuid.uuid4().hex
-            config['session_id'] = session_id
-            
-    if namespace is not None:
-        config['namespace'] = namespace
-    
-    # Save to file
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=4)
-    
-    logger.info(f"config was updated to {config}")    
 
 # CUSTOM_PROMPT = (
 #     "You are tasked with analyzing conversations to extract the user's general preferences."
