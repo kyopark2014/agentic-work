@@ -21,6 +21,8 @@ from application.task_store_persistence import (
     persistent_db_path,
     restore_tasks_db,
 )
+from application import app_data_backend as app_data_backend
+from application import litellm_virtual_key as litellm_virtual_key
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,11 +43,22 @@ _WEB_DIST = os.path.join(_APPLICATION_DIR, "web", "dist")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     restore_tasks_db()
+    # Load virtual keys (S3-only when local + s3_bucket; no local file created).
+    try:
+        location = litellm_virtual_key.restore_virtual_key_store()
+        logger.info("LiteLLM virtual key store ready: %s", location)
+    except Exception:
+        logger.exception("Could not restore LiteLLM virtual_key store")
     init_db()
+    mode = app_data_backend.backend_mode()
     if persistence_enabled():
-        logger.info("Task store persistence enabled: %s", persistent_db_path())
+        logger.info(
+            "Task store persistence enabled (backend=%s): %s",
+            mode,
+            persistent_db_path(),
+        )
     else:
-        logger.info("Task store using local SQLite only")
+        logger.info("Task store using local SQLite only (backend=%s)", mode)
     yield
     flush_persist()
     logger.info("Task store shutdown persist complete")

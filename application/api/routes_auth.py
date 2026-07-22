@@ -40,6 +40,7 @@ class SessionResponse(BaseModel):
     user_id: str
     name: str | None = None
     picture: str | None = None
+    llm_gateway_ready: bool = False
 
 
 def _google_client_id() -> str:
@@ -164,6 +165,39 @@ def _set_user_cookie(response: Response, request: Request, user_id: str) -> None
     )
 
 
+def _has_litellm_virtual_key(user_id: str) -> bool:
+    try:
+        try:
+            from application import litellm_virtual_key
+        except ImportError:
+            import litellm_virtual_key
+
+        return bool(litellm_virtual_key.get_cached_virtual_key(user_id))
+    except Exception:
+        return False
+
+
+def _ensure_litellm_virtual_key(user_id: str) -> bool:
+    """Provision LiteLLM virtual key for email logins. Returns True when ready."""
+    try:
+        try:
+            from application import litellm_virtual_key
+        except ImportError:
+            import litellm_virtual_key
+
+        if not litellm_virtual_key.is_email_user_id(user_id):
+            return False
+        key = litellm_virtual_key.ensure_virtual_key_on_login(user_id)
+        if key:
+            logger.info("LiteLLM virtual key ready for %s", user_id)
+            return True
+        logger.warning("LiteLLM virtual key not available for %s", user_id)
+        return False
+    except Exception:
+        logger.exception("LiteLLM virtual key provisioning failed for %s", user_id)
+        return False
+
+
 @router.post("", response_model=SessionResponse)
 def set_session(body: SessionRequest, request: Request, response: Response) -> SessionResponse:
     credential = (body.credential or "").strip()
@@ -193,11 +227,14 @@ def set_session(body: SessionRequest, request: Request, response: Response) -> S
             )
         except Exception:
             logger.exception("Failed to record Google login event")
-        logger.info("Google login success: %s", user_id)
+
+        gateway_ready = _ensure_litellm_virtual_key(user_id)
+        logger.info("Google login success: %s (llm_gateway_ready=%s)", user_id, gateway_ready)
         return SessionResponse(
             user_id=user_id,
             name=(idinfo.get("name") or None),
             picture=(idinfo.get("picture") or None),
+            llm_gateway_ready=gateway_ready,
         )
 
     if local_user_id:
@@ -213,8 +250,13 @@ def set_session(body: SessionRequest, request: Request, response: Response) -> S
             task_store.record_login(local_user_id, method="local")
         except Exception:
             logger.exception("Failed to record local login event")
-        logger.warning("Local auth bypass login: %s", local_user_id)
-        return SessionResponse(user_id=local_user_id)
+        gateway_ready = _ensure_litellm_virtual_key(local_user_id)
+        logger.warning(
+            "Local auth bypass login: %s (llm_gateway_ready=%s)",
+            local_user_id,
+            gateway_ready,
+        )
+        return SessionResponse(user_id=local_user_id, llm_gateway_ready=gateway_ready)
 
     raise HTTPException(
         status_code=400, detail="credential, access_token, or user_id is required"
@@ -226,7 +268,10 @@ def get_session(request: Request) -> SessionResponse | None:
     user_id = (request.cookies.get(SESSION_COOKIE) or "").strip()
     if not user_id:
         return None
-    return SessionResponse(user_id=user_id)
+    return SessionResponse(
+        user_id=user_id,
+        llm_gateway_ready=_has_litellm_virtual_key(user_id),
+    )
 
 
 @router.delete("", status_code=204)

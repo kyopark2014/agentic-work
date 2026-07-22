@@ -44,6 +44,7 @@ function stabilizeMessageKeys(prev: Message[], next: Message[]): Message[] {
 
 export default function App() {
   const [userId, setUserId] = useState<string | null>(null);
+  const [llmGatewayReady, setLlmGatewayReady] = useState(false);
   const [authReady, setAuthReady] = useState(false);
   const [bootError, setBootError] = useState<string | null>(null);
   const [config, setConfig] = useState<AppConfig | null>(null);
@@ -94,6 +95,7 @@ export default function App() {
         const id = session?.user_id?.trim();
         if (id) {
           setUserId(id);
+          setLlmGatewayReady(Boolean(session?.llm_gateway_ready));
         }
       } catch (err) {
         uiError("boot failed", err);
@@ -129,6 +131,7 @@ export default function App() {
               skills: config.default_skills,
               mcp_servers: config.default_mcp_servers,
               memory_enabled: true,
+              llm_gateway_enabled: llmGatewayReady,
             });
           })();
         }
@@ -149,7 +152,27 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [userId, config, refreshTasks, loadMessages]);
+  }, [userId, config, refreshTasks, loadMessages, llmGatewayReady]);
+
+  // Auto-enable LLM Gateway on the active task when a per-user virtual key is ready.
+  useEffect(() => {
+    if (!llmGatewayReady || !activeTaskId) return;
+    const task = tasks.find((t) => t.id === activeTaskId);
+    if (!task || task.llm_gateway_enabled) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const updated = await api.patchTask(activeTaskId, { llm_gateway_enabled: true });
+        if (cancelled) return;
+        setTasks((prev) => sortTasks(prev.map((t) => (t.id === updated.id ? updated : t))));
+      } catch (err) {
+        uiError("auto-enable LLM Gateway failed", err);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [llmGatewayReady, activeTaskId, tasks]);
 
   useEffect(() => {
     if (activeTaskId) {
@@ -183,6 +206,7 @@ export default function App() {
     try {
       const session = await api.setSession(credential);
       setUserId(session.user_id.trim());
+      setLlmGatewayReady(Boolean(session.llm_gateway_ready));
       await refreshConfig();
     } catch (err) {
       setBootError(err instanceof Error ? err.message : String(err));
@@ -194,6 +218,7 @@ export default function App() {
     try {
       const session = await api.setSessionWithAccessToken(accessToken);
       setUserId(session.user_id.trim());
+      setLlmGatewayReady(Boolean(session.llm_gateway_ready));
       await refreshConfig();
     } catch (err) {
       setBootError(err instanceof Error ? err.message : String(err));
@@ -205,6 +230,7 @@ export default function App() {
     try {
       const session = await api.setLocalSession(id.trim());
       setUserId(session.user_id.trim());
+      setLlmGatewayReady(Boolean(session.llm_gateway_ready));
       await refreshConfig();
     } catch (err) {
       setBootError(err instanceof Error ? err.message : String(err));
@@ -226,6 +252,7 @@ export default function App() {
     tasksBootstrappedForUserRef.current = null;
     emptyTaskBootstrapRef.current = null;
     setUserId(null);
+    setLlmGatewayReady(false);
     setTasks([]);
     setActiveTaskId(null);
     setMessages([]);
@@ -244,7 +271,7 @@ export default function App() {
       mcp_servers: activeTask?.mcp_servers ?? config.default_mcp_servers,
       guardrail_enabled: activeTask?.guardrail_enabled ?? false,
       memory_enabled: activeTask?.memory_enabled ?? true,
-      llm_gateway_enabled: activeTask?.llm_gateway_enabled ?? false,
+      llm_gateway_enabled: activeTask?.llm_gateway_enabled ?? llmGatewayReady,
     });
     setTasks((prev) => [task, ...prev]);
     setActiveTaskId(task.id);
@@ -278,6 +305,7 @@ export default function App() {
       skills: config.default_skills,
       mcp_servers: config.default_mcp_servers,
       memory_enabled: true,
+      llm_gateway_enabled: llmGatewayReady,
     });
     setTasks([task]);
     setActiveTaskId(task.id);

@@ -74,25 +74,30 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  getSession: () => request<{ user_id: string } | null>("/api/session"),
+  getSession: () =>
+    request<{ user_id: string; llm_gateway_ready?: boolean } | null>("/api/session"),
   setSession: (credential: string) =>
-    request<{ user_id: string; name?: string | null; picture?: string | null }>(
-      "/api/session",
-      {
-        method: "POST",
-        body: JSON.stringify({ credential }),
-      },
-    ),
+    request<{
+      user_id: string;
+      name?: string | null;
+      picture?: string | null;
+      llm_gateway_ready?: boolean;
+    }>("/api/session", {
+      method: "POST",
+      body: JSON.stringify({ credential }),
+    }),
   setSessionWithAccessToken: (access_token: string) =>
-    request<{ user_id: string; name?: string | null; picture?: string | null }>(
-      "/api/session",
-      {
-        method: "POST",
-        body: JSON.stringify({ access_token }),
-      },
-    ),
+    request<{
+      user_id: string;
+      name?: string | null;
+      picture?: string | null;
+      llm_gateway_ready?: boolean;
+    }>("/api/session", {
+      method: "POST",
+      body: JSON.stringify({ access_token }),
+    }),
   setLocalSession: (user_id: string) =>
-    request<{ user_id: string }>("/api/session", {
+    request<{ user_id: string; llm_gateway_ready?: boolean }>("/api/session", {
       method: "POST",
       body: JSON.stringify({ user_id }),
     }),

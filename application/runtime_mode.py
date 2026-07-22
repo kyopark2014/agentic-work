@@ -44,19 +44,51 @@ def run_agent(
     llm_gateway_enabled=None,
     files=None,
 ):
-    """Dispatch agent calls to AgentCore runtime only."""
+    """Dispatch agent calls to AgentCore runtime only.
+
+    If the user has a LiteLLM virtual key, LLM Gateway is enabled automatically.
+    On missing key / errors, fall back to the caller toggle + shared config key.
+    """
     from application import agentcore_client
     from application import utils as app_utils
 
     if not use_agentcore_runtime():
         raise RuntimeError("AgentCore runtime is required for agent execution")
 
-    gateway_url = ""
+    cfg = app_utils.load_config()
+    gateway_url = (cfg.get("llm_gateway_url") or "").strip().rstrip("/")
     gateway_key = ""
-    if llm_gateway_enabled:
-        cfg = app_utils.load_config()
-        gateway_url = (cfg.get("llm_gateway_url") or "").strip().rstrip("/")
+    effective_enabled = bool(llm_gateway_enabled)
+
+    try:
+        try:
+            from application import litellm_virtual_key
+        except ImportError:
+            import litellm_virtual_key
+
+        user_key = litellm_virtual_key.get_cached_virtual_key(user_id)
+        if not user_key and litellm_virtual_key.is_email_user_id(user_id):
+            user_key = litellm_virtual_key.resolve_virtual_key_for_email(user_id)
+        if user_key:
+            gateway_key = user_key
+            effective_enabled = True
+            logger.info("LLM Gateway enabled via per-user virtual key for %s", user_id)
+    except Exception as e:
+        logger.warning(
+            "Per-user LiteLLM virtual key unavailable; using existing gateway settings: %s",
+            e,
+        )
+
+    if effective_enabled and not gateway_key:
         gateway_key = (cfg.get("llm_gateway_key") or "").strip()
+
+    if effective_enabled and not (gateway_url and gateway_key):
+        logger.warning(
+            "LLM Gateway requested but url/key missing; falling back to Bedrock"
+        )
+        effective_enabled = False
+        gateway_url = ""
+        gateway_key = ""
 
     return agentcore_client.run_agent(
         prompt,
@@ -68,7 +100,7 @@ def run_agent(
         skill_list=skill_list,
         guardrail_enabled=guardrail_enabled,
         memory_enabled=memory_enabled,
-        llm_gateway_enabled=llm_gateway_enabled,
+        llm_gateway_enabled=effective_enabled,
         llm_gateway_url=gateway_url or None,
         llm_gateway_key=gateway_key or None,
         files=files,

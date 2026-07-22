@@ -2111,6 +2111,7 @@ def delete_secrets(skip_confirmation: bool = False) -> bool:
     secret_names = [
         "tavilyapikey",
         "notionapikey",
+        "litellmmapikey",
     ]
 
     if not skip_confirmation:
@@ -2120,7 +2121,7 @@ def delete_secrets(skip_confirmation: bool = False) -> bool:
             print(f"  - {secret_name}")
         print("=" * 60)
         response = input(
-            "\nDelete shared Tavily/Notion API key secrets? (yes/no) [no]: "
+            "\nDelete shared Tavily/Notion/LiteLLM API key secrets? (yes/no) [no]: "
         ).strip().lower()
         if response != "yes":
             logger.info(
@@ -2272,7 +2273,7 @@ def main():
         "--delete-shared-secrets",
         action="store_true",
         help=(
-            "Delete shared tavilyapikey/notionapikey secrets without a separate "
+            "Delete shared tavilyapikey/notionapikey/litellmmapikey secrets without a separate "
             "confirmation prompt (default: ask, default answer no)"
         ),
     )

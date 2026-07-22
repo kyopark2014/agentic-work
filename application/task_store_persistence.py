@@ -1,20 +1,17 @@
-"""Persist tasks.db via S3 Files using the working-copy + restore/persist pattern."""
+"""Persist tasks.db via S3 Files mount or direct S3 (local) using working-copy pattern."""
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import shutil
 import sqlite3
 import threading
 
+from application import app_data_backend as backend
+
 logger = logging.getLogger("task_store_persistence")
 
-_APPLICATION_DIR = os.path.dirname(os.path.abspath(__file__))
-_DEFAULT_WORKING_DIR = os.path.join(_APPLICATION_DIR, "data")
-_DEFAULT_MOUNT = "/mnt/app-data"
-_APP_DATABASE_SEGMENT = "application-database"
 _PERSIST_DEBOUNCE_SECONDS = 20.0
 
 _persist_lock = threading.Lock()
@@ -22,56 +19,26 @@ _persist_timer: threading.Timer | None = None
 _persist_dirty = False
 
 
-def _load_project_name() -> str:
-    env_name = os.environ.get("TASK_DB_PROJECT", "").strip()
-    if env_name:
-        return env_name
-
-    config_json = os.environ.get("APP_CONFIG_JSON", "").strip()
-    if config_json:
-        try:
-            project = json.loads(config_json).get("projectName")
-            if isinstance(project, str) and project.strip():
-                return project.strip()
-        except json.JSONDecodeError:
-            pass
-
-    config_path = os.path.join(_APPLICATION_DIR, "config.json")
-    try:
-        with open(config_path, encoding="utf-8") as handle:
-            project = json.load(handle).get("projectName")
-            if isinstance(project, str) and project.strip():
-                return project.strip()
-    except (OSError, json.JSONDecodeError):
-        pass
-
-    return "agentic-work"
-
-
 def mount_dir() -> str:
-    return os.environ.get("TASK_DB_MOUNT", _DEFAULT_MOUNT).strip() or _DEFAULT_MOUNT
+    return backend.mount_dir()
 
 
 def persistence_enabled() -> bool:
-    path = mount_dir()
-    return os.path.isdir(path) and os.access(path, os.W_OK)
+    """True when durable storage is available (mount or S3)."""
+    return backend.backend_mode() in {"mount", "s3"}
 
 
 def working_db_path() -> str:
-    custom = os.environ.get("TASK_DB_WORKING_PATH", "").strip()
-    if custom:
-        return custom
-    return os.path.join(_DEFAULT_WORKING_DIR, "tasks.db")
+    return backend.working_tasks_db_path()
 
 
 def persistent_db_path() -> str:
-    project_name = _load_project_name()
-    return os.path.join(
-        mount_dir(),
-        _APP_DATABASE_SEGMENT,
-        project_name,
-        "tasks.db",
-    )
+    """Mount path for ECS; for S3 mode returns the logical s3:// URI for logs."""
+    mode = backend.backend_mode()
+    if mode == "s3":
+        bucket, _ = backend.s3_bucket_and_region()
+        return f"s3://{bucket}/{backend.tasks_db_s3_key()}"
+    return backend.persistent_tasks_db_path()
 
 
 def _db_ready(path: str) -> bool:
@@ -110,20 +77,13 @@ def _remove_db_files(path: str) -> None:
             logger.warning("Could not remove %s: %s", candidate, exc)
 
 
-def restore_tasks_db() -> None:
-    """Prepare working tasks.db from S3 Files or start fresh when persistence is enabled."""
-    working = working_db_path()
-    persistent = persistent_db_path()
-    if not persistence_enabled():
-        logger.info("Task DB persistence disabled (no writable mount at %s)", mount_dir())
-        return
-
+def _restore_from_mount(working: str, persistent: str) -> None:
     os.makedirs(os.path.dirname(working), exist_ok=True)
 
     if _db_ready(persistent):
         _remove_db_files(working)
         _copy_db_files(persistent, working)
-        logger.info("Restored task DB from S3 Files: %s -> %s", persistent, working)
+        logger.info("Restored task DB from S3 Files mount: %s -> %s", persistent, working)
         return
 
     if os.path.isfile(persistent):
@@ -143,15 +103,82 @@ def restore_tasks_db() -> None:
         _remove_db_files(working)
 
 
+def _restore_from_s3(working: str) -> None:
+    bucket, region = backend.s3_bucket_and_region()
+    if not bucket:
+        return
+    key = backend.tasks_db_s3_key()
+    os.makedirs(os.path.dirname(working), exist_ok=True)
+
+    tmp = working + ".s3download"
+    try:
+        if backend.download_s3_file(bucket, key, tmp, region) and _db_ready(tmp):
+            _remove_db_files(working)
+            os.replace(tmp, working)
+            # Drop stale WAL/SHM from a previous local session.
+            for suffix in ("-wal", "-shm"):
+                side = working + suffix
+                if os.path.isfile(side):
+                    os.remove(side)
+            logger.info("Restored task DB from S3: s3://%s/%s -> %s", bucket, key, working)
+            return
+        logger.info(
+            "No S3 task DB at s3://%s/%s; using local working DB %s",
+            bucket,
+            key,
+            working,
+        )
+    finally:
+        if os.path.isfile(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def restore_tasks_db() -> None:
+    """Prepare working tasks.db from mount or S3 when durable storage is available."""
+    working = working_db_path()
+    mode = backend.backend_mode()
+
+    if mode == "mount":
+        _restore_from_mount(working, backend.persistent_tasks_db_path())
+        return
+
+    if mode == "s3":
+        _restore_from_s3(working)
+        return
+
+    logger.info(
+        "Task DB persistence disabled (no mount at %s and no s3_bucket); local only",
+        mount_dir(),
+    )
+
+
+def _persist_to_mount(working: str, persistent: str) -> None:
+    _checkpoint_sqlite(working)
+    _copy_db_files(working, persistent)
+    logger.info("Persisted task DB to S3 Files mount: %s -> %s", working, persistent)
+
+
+def _persist_to_s3(working: str) -> None:
+    bucket, region = backend.s3_bucket_and_region()
+    if not bucket:
+        return
+    _checkpoint_sqlite(working)
+    # Upload main DB only (WAL checkpointed into it).
+    backend.upload_s3_file(bucket, backend.tasks_db_s3_key(), working, region)
+
+
 def persist_tasks_db(*, force: bool = False) -> None:
-    """Flush the working SQLite DB to the S3 Files mount."""
+    """Flush the working SQLite DB to mount or S3."""
     global _persist_dirty
 
-    if not persistence_enabled():
+    mode = backend.backend_mode()
+    if mode == "local":
         return
 
     working = working_db_path()
-    persistent = persistent_db_path()
 
     with _persist_lock:
         if not force and not _persist_dirty:
@@ -162,19 +189,20 @@ def persist_tasks_db(*, force: bool = False) -> None:
             return
 
         try:
-            _checkpoint_sqlite(working)
-            _copy_db_files(working, persistent)
+            if mode == "mount":
+                _persist_to_mount(working, backend.persistent_tasks_db_path())
+            elif mode == "s3":
+                _persist_to_s3(working)
             _persist_dirty = False
-            logger.info("Persisted task DB to S3 Files: %s -> %s", working, persistent)
         except Exception:
-            logger.exception("Failed to persist task DB to %s", persistent)
+            logger.exception("Failed to persist task DB (%s)", mode)
 
 
 def schedule_persist() -> None:
     """Debounced persist after task/message mutations."""
     global _persist_timer, _persist_dirty
 
-    if not persistence_enabled():
+    if backend.backend_mode() == "local":
         return
 
     _persist_dirty = True

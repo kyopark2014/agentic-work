@@ -122,10 +122,11 @@ logger = setup_logging()
 
 
 def create_secrets() -> Dict[str, str]:
-    """Create shared Secrets Manager secrets for Tavily and Notion API keys.
+    """Create shared Secrets Manager secrets for Tavily, Notion, and LiteLLM keys.
 
-    Secret names are project-agnostic (tavilyapikey / notionapikey) so they
-    can be reused across projects in the same AWS account/region.
+    Secret names are project-agnostic (tavilyapikey / notionapikey / litellmmapikey)
+    so they can be reused across projects in the same AWS account/region.
+    Existing secrets are skipped (no overwrite, no re-prompt).
     """
     logger.info("Creating Secrets Manager secrets (shared across projects)")
     logger.info("Please enter API keys when prompted (press Enter to skip and leave empty):")
@@ -143,6 +144,13 @@ def create_secrets() -> Dict[str, str]:
             "description": "shared secret for notion api key (reusable across projects)",
             "secret_value": {
                 "notion_api_key": ""
+            }
+        },
+        "litellm": {
+            "name": "litellmmapikey",
+            "description": "shared secret for LiteLLM master key (reusable across projects)",
+            "secret_value": {
+                "litellm_master_key": "",
             }
         },
     }
@@ -164,6 +172,10 @@ def create_secrets() -> Dict[str, str]:
                     logger.info(f"Enter credential of {secret_config['name']} (Notion API Key):")
                     api_key = input(f"Creating {secret_config['name']} - Notion API Key: ").strip()
                     secret_config["secret_value"]["notion_api_key"] = api_key
+                elif key == "litellm":
+                    logger.info(f"Enter credential of {secret_config['name']} (LiteLLM Master Key):")
+                    api_key = input(f"Creating {secret_config['name']} - LiteLLM Master Key: ").strip()
+                    secret_config["secret_value"]["litellm_master_key"] = api_key
 
                 try:
                     response = secrets_client.create_secret(
@@ -7505,7 +7517,7 @@ def main():
     deployment_success = False
     
     try:
-        # 0. Create Secrets Manager secrets (Tavily / Notion API keys)
+        # 0. Create Secrets Manager secrets (Tavily / Notion / LiteLLM Master Key)
         create_secrets()
 
         # 1. Create S3 bucket
