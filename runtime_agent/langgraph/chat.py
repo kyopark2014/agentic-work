@@ -987,7 +987,7 @@ fileId = uuid.uuid4().hex
 ####################### LangChain #######################
 # Image Summarization
 #########################################################
-def summarize_image(image_content, prompt, st=None):
+def summarize_image(image_content: bytes, prompt: str) -> str:
     img = Image.open(BytesIO(image_content))
     
     width, height = img.size 
@@ -1032,40 +1032,13 @@ def summarize_image(image_content, prompt, st=None):
         logger.warning(f"Image still too large after {max_attempts} attempts: {base64_size} bytes")
         raise Exception(f"이미지 크기가 너무 큽니다. 5MB 이하의 이미지를 사용해주세요.")
 
-    def _status(message: str) -> None:
-        logger.info(f"status: {message}")
-        if st is not None and debug_mode == "Enable" and hasattr(st, "info"):
-            st.info(message)
-
-    # extract text from the image
-    _status("이미지에서 텍스트를 추출합니다.")
-
-    text = extract_text(img_base64)
-    logger.info(f"extracted text: {text}")
-
-    if text.find('<result>') != -1:
-        extracted_text = text[text.find('<result>')+8:text.find('</result>')] # remove <result> tag
-        # print('extracted_text: ', extracted_text)
-    else:
-        extracted_text = text
+    logger.info("이미지의 내용을 분석합니다.")
+    result = summary_image(img_base64, prompt)
     
-    _status(f"### 추출된 텍스트\n\n{extracted_text}")
-    _status("이미지의 내용을 분석합니다.")
-
-    image_summary = summary_image(img_base64, prompt)
-    
-    if text.find('<result>') != -1:
-        image_summary = image_summary[image_summary.find('<result>')+8:image_summary.find('</result>')]
-    logger.info(f"image summary: {image_summary}")
+    summary = result[result.find('<result>')+8:result.find('</result>')]
+    logger.info(f"image summary: {summary}")
             
-    # if len(extracted_text) > 10:
-    #     contents = f"## 이미지 분석\n\n{image_summary}\n\n## 추출된 텍스트\n\n{extracted_text}"
-    # else:
-    #     contents = f"## 이미지 분석\n\n{image_summary}"
-    contents = f"## 이미지 분석\n\n{image_summary}"
-    logger.info(f"image contents: {contents}")
-
-    return contents
+    return summary
 
 
 def _file_name_from_ref(file_ref: str) -> str:
@@ -1098,7 +1071,11 @@ def get_summary_of_uploaded_file(file_ref: str, prompt: str = "") -> str:
         logger.info(f"loading image from s3://{s3_bucket}/{s3_key}")
         image_obj = s3_client.get_object(Bucket=s3_bucket, Key=s3_key)
         image_content = image_obj["Body"].read()
-        return summarize_image(image_content, prompt or "", st=None)
+
+        image_summary_prompt = f"사용자의 요청을 참조하여 이미지의 내용을 분석한 후에 markdown 포맷으로 자세히 설명해주세요. 사용자 요청: <user_request>{prompt}</user_request>"
+        logger.info(f"image_summary_prompt: {image_summary_prompt}")
+
+        return summarize_image(image_content, image_summary_prompt)
 
     return f"지원하지 않는 파일 형식입니다: {file_type or '(unknown)'}"
 
