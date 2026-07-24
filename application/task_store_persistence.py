@@ -46,13 +46,19 @@ def _db_ready(path: str) -> bool:
 
 
 def _copy_db_files(source: str, destination: str) -> None:
+    """Copy DB bytes only (no metadata/xattrs).
+
+    S3 Files / NFS rejects os.setxattr with Errno 524 (EREMOTEIO). shutil.copy2
+    calls copystat → setxattr after a successful content copy, so persist always
+    failed even though the file body was written. Use shutil.copy instead.
+    """
     os.makedirs(os.path.dirname(destination), exist_ok=True)
-    shutil.copy2(source, destination)
+    shutil.copy(source, destination)
     for suffix in ("-wal", "-shm"):
         src = source + suffix
         dst = destination + suffix
         if os.path.isfile(src):
-            shutil.copy2(src, dst)
+            shutil.copy(src, dst)
         elif os.path.isfile(dst):
             os.remove(dst)
 
