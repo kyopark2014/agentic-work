@@ -259,6 +259,40 @@ def _build_tool_reference(ref_item: dict) -> dict:
     return result
 
 
+def _extract_rag_references_from_payload(json_data) -> list:
+    """Extract RAG {contents, reference} items from MCP tool payloads."""
+    refs = []
+    if isinstance(json_data, dict):
+        # Dict iteration yields keys; only accept real RAG items as values.
+        if "reference" in json_data and "contents" in json_data:
+            refs.append(_build_tool_reference(json_data))
+            return refs
+        for value in json_data.values():
+            if isinstance(value, dict) and "reference" in value and "contents" in value:
+                refs.append(_build_tool_reference(value))
+        return refs
+
+    if not isinstance(json_data, list):
+        return refs
+
+    for item in json_data:
+        if not isinstance(item, dict):
+            continue
+        # MCP content block: {"type": "text", "text": "<json string of docs>"}
+        if "text" in item and ("type" not in item or item.get("type") == "text"):
+            text_val = item.get("text")
+            if isinstance(text_val, str):
+                try:
+                    text_json = json.loads(text_val)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                refs.extend(_extract_rag_references_from_payload(text_json))
+            continue
+        if "reference" in item and "contents" in item:
+            refs.append(_build_tool_reference(item))
+    return refs
+
+
 def get_tool_info(tool_name, tool_content):
     tool_references = []    
     urls = []
@@ -576,17 +610,9 @@ def get_tool_info(tool_name, tool_content):
                 else:
                     urls.append(path)            
 
-            if isinstance(json_data, dict):
-                for item in json_data:
-                    logger.info(f"item: {item}")
-                    if "reference" in item and "contents" in item:
-                        tool_references.append(_build_tool_reference(item))
-            else:
-                logger.info(f"json_data is not a dict: {json_data}")
-
-                for item in json_data:
-                    if "reference" in item and "contents" in item:
-                        tool_references.append(_build_tool_reference(item))
+            # RAG retrieve returns MCP blocks: [{"type":"text","text":"[{contents,reference}...]"}]
+            extracted = _extract_rag_references_from_payload(json_data)
+            tool_references.extend(extracted)
                 
             logger.info(f"tool_references: {tool_references}")
 

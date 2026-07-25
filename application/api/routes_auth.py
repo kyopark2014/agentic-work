@@ -11,9 +11,11 @@ from pydantic import BaseModel, Field
 try:
     from application import utils
     from application import session_cookie
+    from application import cloudfront_cookies
 except ImportError:
     import utils
     import session_cookie
+    import cloudfront_cookies
 
 logger = logging.getLogger("routes_auth")
 
@@ -158,14 +160,18 @@ def _cookie_secure(request: Request) -> bool:
 
 def _set_user_cookie(response: Response, request: Request, user_id: str) -> None:
     token = session_cookie.sign_session(user_id)
+    secure = _cookie_secure(request)
+    max_age = session_cookie.session_max_age_seconds()
     response.set_cookie(
         key=SESSION_COOKIE,
         value=token,
         httponly=True,
         samesite="lax",
-        secure=_cookie_secure(request),
-        max_age=session_cookie.session_max_age_seconds(),
+        secure=secure,
+        max_age=max_age,
     )
+    # Same CloudFront host serves /artifacts|/docs|/images from S3 with TrustedKeyGroups.
+    cloudfront_cookies.set_signed_cookies(response, secure=secure, max_age=max_age)
 
 
 def get_optional_user_id(request: Request) -> str | None:
@@ -272,10 +278,16 @@ def set_session(body: SessionRequest, request: Request, response: Response) -> S
 
 
 @router.get("", response_model=SessionResponse | None)
-def get_session(request: Request) -> SessionResponse | None:
+def get_session(request: Request, response: Response) -> SessionResponse | None:
     user_id = get_optional_user_id(request)
     if not user_id:
         return None
+    # Refresh CloudFront signed cookies while the session is still valid.
+    cloudfront_cookies.set_signed_cookies(
+        response,
+        secure=_cookie_secure(request),
+        max_age=session_cookie.session_max_age_seconds(),
+    )
     return SessionResponse(
         user_id=user_id,
         llm_gateway_ready=_has_litellm_virtual_key(user_id),
@@ -284,11 +296,13 @@ def get_session(request: Request) -> SessionResponse | None:
 
 @router.delete("", status_code=204)
 def clear_session(request: Request, response: Response) -> None:
+    secure = _cookie_secure(request)
     response.delete_cookie(
         key=SESSION_COOKIE,
         samesite="lax",
-        secure=_cookie_secure(request),
+        secure=secure,
     )
+    cloudfront_cookies.clear_signed_cookies(response, secure=secure)
 
 
 def require_user_id(request: Request) -> str:

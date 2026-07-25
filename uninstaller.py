@@ -58,6 +58,7 @@ vector_index_name = project_name
 vector_bucket_name = f"{project_name}-{account_id}"
 ALB_ORIGIN_HEADER_SECRET_NAME = f"{project_name}/cloudfront-alb-origin-header"
 SESSION_SIGNING_KEY_SECRET_NAME = f"{project_name}/session-signing-key"
+CLOUDFRONT_SIGNING_KEY_SECRET_NAME = f"{project_name}/cloudfront-signing-key"
 
 # Configure logging
 def setup_logging():
@@ -2183,6 +2184,24 @@ def delete_session_signing_key_secret() -> None:
             logger.warning(f"  Could not delete secret {secret_name}: {e}")
 
 
+def delete_cloudfront_signing_key_secret() -> None:
+    """Delete CloudFront signed-cookie RSA key material from Secrets Manager."""
+    logger.info("Deleting CloudFront signing key secret")
+    secret_name = CLOUDFRONT_SIGNING_KEY_SECRET_NAME
+    try:
+        secretsmanager_client.delete_secret(
+            SecretId=secret_name,
+            ForceDeleteWithoutRecovery=True,
+        )
+        logger.info(f"  ✓ Deleted Secrets Manager secret: {secret_name}")
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("ResourceNotFoundException", "ResourceNotFound"):
+            logger.info(f"  Secret not found: {secret_name}")
+        else:
+            logger.warning(f"  Could not delete secret {secret_name}: {e}")
+
+
 def delete_user_access_cloudwatch_dashboard() -> None:
     """Delete the application user-access CloudWatch dashboard if present."""
     logger.info("Deleting CloudWatch user-access dashboard")
@@ -2375,6 +2394,7 @@ def main():
         delete_secrets(skip_confirmation=args.delete_shared_secrets)
         delete_alb_origin_header_secret()
         delete_session_signing_key_secret()
+        delete_cloudfront_signing_key_secret()
         delete_iam_roles(
             delete_agentcore_gateway_role=agentcore_gateway_deleted,
             delete_agentcore_memory_role=agentcore_memory_deleted,

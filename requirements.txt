@@ -35,6 +35,7 @@ aiosqlite
 pyyaml
 Pillow
 pytz
+cryptography
 
 # Data / charts (runtime trade_info MCP, code interpreter)
 pandas

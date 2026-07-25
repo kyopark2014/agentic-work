@@ -2031,6 +2031,22 @@ SG만으로는 공격자가 **자체 CloudFront**를 ALB DNS에 연결해 우회
 
 삭제 시 `uninstaller.py`의 `delete_alb_origin_header_secret()`이 해당 시크릿을 제거합니다.
 
+### CloudFront Signed Cookies (S3 `/artifacts` · `/docs` · `/images`)
+
+`sharing_url`로 내려주는 파일 링크는 같은 CloudFront 도메인의 S3 오리진 path입니다. 이 path를 인터넷에 공개하지 않기 위해 **CloudFront Signed Cookies**를 사용합니다.
+
+| 항목 | 내용 |
+|------|------|
+| 대상 behavior | `/artifacts/*`, `/docs/*`, `/images/*` — `TrustedKeyGroups` 필수 |
+| 키 재료 | Secrets Manager `{project_name}/cloudfront-signing-key` (RSA) → CloudFront Public Key + Key Group |
+| ECS | env `CLOUDFRONT_KEY_PAIR_ID`, `CLOUDFRONT_SIGNING_PRIVATE_KEY` |
+| 쿠키 | 로그인·`GET /api/session` 시 `CloudFront-Policy` / `CloudFront-Signature` / `CloudFront-Key-Pair-Id` 발급 (로그아웃 시 삭제) |
+| 사용자 경험 | 로그인 후 Web UI의 `sharing_url` 링크를 그대로 클릭하면 파일 열림. 쿠키 없으면 **403** |
+| 구현 | [application/cloudfront_cookies.py](./application/cloudfront_cookies.py), [application/api/routes_auth.py](./application/api/routes_auth.py), installer `get_or_create_cloudfront_signing_material()` / `ensure_cloudfront_s3_signed_cookies()` |
+| 삭제 | `uninstaller.delete_cloudfront_signing_key_secret()` |
+
+기본 ALB behavior(앱 API·SPA)에는 TrustedKeyGroups를 걸지 않습니다. HMAC 세션 쿠키와 Signed Cookies는 역할이 다릅니다(앱 인증 vs S3 정적 파일 접근).
+
 ### HMAC session cookie
 
 Web UI 세션은 평문 `user_id` 쿠키가 아니라 **HMAC 서명 토큰**입니다. 쿠키 값을 임의 이메일로 바꿔도 서명이 맞지 않아 401이 납니다.

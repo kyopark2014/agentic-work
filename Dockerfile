@@ -19,6 +19,7 @@ RUN pip install \
     python-multipart \
     uvicorn[standard] \
     boto3 \
+    cryptography \
     langchain_aws \
     langchain-openai \
     langchain-anthropic \
