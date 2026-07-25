@@ -2034,7 +2034,60 @@ installer가 만드는 **런타임 역할** 요약:
 | Websearch Gateway Role | `SourceAccount`/`SourceArn` 조건 유지 |
 | S3 Files 정책 | Access Point ARN condition 유지 |
 
-OpenSearch data access principal에서는 계정 `root`를 빼고 installer 실행자·KB role만 허용합니다.
+### OpenSearch Serverless (AOSS)
+
+Knowledge Base 벡터 스토어로 OpenSearch Serverless collection(`VECTORSEARCH`)을 사용합니다. 접근은 **네트워크 정책 · data access policy · IAM** 세 계층으로 제어하며, 계정 `root`를 data access principal에 넣지 않습니다.
+
+#### 정책 구성 (`installer.py`)
+
+| 정책 | 이름 예 | 내용 |
+|------|---------|------|
+| Encryption | `enc-{project}-{region}` | AWS owned key |
+| Network | `net-{project}-{region}` | collection + **dashboard** 모두 `AllowFromPublic: true` (인증은 data access/IAM에 위임) |
+| Data access | `data-{project}` | collection/index 권한을 **명시적 Principal**에만 부여 |
+
+Data access에 들어가는 Principal (`_opensearch_data_access_principals`):
+
+| Principal | 용도 |
+|-----------|------|
+| installer 실행 IAM | 인덱스 생성·배포. assume-role(SSO 포함)은 `iam:GetRole`로 **path 포함 full role ARN** 사용 |
+| IAM Identity Center 콘솔 역할 (`AWSReservedSSO_*`) | 브라우저 OpenSearch Dashboards 로그인. CLI가 IAM user여도 콘솔 SSO가 동작하도록 자동 포함 |
+| Knowledge Base role | Bedrock KB → AOSS 데이터 플레인 |
+| EC2 role (선택) | 인자로 넘긴 경우만 |
+
+관련 함수: `_get_installer_iam_arn()`, `_opensearch_identity_center_role_arns()`, `_ensure_opensearch_data_access_principals()`.
+
+KB IAM 인라인 정책의 `aoss:APIAccessAll`은 `Resource: "*"`가 아니라 `arn:aws:aoss:{region}:{account}:collection/*`로 한정합니다.
+
+#### Dashboards 접근
+
+Dashboards URL 예:
+
+`https://{collection-id}.{region}.aoss.amazonaws.com/_dashboards`
+
+브라우저 접속이 되려면 아래가 **모두** 필요합니다.
+
+1. Network policy에 dashboard `AllowFromPublic`(또는 VPC endpoint)
+2. Data access Principal에 **콘솔에 로그인한 IAM/SSO role ARN** 포함
+3. 해당 주체의 IAM에 `aoss:APIAccessAll` + `aoss:DashboardsAccessAll`
+
+CLI access key(`arn:aws:iam::…:user/…`)와 콘솔 SSO(`arn:aws:sts::…:assumed-role/AWSReservedSSO_…/…`)는 서로 다른 principal입니다. data access에 user만 있고 SSO role이 없으면 Dashboards는 `unauthorized.html` / “You don’t have authorization to access dashboards”로 실패하고, API(SigV4)는 성공할 수 있습니다. installer는 Identity Center 역할을 자동으로 넣어 이 불일치를 막습니다.
+
+콘솔 실제 ARN 확인 (CloudShell):
+
+```bash
+aws sts get-caller-identity
+```
+
+assume-role이면 data access에는 세션 ARN이 아니라 기본 role ARN(예: `arn:aws:iam::ACCOUNT:role/aws-reserved/sso.amazonaws.com/REGION/AWSReservedSSO_…`)을 넣습니다.
+
+#### 하지 않는 것
+
+- data access에 `arn:aws:iam::{account}:root` 재추가 (계정 내 임의 IAM이 Dashboards/데이터에 접근 가능)
+- KB role에 `aoss:APIAccessAll`을 `Resource: "*"`로 복원
+- 네트워크만 열어 두고 data access를 느슨하게 두는 구성
+
+레거시 collection에 `root`가 남아 있으면 Dashboards는 열리지만 least privilege에 맞지 않습니다. 신규 배포는 `root` 없이 installer가 넣는 principal만 사용하세요.
 
 > `use_aws` MCP로 임의 AWS API를 호출하려면 Runtime 역할에 해당 서비스 권한을 **별도**로 추가해야 합니다. 기본 정책은 앱 필수 경로만 허용합니다.
 
