@@ -446,16 +446,25 @@ def upload_file_to_s3(filepath: str) -> str:
         if not os.path.exists(full_path):
             return f"File not found: {filepath}"
 
+        # Align with Runtime IAM: only CF-shared prefixes (not agentcore-sessions/).
+        key = filepath.lstrip("/")
+        allowed_prefixes = ("artifacts/", "images/", "docs/")
+        if not key.startswith(allowed_prefixes):
+            return (
+                "Upload rejected: S3 key must start with "
+                f"{', '.join(allowed_prefixes)} (got {key!r})"
+            )
+
         content_type = utils.get_contents_type(filepath)
         s3 = boto3.client("s3", region_name=config.get("region", "us-west-2"))
 
         with open(full_path, "rb") as f:
-            s3.put_object(Bucket=s3_bucket, Key=filepath, Body=f.read(), ContentType=content_type)
+            s3.put_object(Bucket=s3_bucket, Key=key, Body=f.read(), ContentType=content_type)
 
         if sharing_url:
-            url = f"{sharing_url}/{url_parse.quote(filepath)}"
+            url = f"{sharing_url}/{url_parse.quote(key)}"
             return f"Upload complete: {url}"
-        return f"Upload complete: {chat.s3_uri_to_console_url(f"s3://{s3_bucket}/{filepath}", config.get("region", "us-west-2"))}"
+        return f"Upload complete: {chat.s3_uri_to_console_url(f"s3://{s3_bucket}/{key}", config.get("region", "us-west-2"))}"
 
     except Exception as e:
         return f"Upload failed: {str(e)}"

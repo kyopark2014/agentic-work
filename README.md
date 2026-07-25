@@ -2079,7 +2079,7 @@ installer가 만드는 **런타임 역할** 요약:
 |------|-----------|
 | ECS Task Role (`role-ecs-task-for-…`) | Bedrock Invoke/Mantle/KB ingest, AgentCore `InvokeAgentRuntime`을 **config 스캔 runtime ARN**으로 한정, 프로젝트 S3 버킷만 |
 | Knowledge Base Role | `bedrock:InvokeModel`(+inference profile), 프로젝트 S3 Get/List, `aoss:APIAccessAll`을 `collection/*`로 한정 |
-| AgentCore Runtime Role (`AmazonBedrockAgentCoreRuntimePolicyFor…`) | Trust: `bedrock-agentcore` + `SourceAccount`/`SourceArn`(프로젝트 runtime). 권한: 프로젝트 runtime ARN, 공유 Secret(`tavilyapikey*`·`notionapikey*`), 프로젝트 S3, Gateway/workload-identity, VPC ENI·ECR·로그 |
+| AgentCore Runtime Role (`AmazonBedrockAgentCoreRuntimePolicyFor…`) | Trust: `bedrock-agentcore` + `SourceAccount`/`SourceArn`(프로젝트 runtime). 권한: 프로젝트 runtime ARN, 공유 Secret(`tavilyapikey*`·`notionapikey*`만 Allow; `litellmmapikey*`·signing/gateway key는 Deny), 프로젝트 S3는 `artifacts/`·`images/`·`docs/`만 Allow하고 `agentcore-sessions/`(tasks.db·virtual_key.json)는 Deny, Gateway/workload-identity, VPC ENI·ECR·로그. Checkpoint는 `s3files:` 마운트로 유지 |
 | Websearch Gateway Role | `SourceAccount`/`SourceArn` 조건 유지 |
 | S3 Files 정책 | Access Point ARN condition 유지 |
 

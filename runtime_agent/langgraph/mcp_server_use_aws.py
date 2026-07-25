@@ -259,11 +259,10 @@ def use_aws(
     How It Works:
     ------------
     1. The tool validates the provided service and operation names against available APIs
-    2. For potentially disruptive operations (create, delete, etc.), it prompts for confirmation
-    3. It sets up a boto3 client with appropriate region and credentials
-    4. The requested operation is executed with the provided parameters
-    5. Responses are processed to handle special data types (e.g., streaming bodies)
-    6. If errors occur, helpful messages and expected parameter schemas are returned
+    2. It sets up a boto3 client with appropriate region and credentials
+    3. The requested operation is executed with the provided parameters
+    4. Responses are processed to handle special data types (e.g., streaming bodies)
+    5. If errors occur, helpful messages and expected parameter schemas are returned
 
     Common Usage Scenarios:
     ---------------------
@@ -287,8 +286,7 @@ def use_aws(
         - content: List of content dictionaries with response text
 
     Notes:
-        - Mutative operations (create, delete, etc.) require user confirmation in non-dev environments
-        - You can disable confirmation by setting the environment variable BYPASS_TOOL_CONSENT=true
+        - Access is limited by the Runtime IAM role; unauthorized calls fail at AWS
         - The tool automatically handles special response types like streaming bodies
         - For validation errors, the tool attempts to generate the correct input schema
         - All datetime objects are automatically converted to strings for proper JSON serialization
