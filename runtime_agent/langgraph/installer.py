@@ -341,23 +341,90 @@ def create_bedrock_agentcore_policy(config):
     region = config['region']
     accountId = config['accountId']
     projectName = config.get('projectName', 'agentcore')
+    gateway_region = config.get(
+        "agentcore_websearch_gateway_region",
+        config.get("agentcore_gateway_region", "us-east-1"),
+    )
+    s3_bucket = config.get(
+        "s3_bucket",
+        f"storage-for-{projectName}-{accountId}-{region}",
+    )
     
     policy_name = f"AmazonBedrockAgentCoreRuntimePolicyFor{projectName}"
     policy_description = f"Policy for accessing Bedrock AgentCore Runtime endpoints"
     
-    # Comprehensive policy document for Bedrock AgentCore access
     policy_document = {
         "Version": "2012-10-17",
         "Statement": [
             {
-                "Sid": "BedrockAgentAccess",
+                "Sid": "BedrockAgentCoreRuntime",
                 "Effect": "Allow",
                 "Action": [
-                    "bedrock-agentcore:*"
+                    "bedrock-agentcore:GetWorkloadAccessToken",
+                    "bedrock-agentcore:GetWorkloadAccessTokenForJWT",
+                    "bedrock-agentcore:GetWorkloadAccessTokenForUserId",
+                    "bedrock-agentcore:InvokeGateway",
+                    "bedrock-agentcore:InvokeWebSearch",
                 ],
                 "Resource": [
-                    "*"
-                ]
+                    f"arn:aws:bedrock-agentcore:{region}:{accountId}:*",
+                    f"arn:aws:bedrock-agentcore:{gateway_region}:{accountId}:gateway/*",
+                    (
+                        f"arn:aws:bedrock-agentcore:{gateway_region}:"
+                        f"aws:tool/web-search.v1"
+                    ),
+                ],
+            },
+            {
+                # ListGateways is account-scoped; IAM requires Resource "*".
+                "Sid": "ListAgentCoreGateways",
+                "Effect": "Allow",
+                "Action": [
+                    "bedrock-agentcore:ListGateways",
+                    "bedrock-agentcore-control:ListGateways",
+                ],
+                "Resource": ["*"],
+            },
+            {
+                "Sid": "GetAgentCoreGateway",
+                "Effect": "Allow",
+                "Action": [
+                    "bedrock-agentcore:GetGateway",
+                    "bedrock-agentcore-control:GetGateway",
+                ],
+                "Resource": [
+                    f"arn:aws:bedrock-agentcore:{gateway_region}:{accountId}:gateway/*",
+                ],
+            },
+            {
+                "Sid": "BedrockModelInvoke",
+                "Effect": "Allow",
+                "Action": [
+                    "bedrock:InvokeModel",
+                    "bedrock:InvokeModelWithResponseStream",
+                    "bedrock:GetInferenceProfile",
+                    "bedrock:GetFoundationModel",
+                    "bedrock:ApplyGuardrail",
+                    "bedrock:GetGuardrail",
+                    "bedrock:Retrieve",
+                    "bedrock:RetrieveAndGenerate",
+                ],
+                "Resource": [
+                    "arn:aws:bedrock:*::foundation-model/*",
+                    f"arn:aws:bedrock:*:{accountId}:inference-profile/*",
+                    f"arn:aws:bedrock:{region}:{accountId}:guardrail/*",
+                    f"arn:aws:bedrock:{region}:{accountId}:guardrail-profile/*",
+                    f"arn:aws:bedrock:{region}:{accountId}:knowledge-base/*",
+                ],
+            },
+            {
+                "Sid": "BedrockListRead",
+                "Effect": "Allow",
+                "Action": [
+                    "bedrock:ListGuardrails",
+                    "bedrock:ListKnowledgeBases",
+                ],
+                "Resource": ["*"],
             },
             {
                 "Sid": "BedrockMantleAccess",
@@ -382,37 +449,28 @@ def create_bedrock_agentcore_policy(config):
                 "Resource": "*"
             },
             {
-                "Sid": "SecretsManagerAccess",
+                "Sid": "SecretsManagerRead",
                 "Effect": "Allow",
                 "Action": [
                     "secretsmanager:GetSecretValue",
                     "secretsmanager:DescribeSecret",
-                    "secretsmanager:UpdateSecret",
-                    "secretsmanager:CreateSecret",
-                    "secretsmanager:PutSecretValue"
                 ],
                 "Resource": [
-                    f"arn:aws:secretsmanager:{region}:*:secret:{projectName}/cognito/credentials*",
-                    f"arn:aws:secretsmanager:{region}:*:secret:{projectName}/credentials*",
-                    f"arn:aws:secretsmanager:{region}:*:secret:tavilyapikey*",
-                    f"arn:aws:secretsmanager:{region}:*:secret:notionapikey*",
+                    f"arn:aws:secretsmanager:{region}:{accountId}:secret:tavilyapikey-{projectName}*",
+                    f"arn:aws:secretsmanager:{region}:{accountId}:secret:tavilyapikey*",
+                    f"arn:aws:secretsmanager:{region}:{accountId}:secret:notionapikey*",
+                    f"arn:aws:secretsmanager:{region}:{accountId}:secret:{projectName}/cognito/credentials*",
+                    f"arn:aws:secretsmanager:{region}:{accountId}:secret:{projectName}/credentials*",
                 ]
             },
             {
-                "Sid": "CognitoAccess",
-                "Effect": "Allow",
-                "Action": [
-                    "cognito-idp:*"
-                ],
-                "Resource": "*"
-            },
-            {
-                "Sid": "ECRAccess",
+                "Sid": "ECRImagePull",
                 "Effect": "Allow",
                 "Action": [
                     "ecr:GetAuthorizationToken",
                     "ecr:BatchGetImage",
                     "ecr:GetDownloadUrlForLayer",
+                    "ecr:BatchCheckLayerAvailability",
                     "ecr:DescribeRepositories",
                     "ecr:ListImages",
                     "ecr:DescribeImages"
@@ -430,62 +488,63 @@ def create_bedrock_agentcore_policy(config):
                     "logs:DescribeLogStreams"
                 ],
                 "Resource": [
-                    f"arn:aws:logs:{region}:*:log-group:/aws/bedrock-agentcore/*",
-                    f"arn:aws:logs:{region}:*:log-group:/aws/bedrock-agentcore/*:log-stream:*"
+                    f"arn:aws:logs:{region}:{accountId}:log-group:/aws/bedrock-agentcore/*",
+                    f"arn:aws:logs:{region}:{accountId}:log-group:/aws/bedrock-agentcore/*:log-stream:*"
                 ]
             },
             {
-                "Sid": "CloudWatchAccess",
+                "Sid": "CloudWatchMetricsAndXRay",
                 "Effect": "Allow",
                 "Action": [
-                    'cloudwatch:ListMetrics',
-                    'cloudwatch:GetMetricData',
-                    'cloudwatch:GetMetricStatistics',
-                    'cloudwatch:GetMetricWidgetImage',
-                    'cloudwatch:PutMetricData',
-                    'xray:PutTraceSegments',
-                    'xray:PutTelemetryRecords',
-                    'xray:PutAttributes',
-                    'xray:GetTraceSummaries',
-                    'logs:CreateLogGroup',
-                    'logs:DescribeLogStreams', 
-                    'logs:DescribeLogGroups', 
-                    'logs:CreateLogStream', 
-                    'logs:PutLogEvents'
+                    "cloudwatch:PutMetricData",
+                    "xray:PutTraceSegments",
+                    "xray:PutTelemetryRecords",
+                    "xray:PutAttributes",
                 ],
                 "Resource": "*"
             },
             {
-                "Sid": "BedrockGuardrailAccess",
+                "Sid": "ProjectS3Bucket",
                 "Effect": "Allow",
                 "Action": [
-                    "bedrock:GetGuardrail",
-                    "bedrock:ListGuardrails",
-                    "bedrock:ApplyGuardrail"
+                    "s3:ListBucket",
+                    "s3:GetBucketLocation",
                 ],
                 "Resource": [
-                    f"arn:aws:bedrock:{region}:{accountId}:guardrail/*"
+                    f"arn:aws:s3:::{s3_bucket}"
                 ]
             },
             {
-                "Sid": "S3Access",
+                "Sid": "ProjectS3Objects",
                 "Effect": "Allow",
                 "Action": [
-                    "s3:*",
-                    "bedrock:*"
+                    "s3:GetObject",
+                    "s3:PutObject",
+                    "s3:DeleteObject",
                 ],
-                "Resource": "*"
+                "Resource": [
+                    f"arn:aws:s3:::{s3_bucket}/*"
+                ]
             },
             {
-                "Sid": "EC2Access",
+                "Sid": "VpcNetworkInterface",
                 "Effect": "Allow",
                 "Action": [
-                    "ec2:*"
+                    "ec2:CreateNetworkInterface",
+                    "ec2:CreateNetworkInterfacePermission",
+                    "ec2:DeleteNetworkInterface",
+                    "ec2:DescribeNetworkInterfaces",
+                    "ec2:DescribeSubnets",
+                    "ec2:DescribeSecurityGroups",
+                    "ec2:DescribeVpcs",
+                    "ec2:AssignPrivateIpAddresses",
+                    "ec2:UnassignPrivateIpAddresses",
                 ],
                 "Resource": "*"
             }
         ]
     }
+
 
     file_system_id = config.get("s3_files_file_system_id")
     access_point_arn = config.get("s3_files_access_point_arn")

@@ -30,6 +30,16 @@ logger.info(f"workingDir: {workingDir}")
 logger.info(f"contents_dir: {contents_dir}")
 
 def get_agentcore_gateway_mcp_url(gateway_name: str, gateway_region: str) -> str | None:
+    # Prefer URL already written by the root installer (avoids ListGateways on every request).
+    configured_url = (
+        config.get("agentcore_websearch_gateway_url")
+        or os.environ.get("agentcore_websearch_gateway_url")
+        or ""
+    ).strip()
+    if gateway_name == "gateway-websearch" and configured_url:
+        logger.info(f"Using configured AgentCore gateway URL for {gateway_name}")
+        return configured_url.rstrip("/")
+
     client = boto3.client("bedrock-agentcore-control", region_name=gateway_region)
     try:
         response = client.list_gateways()
@@ -44,6 +54,8 @@ def get_agentcore_gateway_mcp_url(gateway_name: str, gateway_region: str) -> str
         logger.error(f"Error resolving AgentCore gateway URL for {gateway_name}: {e}")
 
     return None
+
+
 
 def load_config(mcp_type):
     if mcp_type == "knowledge base":

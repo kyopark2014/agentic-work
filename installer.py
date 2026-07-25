@@ -377,372 +377,221 @@ def attach_inline_policy(role_name: str, policy_name: str, policy_document: Dict
         raise
 
 
+def delete_inline_policies_if_present(role_name: str, policy_names: List[str]) -> None:
+    """Remove obsolete inline policies when present (ignore missing)."""
+    for policy_name in policy_names:
+        try:
+            iam_client.delete_role_policy(RoleName=role_name, PolicyName=policy_name)
+            logger.info(f"  Removed obsolete inline policy {policy_name} from {role_name}")
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "NoSuchEntity":
+                raise
+
+
+def _project_s3_bucket_arns() -> Tuple[str, str]:
+    """Return (bucket ARN, object ARN) for the project storage bucket."""
+    bucket_arn = f"arn:aws:s3:::{bucket_name}"
+    return bucket_arn, f"{bucket_arn}/*"
+
+
 def create_knowledge_base_role() -> str:
-    """Create Knowledge Base IAM role."""
+    """Create Knowledge Base IAM role with least-privilege policies."""
     logger.info("[2/10] Creating Knowledge Base IAM role")
     role_name = f"role-knowledge-base-for-{project_name}-{region}"
     
-    assume_role_policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Principal": {
-                    "Service": "bedrock.amazonaws.com"
-                },
-                "Action": "sts:AssumeRole"
-            }
-        ]
-    }
+    assume_role_policy = _bedrock_knowledge_base_trust_policy()
     
     role_arn = create_iam_role(role_name, assume_role_policy)
-    
-    # Always attach/update inline policies (put_role_policy will create or update)
-    bedrock_invoke_policy = {
+    bucket_arn, object_arn = _project_s3_bucket_arns()
+
+    # Drop legacy broad/duplicate inline policies from earlier installs
+    delete_inline_policies_if_present(
+        role_name,
+        [
+            f"kb-bedrock-policy-for-{project_name}",
+            f"kb-opensearch-policy-for-{project_name}",
+            f"kb-opensearch-policy-for-{project_name}",
+            f"kb-s3-policy-for-{project_name}",
+            f"bedrock-agent-opensearch-policy-for-{project_name}",
+        ],
+    )
+
+    bedrock_policy = {
         "Version": "2012-10-17",
         "Statement": [
             {
+                "Sid": "InvokeEmbeddingModels",
                 "Effect": "Allow",
                 "Action": [
-                    "bedrock:*",
                     "bedrock:InvokeModel",
                     "bedrock:InvokeModelWithResponseStream",
                     "bedrock:GetInferenceProfile",
-                    "bedrock:GetFoundationModel"
+                    "bedrock:GetFoundationModel",
                 ],
                 "Resource": [
-                    "*",
+                    "arn:aws:bedrock:*::foundation-model/*",
                     f"arn:aws:bedrock:{region}:{account_id}:inference-profile/*",
                     f"arn:aws:bedrock:{region}:*:inference-profile/*",
-                    "arn:aws:bedrock:*::foundation-model/*"
-                ]
+                ],
             }
-        ]
+        ],
     }
-    attach_inline_policy(role_name, f"bedrock-invoke-policy-for-{project_name}", bedrock_invoke_policy)
-    
+    attach_inline_policy(role_name, f"kb-bedrock-policy-for-{project_name}", bedrock_policy)
+
     s3_policy = {
         "Version": "2012-10-17",
         "Statement": [
             {
+                "Sid": "ListKnowledgeBaseBucket",
                 "Effect": "Allow",
-                "Action": ["s3:*"],
-                "Resource": ["*"]
-            }
-        ]
+                "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+                "Resource": [bucket_arn],
+            },
+            {
+                "Sid": "ReadKnowledgeBaseObjects",
+                "Effect": "Allow",
+                "Action": ["s3:GetObject"],
+                "Resource": [object_arn],
+            },
+        ],
     }
-    attach_inline_policy(role_name, f"knowledge-base-s3-policy-for-{project_name}", s3_policy)
-
-    # Remove legacy S3 Vectors inline policy if upgrading from a previous install
-    try:
-        iam_client.delete_role_policy(
-            RoleName=role_name,
-            PolicyName=f"bedrock-agent-s3vectors-policy-for-{project_name}",
-        )
-    except ClientError:
-        pass
+    attach_inline_policy(role_name, f"kb-s3-policy-for-{project_name}", s3_policy)
 
     opensearch_policy = {
         "Version": "2012-10-17",
         "Statement": [
             {
+                "Sid": "OpenSearchServerlessAccess",
                 "Effect": "Allow",
                 "Action": ["aoss:APIAccessAll"],
-                "Resource": ["*"],
+                "Resource": [f"arn:aws:aoss:{region}:{account_id}:collection/*"],
             }
         ],
     }
-    attach_inline_policy(
-        role_name, f"bedrock-agent-opensearch-policy-for-{project_name}", opensearch_policy
-    )
+    attach_inline_policy(role_name, f"kb-opensearch-policy-for-{project_name}", opensearch_policy)
     
-    bedrock_policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Action": [
-                    "bedrock:*",
-                    "bedrock:GetInferenceProfile"
-                ],
-                "Resource": [
-                    "*",
-                    f"arn:aws:bedrock:{region}:*:inference-profile/*"
-                ]
-            }
-        ]
-    }
-    attach_inline_policy(role_name, f"bedrock-agent-bedrock-policy-for-{project_name}", bedrock_policy)
-    
+    wait_for_iam_role_propagation(role_name)
     return role_arn
 
 
-def create_agent_role() -> str:
-    """Create Agent IAM role."""
-    logger.info("[2/10] Creating Agent IAM role")
-    role_name = f"role-agent-for-{project_name}-{region}"
-    
-    assume_role_policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Principal": {
-                    "Service": "bedrock.amazonaws.com"
-                },
-                "Action": "sts:AssumeRole"
-            }
-        ]
-    }
-    
-    role_arn = create_iam_role(role_name, assume_role_policy, ["arn:aws:iam::aws:policy/AWSLambdaExecute"])
-    
-    # Always attach/update inline policies
-    bedrock_retrieve_policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Action": ["bedrock:Retrieve"],
-                "Resource": [f"arn:aws:bedrock:{region}:{account_id}:knowledge-base/*"]
-            }
-        ]
-    }
-    attach_inline_policy(role_name, f"bedrock-retrieve-policy-for-{project_name}", bedrock_retrieve_policy)
-    
-    inference_policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Action": [
-                    "bedrock:InvokeModel",
-                    "bedrock:InvokeModelWithResponseStream",
-                    "bedrock:GetInferenceProfile",
-                    "bedrock:GetFoundationModel"
-                ],
-                "Resource": [
-                    f"arn:aws:bedrock:{region}:{account_id}:inference-profile/*",
-                    "arn:aws:bedrock:*::foundation-model/*"
-                ]
-            }
-        ]
-    }
-    attach_inline_policy(role_name, f"agent-inference-policy-for-{project_name}", inference_policy)
-    
-    lambda_policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Action": ["lambda:InvokeFunction", "cloudwatch:*"],
-                "Resource": ["*"]
-            }
-        ]
-    }
-    attach_inline_policy(role_name, f"lambda-invoke-policy-for-{project_name}", lambda_policy)
-    
-    bedrock_policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Action": ["bedrock:*"],
-                "Resource": ["*"]
-            }
-        ]
-    }
-    attach_inline_policy(role_name, f"bedrock-policy-agent-for-{project_name}", bedrock_policy)
-    
-    return role_arn
-
-
-def _get_ecs_task_inline_policies(knowledge_base_role_arn: str, role_prefix: str) -> List[Dict]:
-    """Inline IAM policies shared by the ECS task role."""
+def _get_ecs_task_inline_policies() -> List[Dict]:
+    """Least-privilege inline IAM policies for the ECS task (Web UI) role."""
+    bucket_arn, object_arn = _project_s3_bucket_arns()
     return [
         {
-            "name": f"secret-manager-policy-{role_prefix}-for-{project_name}",
+            "name": f"ecs-task-bedrock-policy-for-{project_name}",
             "document": {
                 "Version": "2012-10-17",
                 "Statement": [
                     {
-                        "Effect": "Allow",
-                        "Action": ["secretsmanager:GetSecretValue"],
-                        "Resource": ["*"]
-                    }
-                ]
-            }
-        },
-        {
-            "name": f"bedrock-policy-{role_prefix}-for-{project_name}",
-            "document": {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Action": ["bedrock:*"],
-                        "Resource": ["*"]
-                    },
-                    {
+                        "Sid": "InvokeBedrockModels",
                         "Effect": "Allow",
                         "Action": [
                             "bedrock:InvokeModel",
-                            "bedrock:InvokeModelWithResponseStream"
+                            "bedrock:InvokeModelWithResponseStream",
+                            "bedrock:ApplyGuardrail",
+                            "bedrock:GetInferenceProfile",
+                            "bedrock:GetFoundationModel",
                         ],
                         "Resource": [
-                            "arn:aws:bedrock:*:*:inference-profile/*",
-                            "arn:aws:bedrock:us-west-2:*:foundation-model/*",
-                            "arn:aws:bedrock:us-east-1:*:foundation-model/*",
-                            "arn:aws:bedrock:us-east-2:*:foundation-model/*",
-                            "arn:aws:bedrock:ap-northeast-2:*:foundation-model/*"
-                        ]
-                    }
-                ]
-            }
-        },
-        {
-            "name": f"cost-explorer-policy-for-{project_name}",
-            "document": {
-                "Version": "2012-10-17",
-                "Statement": [
+                            "arn:aws:bedrock:*::foundation-model/*",
+                            f"arn:aws:bedrock:{region}:{account_id}:inference-profile/*",
+                            f"arn:aws:bedrock:*:{account_id}:inference-profile/*",
+                            f"arn:aws:bedrock:{region}:{account_id}:guardrail/*",
+                            f"arn:aws:bedrock:{region}:{account_id}:guardrail-profile/*",
+                        ],
+                    },
                     {
-                        "Effect": "Allow",
-                        "Action": ["ce:GetCostAndUsage"],
-                        "Resource": ["*"]
-                    }
-                ]
-            }
-        },
-        {
-            "name": f"lambda-invoke-policy-for-{project_name}",
-            "document": {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Action": ["lambda:InvokeFunction"],
-                        "Resource": ["*"]
-                    }
-                ]
-            }
-        },
-        {
-            "name": f"efs-policy-for-{project_name}",
-            "document": {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Action": ["ec2:DescribeFileSystems", "elasticfilesystem:DescribeFileSystems"],
-                        "Resource": ["*"]
-                    }
-                ]
-            }
-        },
-        {
-            "name": f"cognito-policy-for-{project_name}",
-            "document": {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
+                        "Sid": "KnowledgeBaseIngestion",
                         "Effect": "Allow",
                         "Action": [
-                            "cognito-idp:ListUserPools",
-                            "cognito-idp:DescribeUserPool",
-                            "cognito-idp:ListUserPoolClients",
-                            "cognito-idp:DescribeUserPoolClient"
+                            "bedrock:StartIngestionJob",
+                            "bedrock:ListIngestionJobs",
+                            "bedrock:GetIngestionJob",
                         ],
-                        "Resource": ["*"]
-                    }
-                ]
-            }
-        },
-        {
-            "name": f"bedrock-agentcore-policy-for-{project_name}",
-            "document": {
-                "Version": "2012-10-17",
-                "Statement": [
+                        "Resource": [
+                            f"arn:aws:bedrock:{region}:{account_id}:knowledge-base/*",
+                        ],
+                    },
                     {
-                        "Effect": "Allow",
-                        "Action": ["bedrock-agentcore:*"],
-                        "Resource": ["*"]
-                    }
-                ]
-            }
-        },
-        {
-            "name": f"pass-role-for-{project_name}",
-            "document": {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Action": ["iam:PassRole"],
-                        "Resource": [knowledge_base_role_arn]
-                    }
-                ]
-            }
-        },
-        {
-            "name": f"aoss-policy-for-{project_name}",
-            "document": {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Action": ["aoss:*"],
-                        "Resource": ["*"]
-                    }
-                ]
-            }
-        },
-        {
-            "name": f"getRole-policy-for-{project_name}",
-            "document": {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Action": ["iam:GetRole"],
-                        "Resource": ["*"]
-                    }
-                ]
-            }
-        },
-        {
-            "name": f"s3-bucket-access-policy-for-{project_name}",
-            "document": {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Action": ["s3:*"],
-                        "Resource": ["*"]
-                    }
-                ]
-            }
-        },
-        {
-            "name": f"cloudwatch-policy-for-{project_name}",
-            "document": {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
+                        "Sid": "BedrockMantleOpenAI",
                         "Effect": "Allow",
                         "Action": [
-                            "cloudwatch:*",
-                            "logs:*",
-                            "events:*"
+                            "bedrock-mantle:Get*",
+                            "bedrock-mantle:List*",
+                            "bedrock-mantle:CreateInference",
                         ],
-                        "Resource": ["*"]
-                    }
-                ]
-            }
+                        "Resource": [
+                            f"arn:aws:bedrock-mantle:*:{account_id}:project/*",
+                        ],
+                    },
+                    {
+                        "Sid": "BedrockMantleBearerToken",
+                        "Effect": "Allow",
+                        "Action": ["bedrock-mantle:CallWithBearerToken"],
+                        "Resource": ["*"],
+                    },
+                ],
+            },
+        },
+        {
+            "name": f"ecs-task-agentcore-policy-for-{project_name}",
+            "document": {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Sid": "InvokeAndGetAgentRuntime",
+                        "Effect": "Allow",
+                        "Action": [
+                            "bedrock-agentcore:InvokeAgentRuntime",
+                            "bedrock-agentcore:InvokeAgentRuntimeWithWebResponse",
+                            "bedrock-agentcore:GetAgentRuntime",
+                            "bedrock-agentcore-control:GetAgentRuntime",
+                        ],
+                        "Resource": [
+                            f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/*",
+                        ],
+                    },
+                    {
+                        "Sid": "ListAgentRuntimes",
+                        "Effect": "Allow",
+                        "Action": [
+                            "bedrock-agentcore:ListAgentRuntimes",
+                            "bedrock-agentcore-control:ListAgentRuntimes",
+                        ],
+                        "Resource": ["*"],
+                    },
+                ],
+            },
+        },
+        {
+            "name": f"ecs-task-s3-policy-for-{project_name}",
+            "document": {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Sid": "ListProjectBucket",
+                        "Effect": "Allow",
+                        "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+                        "Resource": [bucket_arn],
+                    },
+                    {
+                        "Sid": "ReadWriteProjectObjects",
+                        "Effect": "Allow",
+                        "Action": [
+                            "s3:GetObject",
+                            "s3:PutObject",
+                            "s3:DeleteObject",
+                        ],
+                        "Resource": [object_arn],
+                    },
+                ],
+            },
         },
     ]
 
 
-def create_ecs_roles(knowledge_base_role_arn: str) -> Dict[str, str]:
+def create_ecs_roles() -> Dict[str, str]:
     """Create ECS task role and task execution role."""
     logger.info("[2/10] Creating ECS IAM roles")
 
@@ -754,7 +603,7 @@ def create_ecs_roles(knowledge_base_role_arn: str) -> Dict[str, str]:
         "Statement": [
             {
                 "Effect": "Allow",
-                "Principal": {"Service": ["ecs-tasks.amazonaws.com", "bedrock.amazonaws.com"]},
+                "Principal": {"Service": "ecs-tasks.amazonaws.com"},
                 "Action": "sts:AssumeRole"
             }
         ]
@@ -777,13 +626,33 @@ def create_ecs_roles(knowledge_base_role_arn: str) -> Dict[str, str]:
         managed_policies=["arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"],
     )
 
-    for policy in _get_ecs_task_inline_policies(knowledge_base_role_arn, "ecs-task"):
+    # Remove broad policies from earlier installs before attaching least-privilege set
+    delete_inline_policies_if_present(
+        task_role_name,
+        [
+            f"secret-manager-policy-ecs-task-for-{project_name}",
+            f"bedrock-policy-ecs-task-for-{project_name}",
+            f"cost-explorer-policy-for-{project_name}",
+            f"lambda-invoke-policy-for-{project_name}",
+            f"efs-policy-for-{project_name}",
+            f"cognito-policy-for-{project_name}",
+            f"bedrock-agentcore-policy-for-{project_name}",
+            f"pass-role-for-{project_name}",
+            f"aoss-policy-for-{project_name}",
+            f"getRole-policy-for-{project_name}",
+            f"s3-bucket-access-policy-for-{project_name}",
+            f"cloudwatch-policy-for-{project_name}",
+        ],
+    )
+
+    for policy in _get_ecs_task_inline_policies():
         attach_inline_policy(task_role_name, policy["name"], policy["document"])
 
     return {
         "task_role_arn": task_role_arn,
         "execution_role_arn": execution_role_arn,
     }
+
 
 
 def _get_installer_iam_arn() -> str:
@@ -802,14 +671,22 @@ def _opensearch_data_access_principals(
 ) -> List[str]:
     """Principals that need OpenSearch Serverless data-plane access."""
     principals = [
-        f"arn:aws:iam::{account_id}:root",
         _get_installer_iam_arn(),
     ]
     if knowledge_base_role_arn:
         principals.append(knowledge_base_role_arn)
     if ec2_role_arn:
         principals.append(ec2_role_arn)
-    return principals
+    # De-duplicate while preserving order
+    seen = set()
+    unique = []
+    for principal in principals:
+        if principal and principal not in seen:
+            seen.add(principal)
+            unique.append(principal)
+    return unique
+
+
 
 
 def _build_opensearch_data_policy_document(
@@ -3050,9 +2927,10 @@ def create_alb(vpc_info: Dict[str, str]) -> Dict[str, str]:
 
 
 def create_lambda_role() -> str:
-    """Create Lambda RAG IAM role."""
+    """Create Lambda RAG IAM role (legacy helper; not used by main deploy path)."""
     logger.info("[2/10] Creating Lambda RAG IAM role")
     role_name = f"role-lambda-rag-for-{project_name}-{region}"
+    bucket_arn, object_arn = _project_s3_bucket_arns()
     
     assume_role_policy = {
         "Version": "2012-10-17",
@@ -3068,8 +2946,16 @@ def create_lambda_role() -> str:
     }
     
     role_arn = create_iam_role(role_name, assume_role_policy)
+
+    delete_inline_policies_if_present(
+        role_name,
+        [
+            f"tool-bedrock-invoke-policy-for-{project_name}",
+            f"tool-bedrock-agent-opensearch-policy-for-{project_name}",
+            f"tool-bedrock-agent-bedrock-policy-for-{project_name}",
+        ],
+    )
     
-    # Attach inline policies
     create_log_policy = {
         "Version": "2012-10-17",
         "Statement": [
@@ -3094,17 +2980,29 @@ def create_lambda_role() -> str:
     }
     attach_inline_policy(role_name, f"create-stream-log-policy-lambda-rag-for-{project_name}", create_log_stream_policy)
     
-    bedrock_invoke_policy = {
+    bedrock_policy = {
         "Version": "2012-10-17",
         "Statement": [
             {
+                "Sid": "InvokeModelsAndRetrieve",
                 "Effect": "Allow",
-                "Action": ["bedrock:*"],
-                "Resource": ["*"]
+                "Action": [
+                    "bedrock:InvokeModel",
+                    "bedrock:InvokeModelWithResponseStream",
+                    "bedrock:GetInferenceProfile",
+                    "bedrock:GetFoundationModel",
+                    "bedrock:Retrieve",
+                    "bedrock:RetrieveAndGenerate",
+                ],
+                "Resource": [
+                    "arn:aws:bedrock:*::foundation-model/*",
+                    f"arn:aws:bedrock:{region}:{account_id}:inference-profile/*",
+                    f"arn:aws:bedrock:{region}:{account_id}:knowledge-base/*",
+                ],
             }
-        ]
+        ],
     }
-    attach_inline_policy(role_name, f"tool-bedrock-invoke-policy-for-{project_name}", bedrock_invoke_policy)
+    attach_inline_policy(role_name, f"lambda-rag-bedrock-policy-for-{project_name}", bedrock_policy)
     
     opensearch_policy = {
         "Version": "2012-10-17",
@@ -3112,25 +3010,31 @@ def create_lambda_role() -> str:
             {
                 "Effect": "Allow",
                 "Action": ["aoss:APIAccessAll"],
-                "Resource": ["*"]
+                "Resource": [f"arn:aws:aoss:{region}:{account_id}:collection/*"],
             }
-        ]
+        ],
     }
-    attach_inline_policy(role_name, f"tool-bedrock-agent-opensearch-policy-for-{project_name}", opensearch_policy)
-    
-    bedrock_policy = {
+    attach_inline_policy(role_name, f"lambda-rag-opensearch-policy-for-{project_name}", opensearch_policy)
+
+    s3_policy = {
         "Version": "2012-10-17",
         "Statement": [
             {
                 "Effect": "Allow",
-                "Action": ["bedrock:*"],
-                "Resource": ["*"]
-            }
-        ]
+                "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+                "Resource": [bucket_arn],
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["s3:GetObject"],
+                "Resource": [object_arn],
+            },
+        ],
     }
-    attach_inline_policy(role_name, f"tool-bedrock-agent-bedrock-policy-for-{project_name}", bedrock_policy)
+    attach_inline_policy(role_name, f"lambda-rag-s3-policy-for-{project_name}", s3_policy)
     
     return role_arn
+
 
 
 def check_knowledge_base_exists() -> Optional[str]:
@@ -7619,8 +7523,7 @@ def main():
         
         # 2. Create IAM roles
         knowledge_base_role_arn = create_knowledge_base_role()
-        agent_role_arn = create_agent_role()
-        ecs_roles = create_ecs_roles(knowledge_base_role_arn)
+        ecs_roles = create_ecs_roles()
         agentcore_memory_role_arn = create_agentcore_memory_role()
         memory_id = create_agentcore_memory(agentcore_memory_role_arn)
         agentcore_websearch_gateway_info = _find_existing_agentcore_websearch_gateway()
