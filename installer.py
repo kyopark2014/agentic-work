@@ -377,16 +377,6 @@ def attach_inline_policy(role_name: str, policy_name: str, policy_document: Dict
         raise
 
 
-def delete_inline_policies_if_present(role_name: str, policy_names: List[str]) -> None:
-    """Remove obsolete inline policies when present (ignore missing)."""
-    for policy_name in policy_names:
-        try:
-            iam_client.delete_role_policy(RoleName=role_name, PolicyName=policy_name)
-            logger.info(f"  Removed obsolete inline policy {policy_name} from {role_name}")
-        except ClientError as e:
-            if e.response["Error"]["Code"] != "NoSuchEntity":
-                raise
-
 
 def _bedrock_knowledge_base_trust_policy() -> Dict:
     """Trust policy for Bedrock Knowledge Base service role (AWS recommended)."""
@@ -454,18 +444,6 @@ def create_knowledge_base_role() -> str:
     
     role_arn = create_iam_role(role_name, assume_role_policy)
     bucket_arn, object_arn = _project_s3_bucket_arns()
-
-    # Drop legacy broad/duplicate inline policies from earlier installs
-    delete_inline_policies_if_present(
-        role_name,
-        [
-            f"bedrock-invoke-policy-for-{project_name}",
-            f"bedrock-agent-bedrock-policy-for-{project_name}",
-            f"bedrock-agent-s3vectors-policy-for-{project_name}",
-            f"knowledge-base-s3-policy-for-{project_name}",
-            f"bedrock-agent-opensearch-policy-for-{project_name}",
-        ],
-    )
 
     bedrock_policy = {
         "Version": "2012-10-17",
@@ -675,25 +653,6 @@ def create_ecs_roles() -> Dict[str, str]:
         execution_role_name,
         execution_assume_role_policy,
         managed_policies=["arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"],
-    )
-
-    # Remove broad policies from earlier installs before attaching least-privilege set
-    delete_inline_policies_if_present(
-        task_role_name,
-        [
-            f"secret-manager-policy-ecs-task-for-{project_name}",
-            f"bedrock-policy-ecs-task-for-{project_name}",
-            f"cost-explorer-policy-for-{project_name}",
-            f"lambda-invoke-policy-for-{project_name}",
-            f"efs-policy-for-{project_name}",
-            f"cognito-policy-for-{project_name}",
-            f"bedrock-agentcore-policy-for-{project_name}",
-            f"pass-role-for-{project_name}",
-            f"aoss-policy-for-{project_name}",
-            f"getRole-policy-for-{project_name}",
-            f"s3-bucket-access-policy-for-{project_name}",
-            f"cloudwatch-policy-for-{project_name}",
-        ],
     )
 
     for policy in _get_ecs_task_inline_policies():
@@ -2998,14 +2957,6 @@ def create_lambda_role() -> str:
     
     role_arn = create_iam_role(role_name, assume_role_policy)
 
-    delete_inline_policies_if_present(
-        role_name,
-        [
-            f"tool-bedrock-invoke-policy-for-{project_name}",
-            f"tool-bedrock-agent-opensearch-policy-for-{project_name}",
-            f"tool-bedrock-agent-bedrock-policy-for-{project_name}",
-        ],
-    )
     
     create_log_policy = {
         "Version": "2012-10-17",

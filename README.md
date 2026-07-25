@@ -2009,7 +2009,7 @@ if __name__ == "__main__":
 2. **최소 Action** — `bedrock:*`, `s3:*`, `ec2:*` 같은 서비스 와일드카드를 쓰지 않고, Invoke·Retrieve·Get/Put 등 필요한 Action만 허용합니다.
 3. **Resource 스코프** — `Resource: "*"` 대신 프로젝트 S3 버킷, Knowledge Base, Runtime/Gateway ARN, AOSS `collection/*`, Tavily secret 등 **이 배포의 리소스**로 한정합니다.
 4. **조건·Trust 축소** — Gateway는 `SourceAccount`/`SourceArn`, S3 Files는 Access Point ARN condition, ECS Task trust는 `ecs-tasks.amazonaws.com`만 허용합니다.
-5. **죽은 권한 제거** — 미사용 역할(`create_agent_role`)과 CE/Lambda/Cognito 등 코드에서 쓰지 않는 정책을 제거하며, 재설치 시 구버전 광범위 inline policy를 삭제합니다.
+5. **죽은 권한 제거** — 미사용 역할(`create_agent_role`)과 CE/Lambda/Cognito 등 코드에서 쓰지 않는 정책을 제거합니다.
 
 installer가 만드는 **런타임 역할** 요약:
 
