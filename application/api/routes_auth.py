@@ -154,8 +154,30 @@ def verify_google_access_token(token: str, client_id: str) -> dict:
 
 
 def _cookie_secure(request: Request) -> bool:
-    proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "").lower()
-    return proto == "https"
+    # CloudFront→ALB is http-only, so ALB's X-Forwarded-Proto is often "http"
+    # even when the viewer used HTTPS. Prefer CloudFront's viewer proto, then
+    # treat CloudFront / sharing_url hosts as HTTPS viewers (custom domains too).
+    from urllib.parse import urlparse
+
+    proto = (
+        request.headers.get("cloudfront-forwarded-proto")
+        or request.headers.get("x-forwarded-proto")
+        or request.url.scheme
+        or ""
+    ).lower()
+    if proto == "https":
+        return True
+    host = (request.headers.get("host") or request.url.hostname or "").split(":")[0].lower()
+    if host.endswith(".cloudfront.net"):
+        return True
+    try:
+        sharing = (utils.load_config().get("sharing_url") or "").strip()
+        parsed = urlparse(sharing)
+        if parsed.scheme == "https" and (parsed.hostname or "").lower() == host:
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _set_user_cookie(response: Response, request: Request, user_id: str) -> None:
@@ -171,7 +193,12 @@ def _set_user_cookie(response: Response, request: Request, user_id: str) -> None
         max_age=max_age,
     )
     # Same CloudFront host serves /artifacts|/docs|/images from S3 with TrustedKeyGroups.
-    cloudfront_cookies.set_signed_cookies(response, secure=secure, max_age=max_age)
+    if not cloudfront_cookies.set_signed_cookies(
+        response, secure=secure, max_age=max_age
+    ):
+        logger.warning(
+            "CloudFront signed cookies not attached on login (signing material missing?)"
+        )
 
 
 def get_optional_user_id(request: Request) -> str | None:
@@ -283,11 +310,15 @@ def get_session(request: Request, response: Response) -> SessionResponse | None:
     if not user_id:
         return None
     # Refresh CloudFront signed cookies while the session is still valid.
-    cloudfront_cookies.set_signed_cookies(
+    if not cloudfront_cookies.set_signed_cookies(
         response,
         secure=_cookie_secure(request),
         max_age=session_cookie.session_max_age_seconds(),
-    )
+    ):
+        logger.warning(
+            "CloudFront signed cookies not attached on session refresh "
+            "(signing material missing?)"
+        )
     return SessionResponse(
         user_id=user_id,
         llm_gateway_ready=_has_litellm_virtual_key(user_id),
