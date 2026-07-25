@@ -56,6 +56,8 @@ distance_metric = "cosine"
 custom_header_name = "X-Custom-Header"
 # Origin header secret value lives in Secrets Manager (never hardcode in source).
 ALB_ORIGIN_HEADER_SECRET_NAME = f"{project_name}/cloudfront-alb-origin-header"
+# HMAC key for Web UI session cookies (never hardcode in source).
+SESSION_SIGNING_KEY_SECRET_NAME = f"{project_name}/session-signing-key"
 
 # Bedrock Knowledge Base requires these metadata keys as non-filterable on S3 Vectors index
 BEDROCK_NON_FILTERABLE_METADATA_KEYS = [
@@ -180,6 +182,60 @@ def get_or_create_alb_origin_header(*, rotate: bool = False) -> str:
                     SecretString=new_value,
                 )
                 logger.info(f"  ✓ Rotated ALB origin header in Secrets Manager: {secret_name}")
+                return new_value
+            response = secretsmanager_client.get_secret_value(SecretId=secret_name)
+            return response["SecretString"]
+        raise
+
+
+def get_or_create_session_signing_key(*, rotate: bool = False) -> str:
+    """
+    Return HMAC key for Web UI session cookies from Secrets Manager.
+
+    Generated once per project and injected into ECS as SESSION_SIGNING_KEY
+    (not embedded in APP_CONFIG_JSON).
+    """
+    secret_name = SESSION_SIGNING_KEY_SECRET_NAME
+
+    try:
+        existing = secretsmanager_client.get_secret_value(SecretId=secret_name)
+        current = (existing.get("SecretString") or "").strip()
+        if current and not rotate:
+            logger.info(f"  ✓ Reusing session signing key from Secrets Manager: {secret_name}")
+            return current
+        new_value = secrets.token_urlsafe(32)
+        secretsmanager_client.put_secret_value(
+            SecretId=secret_name,
+            SecretString=new_value,
+        )
+        logger.info(f"  ✓ Rotated session signing key in Secrets Manager: {secret_name}")
+        return new_value
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ResourceNotFoundException":
+            raise
+
+    new_value = secrets.token_urlsafe(32)
+    try:
+        secretsmanager_client.create_secret(
+            Name=secret_name,
+            Description=f"HMAC signing key for {project_name} Web UI session cookies",
+            SecretString=new_value,
+            Tags=[
+                {"Key": "Name", "Value": secret_name},
+                {"Key": "Project", "Value": project_name},
+            ],
+        )
+        logger.info(f"  ✓ Created session signing key secret: {secret_name}")
+        return new_value
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ResourceExistsException":
+            if rotate:
+                new_value = secrets.token_urlsafe(32)
+                secretsmanager_client.put_secret_value(
+                    SecretId=secret_name,
+                    SecretString=new_value,
+                )
+                logger.info(f"  ✓ Rotated session signing key in Secrets Manager: {secret_name}")
                 return new_value
             response = secretsmanager_client.get_secret_value(SecretId=secret_name)
             return response["SecretString"]
@@ -6218,6 +6274,8 @@ def deploy_ecs_service(
     if not origin_header_value:
         origin_header_value = get_or_create_alb_origin_header(rotate=False)
 
+    session_signing_key = get_or_create_session_signing_key(rotate=False)
+
     ensure_ecs_service_linked_role()
 
     if not vpc_info.get("ecs_sg_id"):
@@ -6241,7 +6299,11 @@ def deploy_ecs_service(
         {
             "name": "APP_CONFIG_JSON",
             "value": json.dumps(app_environment),
-        }
+        },
+        {
+            "name": "SESSION_SIGNING_KEY",
+            "value": session_signing_key,
+        },
     ]
     container_definition: Dict[str, object] = {
         "name": container_name,

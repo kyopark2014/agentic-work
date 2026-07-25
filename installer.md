@@ -199,6 +199,12 @@ Runtime은 access point ARN이 있으면 **`s3FilesAccessPoint` + VPC 모드**, 
 - **용도**: CloudFront → ALB 오리진 검증용 `X-Custom-Header` 값 (랜덤, 소스 하드코딩 없음)
 - **생성**: `get_or_create_alb_origin_header()` / 삭제: `uninstaller.delete_alb_origin_header_secret()`
 
+### 6.6. Secrets Manager (HMAC session signing key)
+- **이름**: `{project_name}/session-signing-key`
+- **용도**: Web UI `agent_user_id` 쿠키 HMAC-SHA256 서명 키
+- **주입**: ECS env `SESSION_SIGNING_KEY` (`APP_CONFIG_JSON`에는 포함하지 않음)
+- **생성**: `get_or_create_session_signing_key()` / 삭제: `uninstaller.delete_session_signing_key_secret()`
+
 ### 7. ECR (Elastic Container Registry)
 - **리포지토리**: `ecr-for-{project_name}`
 - **이미지 태그**: 배포 시각 기반 (`YYYYMMDDHHMMSS`) + ECR에서 `latest`로 promote
@@ -344,6 +350,7 @@ AgentCore Web Search gateway 및 managed web-search 타겟 생성/조회
 | `ensure_private_subnet_vpc_endpoints()` | ECR/Logs/Secrets/AgentCore/S3 엔드포인트 |
 | `ensure_alb_idle_timeout()` | ALB idle timeout 120초 |
 | `get_or_create_alb_origin_header()` | Secrets Manager 오리진 헤더 생성·재사용 |
+| `get_or_create_session_signing_key()` | Secrets Manager HMAC 세션 키 생성·재사용 → ECS `SESSION_SIGNING_KEY` |
 | `ensure_alb_listener_origin_protection()` | ALB default 403 + 커스텀 헤더 forward |
 | `_ensure_cloudfront_alb_origin_config()` / `_ensure_cloudfront_s3_path_behavior()` | CF 헤더·타임아웃·S3 path |
 | `_get_or_create_s3files_*` / `ensure_ecs_task_s3files_policy` | S3 Files 프로비저닝 |

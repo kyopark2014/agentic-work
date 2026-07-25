@@ -10,8 +10,10 @@ from pydantic import BaseModel, Field
 
 try:
     from application import utils
+    from application import session_cookie
 except ImportError:
     import utils
+    import session_cookie
 
 logger = logging.getLogger("routes_auth")
 
@@ -155,14 +157,20 @@ def _cookie_secure(request: Request) -> bool:
 
 
 def _set_user_cookie(response: Response, request: Request, user_id: str) -> None:
+    token = session_cookie.sign_session(user_id)
     response.set_cookie(
         key=SESSION_COOKIE,
-        value=user_id,
+        value=token,
         httponly=True,
         samesite="lax",
         secure=_cookie_secure(request),
-        max_age=60 * 60 * 24 * 365,
+        max_age=session_cookie.session_max_age_seconds(),
     )
+
+
+def get_optional_user_id(request: Request) -> str | None:
+    """Return verified user_id from the HMAC session cookie, or None."""
+    return session_cookie.verify_session(request.cookies.get(SESSION_COOKIE) or "")
 
 
 def _has_litellm_virtual_key(user_id: str) -> bool:
@@ -265,7 +273,7 @@ def set_session(body: SessionRequest, request: Request, response: Response) -> S
 
 @router.get("", response_model=SessionResponse | None)
 def get_session(request: Request) -> SessionResponse | None:
-    user_id = (request.cookies.get(SESSION_COOKIE) or "").strip()
+    user_id = get_optional_user_id(request)
     if not user_id:
         return None
     return SessionResponse(
@@ -284,7 +292,7 @@ def clear_session(request: Request, response: Response) -> None:
 
 
 def require_user_id(request: Request) -> str:
-    user_id = request.cookies.get(SESSION_COOKIE)
+    user_id = get_optional_user_id(request)
     if not user_id:
         raise HTTPException(status_code=401, detail="User session required")
     return user_id

@@ -507,6 +507,32 @@ def create_bedrock_agentcore_policy(config):
                 ],
             },
             {
+                # Runtime calls Memory data/control APIs for save (CreateEvent) and
+                # recall_memory (Retrieve/List/GetMemoryRecords, GetMemory strategies).
+                "Sid": "AgentCoreMemoryAccess",
+                "Effect": "Allow",
+                "Action": [
+                    "bedrock-agentcore:CreateEvent",
+                    "bedrock-agentcore:GetEvent",
+                    "bedrock-agentcore:ListEvents",
+                    "bedrock-agentcore:DeleteEvent",
+                    "bedrock-agentcore:RetrieveMemoryRecords",
+                    "bedrock-agentcore:ListMemoryRecords",
+                    "bedrock-agentcore:GetMemoryRecord",
+                    "bedrock-agentcore:ListActors",
+                    "bedrock-agentcore:ListSessions",
+                    "bedrock-agentcore:GetMemory",
+                    "bedrock-agentcore:UpdateMemory",
+                    "bedrock-agentcore-control:GetMemory",
+                    "bedrock-agentcore-control:UpdateMemory",
+                    "bedrock-agentcore-control:ListMemories",
+                ],
+                "Resource": [
+                    f"arn:aws:bedrock-agentcore:{region}:{accountId}:memory/*",
+                    f"arn:aws:bedrock-agentcore:{region}:{accountId}:memory/{projectName.replace('-', '_')}*",
+                ],
+            },
+            {
                 "Sid": "BedrockModelInvoke",
                 "Effect": "Allow",
                 "Action": [

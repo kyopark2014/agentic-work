@@ -410,7 +410,7 @@ Web UI는 **FastAPI 백엔드 + React SPA**로 구성됩니다. Streamlit을 대
 | **프론트엔드** | Vite 6 | 개발 서버·프로덕션 빌드 |
 | **프론트엔드** | react-markdown, remark-gfm | Assistant 응답 Markdown 렌더링 |
 | **프론트엔드** | CSS (`agent.css`) | 다크 테마 Agent 레이아웃 |
-| **인증** | HttpOnly Cookie (`agent_user_id`) | User ID 세션 유지 |
+| **인증** | HttpOnly Cookie (`agent_user_id`) + **HMAC-SHA256 서명** | 서버만 아는 키로 서명한 세션 토큰. 평문 `user_id` 쿠키는 거부 |
 
 ### 화면 구조
 
@@ -512,7 +512,8 @@ function MarkdownText({ content }: { content: string }) {
 | Method | Path | 설명 |
 |--------|------|------|
 | `GET` | `/api/health` | 헬스체크 |
-| `GET`/`POST` | `/api/session` | User ID 세션 조회·생성 (Cookie) |
+| `GET`/`POST` | `/api/session` | 세션 조회·생성. 쿠키는 HMAC 서명 토큰 (`v1.<payload>.<sig>`) |
+| `DELETE` | `/api/session` | 세션 쿠키 삭제 (로그아웃) |
 | `GET` | `/api/config` | Skill·MCP·Model 목록 및 기본값 |
 | `PATCH` | `/api/config/defaults` | 기본 Skill·MCP 저장 |
 | `GET`/`POST` | `/api/tasks` | 태스크 목록·생성 |
@@ -521,6 +522,22 @@ function MarkdownText({ content }: { content: string }) {
 | `POST` | `/api/tasks/{id}/chat` | 채팅 SSE 스트림 (`data: {...}`) |
 
 채팅 요청은 `agentcore_client.run_agent` → AgentCore Runtime으로 전달되며, 태스크마다 고유한 `runtime_session_id`로 checkpoint가 격리됩니다.
+
+### 세션 쿠키 (HMAC)
+
+`agent_user_id` 쿠키에는 이메일을 평문으로 넣지 않습니다. 로그인 성공 시 서버가 HMAC-SHA256으로 서명한 토큰을 발급하고, `require_user_id` / `GET /api/session`은 서명·만료를 검증한 뒤에만 `user_id`를 신뢰합니다.
+
+| 항목 | 내용 |
+|------|------|
+| 쿠키 이름 | `agent_user_id` (HttpOnly, SameSite=Lax, Secure on HTTPS) |
+| 토큰 형식 | `v1.<base64url(json)>.<base64url(hmac)>` — payload: `{uid, exp}` |
+| 서명 키 | Secrets Manager `{project_name}/session-signing-key` → ECS env `SESSION_SIGNING_KEY` |
+| 로컬 개발 | env 미설정 시 Secrets Manager 조회 후, 없으면 `application/data/.session_signing_key` 자동 생성 |
+| 유효기간 | 기본 **30일** (`SESSION_MAX_AGE_SECONDS`로 조정 가능) |
+| 레거시 | 평문 email 쿠키는 **거부** (재로그인 필요) |
+
+구현: [application/session_cookie.py](./application/session_cookie.py), [application/api/routes_auth.py](./application/api/routes_auth.py).  
+installer는 `get_or_create_session_signing_key()`로 키를 만들고 ECS 태스크 정의에 `SESSION_SIGNING_KEY`로 주입합니다 (`APP_CONFIG_JSON`에는 넣지 않음). 삭제 시 `uninstaller.delete_session_signing_key_secret()`.
 
 ### Local 빌드
 
@@ -2013,6 +2030,19 @@ SG만으로는 공격자가 **자체 CloudFront**를 ALB DNS에 연결해 우회
 | ALB listener | default action = **403 fixed-response**, 헤더 일치 시에만 target group으로 forward (`ensure_alb_listener_origin_protection`) |
 
 삭제 시 `uninstaller.py`의 `delete_alb_origin_header_secret()`이 해당 시크릿을 제거합니다.
+
+### HMAC session cookie
+
+Web UI 세션은 평문 `user_id` 쿠키가 아니라 **HMAC 서명 토큰**입니다. 쿠키 값을 임의 이메일로 바꿔도 서명이 맞지 않아 401이 납니다.
+
+| 항목 | 내용 |
+|------|------|
+| Secret | `{project_name}/session-signing-key` |
+| ECS | env `SESSION_SIGNING_KEY` (installer가 배포 시 주입, `APP_CONFIG_JSON` 비포함) |
+| 모듈 | `application/session_cookie.py` + `routes_auth.require_user_id` |
+| 삭제 | `uninstaller.delete_session_signing_key_secret()` |
+
+배포 후 기존 평문 쿠키를 가진 사용자는 **다시 로그인**해야 합니다.
 
 ### IAM least privilege
 
