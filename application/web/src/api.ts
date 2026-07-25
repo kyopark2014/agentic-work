@@ -23,8 +23,8 @@ export interface FileUploadResult {
 
 export interface LlmGatewayConfig {
   url: string;
-  key: string;
   configured: boolean;
+  key_configured?: boolean;
 }
 
 export interface LlmGatewayVerifyResult {
@@ -106,10 +106,10 @@ export const api = {
   getAdminDashboard: () => request<DashboardStats>("/api/admin/dashboard"),
   getLlmGateway: () =>
     request<LlmGatewayConfig>("/api/config/llm-gateway"),
-  verifyLlmGateway: (body: { url: string; key: string }) =>
+  verifyLlmGateway: (body: { url: string; key?: string }) =>
     request<LlmGatewayVerifyResult>("/api/config/llm-gateway/verify", {
       method: "POST",
-      body: JSON.stringify(body),
+      body: JSON.stringify({ url: body.url, key: body.key ?? "" }),
     }),
   patchDefaults: (body: {
     default_skills?: string[];

@@ -282,6 +282,8 @@ export function Sidebar({
       {llmGatewayOpen && activeTask && (
         <LlmGatewayModal
           enabled={llmGatewayEnabled}
+          isAdmin={Boolean(config?.is_admin)}
+          gatewayConfigured={Boolean(config?.llm_gateway_configured)}
           onConfirmEnable={async (uiModels) => {
             const refreshed = await onRefreshConfig?.();
             const gatewayList =

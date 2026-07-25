@@ -3,18 +3,18 @@ import os
 import json
 
 import httpx
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel
 
 try:
     from application import utils
     from application.api.routes_auth import get_optional_user_id, local_auth_bypass_enabled
-    from application.api.routes_admin import is_admin_user
+    from application.api.routes_admin import is_admin_user, require_admin
     from application.llm_gateway_models import ui_models_for_gateway_ids
 except ImportError:
     import utils
     from routes_auth import get_optional_user_id, local_auth_bypass_enabled  # type: ignore
-    from routes_admin import is_admin_user  # type: ignore
+    from routes_admin import is_admin_user, require_admin  # type: ignore
     from llm_gateway_models import ui_models_for_gateway_ids  # type: ignore
 
 logger = logging.getLogger("routes_config")
@@ -71,6 +71,7 @@ class DefaultsPatch(BaseModel):
 
 class LlmGatewaySettings(BaseModel):
     url: str = ""
+    # Empty string means "keep existing stored key" (never echoed to clients).
     key: str = ""
 
 
@@ -81,13 +82,16 @@ def _llm_gateway_from_config() -> tuple[str, str]:
     return url, key
 
 
-def _save_llm_gateway(url: str, key: str) -> None:
-    updates = {
+def _save_llm_gateway(url: str, key: str | None = None) -> None:
+    """Persist gateway URL; update key only when a non-empty value is provided."""
+    updates: dict[str, str] = {
         "llm_gateway_url": url.rstrip("/"),
-        "llm_gateway_key": key,
     }
+    if key:
+        updates["llm_gateway_key"] = key
     utils.persist_config_updates(updates)
-    utils.sync_llm_gateway_key_secret(key)
+    if key:
+        utils.sync_llm_gateway_key_secret(key)
     # Keep AgentCore runtime config in sync for image rebuilds / local runs.
     try:
         if os.path.isfile(_RUNTIME_CONFIG_PATH):
@@ -202,40 +206,55 @@ def get_config(request: Request):
 
 
 @router.get("/llm-gateway")
-def get_llm_gateway():
+def get_llm_gateway(_admin: str = Depends(require_admin)):
+    """Admin-only. Never returns the secret key to the browser."""
     url, key = _llm_gateway_from_config()
     return {
         "url": url,
-        "key": key,
         "configured": bool(url and key),
+        "key_configured": bool(key),
     }
 
 
 @router.post("/llm-gateway/verify")
-def verify_llm_gateway(body: LlmGatewaySettings | None = None):
-    """Probe LiteLLM /v1/models with form (or config) values; save on success."""
+def verify_llm_gateway(
+    body: LlmGatewaySettings | None = None,
+    _admin: str = Depends(require_admin),
+):
+    """Admin-only. Probe LiteLLM /v1/models; save on success.
+
+    Empty ``key`` in the body keeps the existing stored / env key.
+    The key is never included in the response.
+    """
+    stored_url, stored_key = _llm_gateway_from_config()
     if body is not None:
-        url = (body.url or "").strip().rstrip("/")
-        key = (body.key or "").strip()
+        url = (body.url or "").strip().rstrip("/") or stored_url
+        submitted_key = (body.key or "").strip()
+        key = submitted_key or stored_key
+        key_provided = bool(submitted_key)
     else:
-        url, key = _llm_gateway_from_config()
+        url, key = stored_url, stored_key
+        key_provided = False
 
     if not url or not key:
         return {
             "ok": False,
-            "message": "url과 key가 모두 필요합니다.",
+            "message": "url과 key가 모두 필요합니다. (Key는 비워두면 기존 값을 사용합니다)",
             "models": [],
             "ui_models": [],
         }
 
     result = _probe_llm_gateway(url, key)
     if result.get("ok"):
-        _save_llm_gateway(url, key)
+        _save_llm_gateway(url, key if key_provided else None)
     return result
 
 
 @router.patch("/defaults")
-def patch_defaults(body: DefaultsPatch):
+def patch_defaults(
+    body: DefaultsPatch,
+    _admin: str = Depends(require_admin),
+):
     utils.save_favorite_tools(
         skills=body.default_skills,
         mcp_servers=body.default_mcp_servers,
