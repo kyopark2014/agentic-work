@@ -230,6 +230,7 @@ UI에서 Gateway 설정을 저장하면 application + runtime `config.json`을 �
 | UI 표시명 | LiteLLM `model_name` |
 |-----------|----------------------|
 | Claude 5.0 Sonnet | `claude-sonnet-5` |
+| Claude 5.0 Opus | `claude-opus-5` |
 | Claude 4.6 Sonnet | `claude-sonnet-4-6` |
 | Claude 4.5 Sonnet | `claude-sonnet-4-5` |
 | Claude Fable 5 | `claude-fable-5` |
