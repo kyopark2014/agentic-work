@@ -531,13 +531,15 @@ function MarkdownText({ content }: { content: string }) {
 |------|------|
 | 쿠키 이름 | `agent_user_id` (HttpOnly, SameSite=Lax, Secure on HTTPS) |
 | 토큰 형식 | `v1.<base64url(json)>.<base64url(hmac)>` — payload: `{uid, exp}` |
-| 서명 키 | Secrets Manager `{project_name}/session-signing-key` → ECS env `SESSION_SIGNING_KEY` |
+| 서명 키 | Secrets Manager `{project_name}/session-signing-key` → ECS **secrets** `SESSION_SIGNING_KEY` (ARN 주입, task def 평문 없음) |
 | 로컬 개발 | env 미설정 시 Secrets Manager 조회 후, 없으면 `application/data/.session_signing_key` 자동 생성 |
 | 유효기간 | 기본 **30일** (`SESSION_MAX_AGE_SECONDS`로 조정 가능) |
 | 레거시 | 평문 email 쿠키는 **거부** (재로그인 필요) |
 
 구현: [application/session_cookie.py](./application/session_cookie.py), [application/api/routes_auth.py](./application/api/routes_auth.py).  
-installer는 `get_or_create_session_signing_key()`로 키를 만들고 ECS 태스크 정의에 `SESSION_SIGNING_KEY`로 주입합니다 (`APP_CONFIG_JSON`에는 넣지 않음). 삭제 시 `uninstaller.delete_session_signing_key_secret()`.
+installer는 `get_or_create_session_signing_key()`로 키를 만들고 ECS task definition의 `secrets.valueFrom`으로 주입합니다 (`environment` 평문·`APP_CONFIG_JSON`에는 넣지 않음). 삭제 시 `uninstaller.delete_session_signing_key_secret()`.
+
+LLM Gateway fallback 키(`llm_gateway_key`)도 동일하게 Secrets Manager `{project_name}/llm-gateway-key` → ECS secrets `LLM_GATEWAY_KEY`로 주입하며, `APP_CONFIG_JSON`에서는 제외합니다. CloudFront 서명 개인키(`CLOUDFRONT_SIGNING_PRIVATE_KEY`)는 `{project}/cloudfront-signing-key` JSON의 `private_key_pem` 필드를 ARN 키 참조로 주입합니다.
 
 ### Local 빌드
 
@@ -2039,7 +2041,7 @@ SG만으로는 공격자가 **자체 CloudFront**를 ALB DNS에 연결해 우회
 |------|------|
 | 대상 behavior | `/artifacts/*`, `/docs/*`, `/images/*` — `TrustedKeyGroups` 필수 |
 | 키 재료 | Secrets Manager `{project_name}/cloudfront-signing-key` (RSA) → CloudFront Public Key + Key Group |
-| ECS | env `CLOUDFRONT_KEY_PAIR_ID`, `CLOUDFRONT_SIGNING_PRIVATE_KEY` |
+| ECS | `CLOUDFRONT_KEY_PAIR_ID`(environment) + `CLOUDFRONT_SIGNING_PRIVATE_KEY`(secrets ARN → JSON `private_key_pem`) |
 | 쿠키 | 로그인·`GET /api/session` 시 `CloudFront-Policy` / `CloudFront-Signature` / `CloudFront-Key-Pair-Id` 발급 (로그아웃 시 삭제) |
 | 사용자 경험 | 로그인 후 Web UI의 `sharing_url` 링크를 그대로 클릭하면 파일 열림. 쿠키 없으면 **403** |
 | 구현 | [application/cloudfront_cookies.py](./application/cloudfront_cookies.py), [application/api/routes_auth.py](./application/api/routes_auth.py), installer `get_or_create_cloudfront_signing_material()` / `ensure_cloudfront_s3_signed_cookies()` |
@@ -2054,7 +2056,7 @@ Web UI 세션은 평문 `user_id` 쿠키가 아니라 **HMAC 서명 토큰**입�
 | 항목 | 내용 |
 |------|------|
 | Secret | `{project_name}/session-signing-key` |
-| ECS | env `SESSION_SIGNING_KEY` (installer가 배포 시 주입, `APP_CONFIG_JSON` 비포함) |
+| ECS | secrets `SESSION_SIGNING_KEY` (ARN 주입, task def 평문 없음 / `APP_CONFIG_JSON` 비포함) |
 | 모듈 | `application/session_cookie.py` + `routes_auth.require_user_id` |
 | 삭제 | `uninstaller.delete_session_signing_key_secret()` |
 

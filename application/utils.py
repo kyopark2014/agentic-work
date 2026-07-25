@@ -153,6 +153,49 @@ def persist_config_updates(updates):
         logger.warning("Failed to write config.json: %s", e)
 
 
+def get_llm_gateway_key() -> str:
+    """Resolve LLM Gateway key: ECS-injected env first, then config.json."""
+    env_key = (os.environ.get("LLM_GATEWAY_KEY") or "").strip()
+    if env_key:
+        return env_key
+    return (load_config().get("llm_gateway_key") or "").strip()
+
+
+def sync_llm_gateway_key_secret(key: str) -> None:
+    """Best-effort upsert of `{project}/llm-gateway-key` for ECS secret injection."""
+    value = (key or "").strip()
+    if not value:
+        return
+    os.environ["LLM_GATEWAY_KEY"] = value
+    try:
+        from botocore.exceptions import ClientError
+
+        cfg = load_config()
+        project = (cfg.get("projectName") or "agentic-work").strip() or "agentic-work"
+        region_name = (
+            (cfg.get("region") or "").strip()
+            or os.environ.get("AWS_REGION")
+            or os.environ.get("AWS_DEFAULT_REGION")
+            or "us-west-2"
+        )
+        secret_name = f"{project}/llm-gateway-key"
+        client = boto3.client("secretsmanager", region_name=region_name)
+        try:
+            client.put_secret_value(SecretId=secret_name, SecretString=value)
+            logger.info("Updated Secrets Manager secret: %s", secret_name)
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") != "ResourceNotFoundException":
+                raise
+            client.create_secret(
+                Name=secret_name,
+                Description=f"LLM Gateway fallback API key for {project}",
+                SecretString=value,
+            )
+            logger.info("Created Secrets Manager secret: %s", secret_name)
+    except Exception as e:
+        logger.debug("Could not sync LLM gateway key to Secrets Manager: %s", e)
+
+
 def get_contents_type(file_name: str) -> str:
     lower = file_name.lower()
     if lower.endswith((".jpg", ".jpeg")):

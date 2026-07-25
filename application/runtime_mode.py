@@ -80,7 +80,7 @@ def run_agent(
         )
 
     if effective_enabled and not gateway_key:
-        gateway_key = (cfg.get("llm_gateway_key") or "").strip()
+        gateway_key = app_utils.get_llm_gateway_key()
 
     if effective_enabled and not (gateway_url and gateway_key):
         logger.warning(

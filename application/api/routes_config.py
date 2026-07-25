@@ -77,7 +77,7 @@ class LlmGatewaySettings(BaseModel):
 def _llm_gateway_from_config() -> tuple[str, str]:
     cfg = utils.load_config()
     url = (cfg.get("llm_gateway_url") or "").strip().rstrip("/")
-    key = (cfg.get("llm_gateway_key") or "").strip()
+    key = utils.get_llm_gateway_key()
     return url, key
 
 
@@ -87,6 +87,7 @@ def _save_llm_gateway(url: str, key: str) -> None:
         "llm_gateway_key": key,
     }
     utils.persist_config_updates(updates)
+    utils.sync_llm_gateway_key_secret(key)
     # Keep AgentCore runtime config in sync for image rebuilds / local runs.
     try:
         if os.path.isfile(_RUNTIME_CONFIG_PATH):

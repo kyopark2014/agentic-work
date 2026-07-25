@@ -60,7 +60,11 @@ ALB_ORIGIN_HEADER_SECRET_NAME = f"{project_name}/cloudfront-alb-origin-header"
 SESSION_SIGNING_KEY_SECRET_NAME = f"{project_name}/session-signing-key"
 # RSA private key + CloudFront public key / key group ids for signed cookies.
 CLOUDFRONT_SIGNING_KEY_SECRET_NAME = f"{project_name}/cloudfront-signing-key"
+# Shared LLM Gateway fallback key (stripped from APP_CONFIG_JSON; ECS secrets inject).
+LLM_GATEWAY_KEY_SECRET_NAME = f"{project_name}/llm-gateway-key"
 CLOUDFRONT_S3_SIGNED_PATHS = ("/images/*", "/docs/*", "/artifacts/*")
+# Keys that must never appear in ECS APP_CONFIG_JSON / task-definition environment.
+APP_CONFIG_SECRET_KEYS = frozenset({"llm_gateway_key"})
 
 # Bedrock Knowledge Base requires these metadata keys as non-filterable on S3 Vectors index
 BEDROCK_NON_FILTERABLE_METADATA_KEYS = [
@@ -193,10 +197,11 @@ def get_or_create_alb_origin_header(*, rotate: bool = False) -> str:
 
 def get_or_create_session_signing_key(*, rotate: bool = False) -> str:
     """
-    Return HMAC key for Web UI session cookies from Secrets Manager.
+    Ensure HMAC key for Web UI session cookies exists in Secrets Manager.
 
-    Generated once per project and injected into ECS as SESSION_SIGNING_KEY
-    (not embedded in APP_CONFIG_JSON).
+    ECS injects the value via task-definition ``secrets`` (ARN), never as
+    plaintext ``environment``. Callers should not put the return value into
+    the task definition.
     """
     secret_name = SESSION_SIGNING_KEY_SECRET_NAME
 
@@ -243,6 +248,148 @@ def get_or_create_session_signing_key(*, rotate: bool = False) -> str:
             response = secretsmanager_client.get_secret_value(SecretId=secret_name)
             return response["SecretString"]
         raise
+
+
+def _describe_secret_arn(secret_id: str) -> str:
+    """Return the full Secrets Manager ARN (includes random suffix)."""
+    return secretsmanager_client.describe_secret(SecretId=secret_id)["ARN"]
+
+
+def _ecs_secret_value_from(secret_name: str, *, json_key: Optional[str] = None) -> str:
+    """Build ECS containerSecrets valueFrom (ARN or ARN:json_key::)."""
+    arn = _describe_secret_arn(secret_name)
+    if json_key:
+        return f"{arn}:{json_key}::"
+    return arn
+
+
+def _public_app_config_for_ecs(app_environment: Dict) -> Dict:
+    """Copy config for APP_CONFIG_JSON without secret fields."""
+    return {
+        key: value
+        for key, value in app_environment.items()
+        if key not in APP_CONFIG_SECRET_KEYS
+    }
+
+
+def ensure_llm_gateway_key_secret(*, preferred_value: Optional[str] = None) -> Optional[str]:
+    """
+    Ensure `{project}/llm-gateway-key` exists when a key is available.
+
+    Returns the secret ARN if a non-empty value is stored (for ECS injection),
+    otherwise None.
+    """
+    secret_name = LLM_GATEWAY_KEY_SECRET_NAME
+    preferred = (preferred_value or "").strip()
+    current = ""
+
+    try:
+        existing = secretsmanager_client.get_secret_value(SecretId=secret_name)
+        current = (existing.get("SecretString") or "").strip()
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ResourceNotFoundException":
+            raise
+        if not preferred:
+            logger.info(f"  Skipping LLM gateway key secret (empty, not created): {secret_name}")
+            return None
+        secretsmanager_client.create_secret(
+            Name=secret_name,
+            Description=f"LLM Gateway fallback API key for {project_name}",
+            SecretString=preferred,
+            Tags=[
+                {"Key": "Name", "Value": secret_name},
+                {"Key": "Project", "Value": project_name},
+            ],
+        )
+        logger.info(f"  ✓ Created LLM gateway key secret: {secret_name}")
+        return _describe_secret_arn(secret_name)
+
+    if preferred and preferred != current:
+        secretsmanager_client.put_secret_value(
+            SecretId=secret_name,
+            SecretString=preferred,
+        )
+        current = preferred
+        logger.info(f"  ✓ Updated LLM gateway key secret: {secret_name}")
+    elif current:
+        logger.info(f"  ✓ Reusing LLM gateway key secret: {secret_name}")
+
+    if not current:
+        logger.info(f"  LLM gateway key secret is empty: {secret_name}")
+        return None
+    return _describe_secret_arn(secret_name)
+
+
+def _ecs_execution_secrets_policy_document() -> Dict:
+    """Allow ECS task execution role to inject project secrets into containers."""
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "ReadProjectSecretsForEcsInjection",
+                "Effect": "Allow",
+                "Action": ["secretsmanager:GetSecretValue"],
+                "Resource": [
+                    f"arn:aws:secretsmanager:{region}:{account_id}:secret:{project_name}/session-signing-key*",
+                    f"arn:aws:secretsmanager:{region}:{account_id}:secret:{project_name}/cloudfront-signing-key*",
+                    f"arn:aws:secretsmanager:{region}:{account_id}:secret:{project_name}/llm-gateway-key*",
+                ],
+            }
+        ],
+    }
+
+
+def attach_ecs_execution_secrets_policy(execution_role_name: str) -> None:
+    attach_inline_policy(
+        execution_role_name,
+        f"ecs-execution-secrets-for-{project_name}",
+        _ecs_execution_secrets_policy_document(),
+    )
+    logger.info(f"  ✓ ECS execution role can read project secrets: {execution_role_name}")
+
+
+def build_ecs_runtime_secret_refs(
+    app_environment: Optional[Dict] = None,
+) -> Tuple[List[Dict[str, str]], Dict[str, str]]:
+    """
+    Ensure signing/gateway secrets exist and return (secrets, non-secret env extras).
+
+    ``secrets`` entries use valueFrom ARNs for ECS containerDefinitions.secrets.
+    ``extras`` holds non-sensitive env such as CLOUDFRONT_KEY_PAIR_ID.
+    """
+    get_or_create_session_signing_key(rotate=False)
+    cf_signing = get_or_create_cloudfront_signing_material(rotate=False)
+
+    preferred_gateway = ""
+    if isinstance(app_environment, dict):
+        preferred_gateway = (app_environment.get("llm_gateway_key") or "").strip()
+    gateway_arn = ensure_llm_gateway_key_secret(preferred_value=preferred_gateway or None)
+
+    secrets_list: List[Dict[str, str]] = [
+        {
+            "name": "SESSION_SIGNING_KEY",
+            "valueFrom": _ecs_secret_value_from(SESSION_SIGNING_KEY_SECRET_NAME),
+        },
+        {
+            "name": "CLOUDFRONT_SIGNING_PRIVATE_KEY",
+            "valueFrom": _ecs_secret_value_from(
+                CLOUDFRONT_SIGNING_KEY_SECRET_NAME,
+                json_key="private_key_pem",
+            ),
+        },
+    ]
+    if gateway_arn:
+        secrets_list.append(
+            {
+                "name": "LLM_GATEWAY_KEY",
+                "valueFrom": gateway_arn,
+            }
+        )
+
+    extras = {
+        "CLOUDFRONT_KEY_PAIR_ID": cf_signing.get("public_key_id") or "",
+    }
+    return secrets_list, extras
 
 
 def _generate_cloudfront_rsa_keypair() -> Tuple[str, str]:
@@ -1180,6 +1327,8 @@ def create_ecs_roles() -> Dict[str, str]:
 
     for policy in _get_ecs_task_inline_policies():
         attach_inline_policy(task_role_name, policy["name"], policy["document"])
+
+    attach_ecs_execution_secrets_policy(execution_role_name)
 
     return {
         "task_role_arn": task_role_arn,
@@ -6572,8 +6721,10 @@ def deploy_ecs_service(
     if not origin_header_value:
         origin_header_value = get_or_create_alb_origin_header(rotate=False)
 
-    session_signing_key = get_or_create_session_signing_key(rotate=False)
-    cf_signing = get_or_create_cloudfront_signing_material(rotate=False)
+    execution_role_name = f"role-ecs-execution-for-{project_name}-{region}"
+    attach_ecs_execution_secrets_policy(execution_role_name)
+    secret_refs, secret_env_extras = build_ecs_runtime_secret_refs(app_environment)
+    public_app_config = _public_app_config_for_ecs(app_environment)
 
     ensure_ecs_service_linked_role()
 
@@ -6597,19 +6748,11 @@ def deploy_ecs_service(
     environment = [
         {
             "name": "APP_CONFIG_JSON",
-            "value": json.dumps(app_environment),
-        },
-        {
-            "name": "SESSION_SIGNING_KEY",
-            "value": session_signing_key,
+            "value": json.dumps(public_app_config),
         },
         {
             "name": "CLOUDFRONT_KEY_PAIR_ID",
-            "value": cf_signing.get("public_key_id") or "",
-        },
-        {
-            "name": "CLOUDFRONT_SIGNING_PRIVATE_KEY",
-            "value": cf_signing.get("private_key_pem") or "",
+            "value": secret_env_extras.get("CLOUDFRONT_KEY_PAIR_ID") or "",
         },
     ]
     container_definition: Dict[str, object] = {
@@ -6618,6 +6761,7 @@ def deploy_ecs_service(
         "essential": True,
         "portMappings": [{"containerPort": 8501, "protocol": "tcp"}],
         "environment": environment,
+        "secrets": secret_refs,
         "logConfiguration": {
             "logDriver": "awslogs",
             "options": {
