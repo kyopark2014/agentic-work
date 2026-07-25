@@ -2041,6 +2041,7 @@ SG만으로는 공격자가 **자체 CloudFront**를 ALB DNS에 연결해 우회
 |------|------|
 | 대상 behavior | `/artifacts/*`, `/docs/*`, `/images/*` — `TrustedKeyGroups` 필수 |
 | 키 재료 | Secrets Manager `{project_name}/cloudfront-signing-key` (RSA) → CloudFront Public Key + Key Group |
+| S3 bucket policy | OAI `s3:GetObject`는 `images/*`·`docs/*`·`artifacts/*`만 (bucket 전체 `/*` 아님) |
 | ECS | `CLOUDFRONT_KEY_PAIR_ID`(environment) + `CLOUDFRONT_SIGNING_PRIVATE_KEY`(secrets ARN → JSON `private_key_pem`) |
 | 쿠키 | 로그인·`GET /api/session` 시 `CloudFront-Policy` / `CloudFront-Signature` / `CloudFront-Key-Pair-Id` 발급 (로그아웃 시 삭제) |
 | 사용자 경험 | 로그인 후 Web UI의 `sharing_url` 링크를 그대로 클릭하면 파일 열림. 쿠키 없으면 **403** |
@@ -2078,7 +2079,7 @@ installer가 만드는 **런타임 역할** 요약:
 |------|-----------|
 | ECS Task Role (`role-ecs-task-for-…`) | Bedrock Invoke/Mantle/KB ingest, AgentCore `InvokeAgentRuntime`을 **config 스캔 runtime ARN**으로 한정, 프로젝트 S3 버킷만 |
 | Knowledge Base Role | `bedrock:InvokeModel`(+inference profile), 프로젝트 S3 Get/List, `aoss:APIAccessAll`을 `collection/*`로 한정 |
-| AgentCore Runtime Role (`AmazonBedrockAgentCoreRuntimePolicyFor…`) | Trust: `bedrock-agentcore` + `SourceAccount`/`SourceArn`(프로젝트 runtime). 권한: 프로젝트 runtime ARN, Tavily secret만, 프로젝트 S3, Gateway/workload-identity, VPC ENI·ECR·로그 |
+| AgentCore Runtime Role (`AmazonBedrockAgentCoreRuntimePolicyFor…`) | Trust: `bedrock-agentcore` + `SourceAccount`/`SourceArn`(프로젝트 runtime). 권한: 프로젝트 runtime ARN, 공유 Secret(`tavilyapikey*`·`notionapikey*`), 프로젝트 S3, Gateway/workload-identity, VPC ENI·ECR·로그 |
 | Websearch Gateway Role | `SourceAccount`/`SourceArn` 조건 유지 |
 | S3 Files 정책 | Access Point ARN condition 유지 |
 

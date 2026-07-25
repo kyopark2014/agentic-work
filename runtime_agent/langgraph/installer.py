@@ -399,19 +399,18 @@ def _project_s3_resource_arns(config) -> tuple:
 
 
 def _project_secret_resource_arns(config) -> list:
-    """Secrets Manager ARNs used by this project (Tavily only; no Cognito stubs)."""
+    """Shared Secrets Manager ARNs used by Runtime (Tavily / Notion).
+
+    Names match root ``installer.create_secrets`` and ``utils._load_*_api_key``:
+    account/region shared secrets ``tavilyapikey`` / ``notionapikey`` (not
+    ``tavilyapikey-{project}``).
+    """
     region = config["region"]
     account_id = config["accountId"]
-    project_name = config.get("projectName", "agentcore")
-    secret_arns = [
-        f"arn:aws:secretsmanager:{region}:{account_id}:secret:tavilyapikey-{project_name}*",
+    return [
+        f"arn:aws:secretsmanager:{region}:{account_id}:secret:tavilyapikey*",
+        f"arn:aws:secretsmanager:{region}:{account_id}:secret:notionapikey*",
     ]
-    kb_name = (config.get("knowledge_base_name") or "").strip()
-    if kb_name and kb_name != project_name:
-        secret_arns.append(
-            f"arn:aws:secretsmanager:{region}:{account_id}:secret:tavilyapikey-{kb_name}*"
-        )
-    return secret_arns
 
 
 def create_bedrock_agentcore_policy(config):

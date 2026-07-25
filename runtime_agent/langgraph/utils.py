@@ -93,7 +93,7 @@ def _load_tavily_api_key(app_config: dict) -> str:
         return key
 
     region = app_config.get("region", "us-west-2")
-    # Shared secret name — matches installer.py / langgraph IAM (tavilyapikey*).
+    # Shared secret name — matches installer.py / Runtime IAM (tavilyapikey*).
     secret_name = "tavilyapikey"
     secrets_client = boto3.client("secretsmanager", region_name=region)
     try:
@@ -124,7 +124,7 @@ def _load_notion_api_key(app_config: dict) -> str:
         return key
 
     region = app_config.get("region", "us-west-2")
-    # Shared secret name — matches installer.py / langgraph IAM (notionapikey*).
+    # Shared secret name — matches installer.py / Runtime IAM (notionapikey*).
     secret_name = "notionapikey"
     secrets_client = boto3.client("secretsmanager", region_name=region)
     try:
