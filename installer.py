@@ -1547,6 +1547,7 @@ def create_security_group(
             - FromPort: Starting port
             - ToPort: Ending port
             - IpRanges: List of {"CidrIp": "..."} for CIDR-based rules
+            - PrefixListIds: List of {"PrefixListId": "..."} for managed prefix lists
             - UserIdGroupPairs: List of {"GroupId": "..."} for security group-based rules
     
     Returns:
@@ -1598,9 +1599,97 @@ def create_security_group(
                 raise
 
 
+def get_cloudfront_origin_facing_prefix_list_id() -> str:
+    """Return the AWS-managed CloudFront origin-facing prefix list ID for this region."""
+    response = ec2_client.describe_managed_prefix_lists(
+        Filters=[
+            {
+                "Name": "prefix-list-name",
+                "Values": ["com.amazonaws.global.cloudfront.origin-facing"],
+            }
+        ]
+    )
+    prefix_lists = response.get("PrefixLists", [])
+    if not prefix_lists:
+        raise RuntimeError(
+            "CloudFront managed prefix list "
+            "'com.amazonaws.global.cloudfront.origin-facing' not found in this region"
+        )
+    return prefix_lists[0]["PrefixListId"]
+
+
+def ensure_alb_security_group_cloudfront_ingress(sg_id: str, prefix_list_id: str) -> None:
+    """
+    Restrict ALB SG HTTP/80 ingress to CloudFront only.
+
+    Adds the managed prefix list rule when missing and removes open 0.0.0.0/0.
+    """
+    sg = ec2_client.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0]
+    permissions = sg.get("IpPermissions", [])
+
+    has_cloudfront_ingress = False
+    open_world_permissions = []
+
+    for perm in permissions:
+        if perm.get("IpProtocol") != "tcp":
+            continue
+        if perm.get("FromPort") != 80 or perm.get("ToPort") != 80:
+            continue
+
+        for prefix in perm.get("PrefixListIds", []):
+            if prefix.get("PrefixListId") == prefix_list_id:
+                has_cloudfront_ingress = True
+
+        open_cidrs = [
+            ip_range
+            for ip_range in perm.get("IpRanges", [])
+            if ip_range.get("CidrIp") == "0.0.0.0/0"
+        ]
+        if open_cidrs:
+            open_world_permissions.append(
+                {
+                    "IpProtocol": "tcp",
+                    "FromPort": 80,
+                    "ToPort": 80,
+                    "IpRanges": open_cidrs,
+                }
+            )
+
+    if not has_cloudfront_ingress:
+        try:
+            ec2_client.authorize_security_group_ingress(
+                GroupId=sg_id,
+                IpPermissions=[
+                    {
+                        "IpProtocol": "tcp",
+                        "FromPort": 80,
+                        "ToPort": 80,
+                        "PrefixListIds": [{"PrefixListId": prefix_list_id}],
+                    }
+                ],
+            )
+            logger.info(
+                f"  ✓ ALB SG {sg_id}: added CloudFront prefix list ingress ({prefix_list_id})"
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "InvalidPermission.Duplicate":
+                raise
+
+    for permission in open_world_permissions:
+        try:
+            ec2_client.revoke_security_group_ingress(
+                GroupId=sg_id,
+                IpPermissions=[permission],
+            )
+            logger.info(f"  ✓ ALB SG {sg_id}: removed open 0.0.0.0/0 HTTP ingress")
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "InvalidPermission.NotFound":
+                raise
+
+
 def create_alb_security_group(vpc_id: str) -> str:
     """
-    Create ALB security group with HTTP ingress rule.
+    Create ALB security group with HTTP ingress from CloudFront only.
     
     Args:
         vpc_id: VPC ID where security group will be created
@@ -1608,7 +1697,8 @@ def create_alb_security_group(vpc_id: str) -> str:
     Returns:
         Security group ID
     """
-    return create_security_group(
+    prefix_list_id = get_cloudfront_origin_facing_prefix_list_id()
+    sg_id = create_security_group(
         vpc_id=vpc_id,
         group_name=f"alb-sg-for-{project_name}",
         description="security group for alb",
@@ -1617,10 +1707,13 @@ def create_alb_security_group(vpc_id: str) -> str:
                 "IpProtocol": "tcp",
                 "FromPort": 80,
                 "ToPort": 80,
-                "IpRanges": [{"CidrIp": "0.0.0.0/0"}]
+                "PrefixListIds": [{"PrefixListId": prefix_list_id}],
             }
         ]
     )
+    # Existing SGs may still allow 0.0.0.0/0; reconcile on every install/reuse.
+    ensure_alb_security_group_cloudfront_ingress(sg_id, prefix_list_id)
+    return sg_id
 
 
 def create_vpc_endpoint(

@@ -1979,6 +1979,28 @@ if __name__ == "__main__":
     app.run()
 ```
 
+## Security
+
+공개 진입점은 **CloudFront → ALB → ECS** 입니다. ALB는 public subnet의 `internet-facing` Load Balancer이지만, ALB Security Group ingress는 인터넷 전체(`0.0.0.0/0`)가 아니라 **CloudFront origin IP만** 허용합니다.
+
+### ALB Security Group (CloudFront only)
+
+[installer.py](./installer.py)의 `create_alb_security_group()`이 `alb-sg-for-{project_name}`을 생성·재사용할 때 HTTP(80) ingress를 AWS managed prefix list로 제한합니다.
+
+| 항목 | 값 |
+|------|-----|
+| Prefix list 이름 | `com.amazonaws.global.cloudfront.origin-facing` |
+| 허용 트래픽 | TCP 80 ← CloudFront origin-facing IP |
+| 제거 대상 | TCP 80 ← `0.0.0.0/0` (공개 인터넷) |
+
+관련 함수:
+
+1. `get_cloudfront_origin_facing_prefix_list_id()` — 리전의 managed prefix list ID 조회  
+2. `ensure_alb_security_group_cloudfront_ingress()` — prefix list 규칙 추가, 기존 `0.0.0.0/0` 규칙 제거  
+3. `create_alb_security_group()` — 신규 생성과 기존 SG 재사용 시 위 규칙을 항상 맞춤  
+
+이로써 ALB DNS로 CloudFront를 우회해 직접 접근하는 경로를 차단합니다. ECS Security Group(`ecs-sg-for-{project_name}`)은 계속 ALB SG에서만 8501을 허용합니다.
+
 ## Guardrail
 
 `installer.py`가 Amazon Bedrock Guardrail을 자동으로 생성·업데이트합니다. 사용자 입력에서 **성적 표현**과 **프롬프트 공격**(jailbreak, prompt injection)을 차단합니다.
