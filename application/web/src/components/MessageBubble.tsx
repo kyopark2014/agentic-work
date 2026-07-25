@@ -61,7 +61,20 @@ function filterSupersededTextEvents(events: ToolEvent[], content: string): ToolE
 }
 
 function MarkdownText({ content }: { content: string }) {
-  return <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>;
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={{
+        a: ({ href, children, ...props }) => (
+          <a href={href} target="_blank" rel="noopener noreferrer" {...props}>
+            {children}
+          </a>
+        ),
+      }}
+    >
+      {content}
+    </ReactMarkdown>
+  );
 }
 
 async function copyTextToClipboard(text: string): Promise<void> {
@@ -190,6 +203,9 @@ function MarkdownBubble({ content }: { content: string }) {
 
   function onContextMenu(e: MouseEvent<HTMLDivElement>) {
     if (!content.trim()) return;
+    // Let the browser show its native link menu (Open in New Tab, etc.)
+    const target = e.target as HTMLElement | null;
+    if (target?.closest("a[href]")) return;
     e.preventDefault();
     const selectedText = bubbleRef.current
       ? getSelectedTextInElement(bubbleRef.current)
