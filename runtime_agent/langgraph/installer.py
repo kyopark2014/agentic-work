@@ -385,6 +385,29 @@ def create_bedrock_agentcore_policy(config):
                 ],
                 "Resource": ["*"],
             },
+
+            {
+                # ListAgentRuntimes is account-scoped; IAM requires Resource "*".
+                # Used by mcp_config to resolve aws-tavily (and sibling) runtime ARNs.
+                "Sid": "ListAgentRuntimes",
+                "Effect": "Allow",
+                "Action": [
+                    "bedrock-agentcore:ListAgentRuntimes",
+                    "bedrock-agentcore-control:ListAgentRuntimes",
+                ],
+                "Resource": ["*"],
+            },
+            {
+                "Sid": "GetAgentRuntime",
+                "Effect": "Allow",
+                "Action": [
+                    "bedrock-agentcore:GetAgentRuntime",
+                    "bedrock-agentcore-control:GetAgentRuntime",
+                ],
+                "Resource": [
+                    f"arn:aws:bedrock-agentcore:*:{accountId}:runtime/*",
+                ],
+            },
             {
                 "Sid": "GetAgentCoreGateway",
                 "Effect": "Allow",
