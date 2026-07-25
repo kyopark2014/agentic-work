@@ -398,11 +398,13 @@ def create_bedrock_agentcore_policy(config):
                 "Resource": ["*"],
             },
             {
-                "Sid": "GetAgentRuntime",
+                "Sid": "GetAndInvokeAgentRuntime",
                 "Effect": "Allow",
                 "Action": [
                     "bedrock-agentcore:GetAgentRuntime",
                     "bedrock-agentcore-control:GetAgentRuntime",
+                    "bedrock-agentcore:InvokeAgentRuntime",
+                    "bedrock-agentcore:InvokeAgentRuntimeWithWebResponse",
                 ],
                 "Resource": [
                     f"arn:aws:bedrock-agentcore:*:{accountId}:runtime/*",
