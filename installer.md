@@ -36,6 +36,7 @@ CDK 스택과 동등한 AWS 인프라를 프로그래밍 방식으로 배포합�
 - **ECS Fargate 배포**: multi-stage Dockerfile 이미지를 ECR에 push한 뒤 ECS Fargate(ARM64) 서비스로 실행
 - **AgentCore 연동**: CloudFront URL·S3 Files 반영 후 LangGraph Runtime installer를 자동 호출
 - **SSE 장시간 스트림**: ALB idle timeout·CloudFront origin read timeout을 120초로 설정
+- **CloudFront→ALB 오리진 보호**: Secrets Manager 랜덤 헤더 주입 + ALB default 403 (헤더 일치 시에만 forward)
 - **AgentCore Web Search Gateway**: `us-east-1` managed web-search connector
 
 ### 사전 요구사항
@@ -81,9 +82,12 @@ S3_FILES_SESSION_PREFIX = "agentcore-sessions/"
 # AgentCore Runtime 이름: project_name의 '-' → '_' (예: agentic_work)
 # agent_runtime_name(project_name)
 
-# 커스텀 헤더 (CloudFront-ALB 통신용)
+# CloudFront→ALB 오리진 검증 헤더
 custom_header_name = "X-Custom-Header"
-custom_header_value = f"{project_name}_12dab15e4s31"
+# 값은 소스에 두지 않음. Secrets Manager:
+#   {project_name}/cloudfront-alb-origin-header
+# get_or_create_alb_origin_header()가 최초 배포 시 랜덤 생성·이후 재사용
+ALB_ORIGIN_HEADER_SECRET_NAME = f"{project_name}/cloudfront-alb-origin-header"
 ```
 
 ---
@@ -179,15 +183,21 @@ Runtime은 access point ARN이 있으면 **`s3FilesAccessPoint` + VPC 모드**, 
 - **헬스체크**: `/api/health`
 - **Idle timeout**: 120초 (`ALB_IDLE_TIMEOUT_SECONDS`) — 장시간 SSE 스트림 유지
 - **Stickiness**: `lb_cookie` 86400초 (태스크별 SQLite working-copy 일관성)
+- **Origin 보호**: listener default = **403 fixed-response**, `X-Custom-Header` 일치 시에만 ECS target group으로 forward (`ensure_alb_listener_origin_protection`)
 
 ### 6. CloudFront 배포
 - **오리진**:
-  - 기본: ALB (동적 컨텐츠)
+  - 기본: ALB (동적 컨텐츠) — Secrets Manager 오리진 헤더를 Custom Header로 주입
   - `/images/*`, `/docs/*`, `/artifacts/*`: S3 (정적 컨텐츠)
 - **캐시 정책**: Managed-CachingDisabled
 - **프로토콜**: HTTP → HTTPS 리다이렉트
 - **Origin read timeout**: 120초 (`SSE_ORIGIN_READ_TIMEOUT_SECONDS`)
-- **재사용**: 동일 `project_name`의 기존 CloudFront 배포가 있으면 재사용 (타임아웃·`/artifacts/*` behavior 갱신)
+- **재사용**: 동일 `project_name`의 기존 CloudFront 배포가 있으면 재사용 (헤더·타임아웃·`/artifacts/*` behavior 갱신)
+
+### 6.5. Secrets Manager (ALB origin header)
+- **이름**: `{project_name}/cloudfront-alb-origin-header`
+- **용도**: CloudFront → ALB 오리진 검증용 `X-Custom-Header` 값 (랜덤, 소스 하드코딩 없음)
+- **생성**: `get_or_create_alb_origin_header()` / 삭제: `uninstaller.delete_alb_origin_header_secret()`
 
 ### 7. ECR (Elastic Container Registry)
 - **리포지토리**: `ecr-for-{project_name}`
@@ -275,8 +285,11 @@ S3 Vectors 벡터 버킷·인덱스 생성 및 Bedrock Knowledge Base 연결
 VPC·ALB·CloudFront 생성
 
 - VPC: Bedrock Runtime + `ensure_private_subnet_vpc_endpoints()` (ECR, Logs, Secrets, AgentCore, S3 gateway)
-- ALB: `ensure_alb_idle_timeout()` (120초)
-- CloudFront: origin read timeout 120초, `/images/*`·`/docs/*`·`/artifacts/*`
+- ALB: `ensure_alb_idle_timeout()` (120초), SG는 CloudFront prefix list만 허용
+- CloudFront: ALB 오리진에 `X-Custom-Header` 주입, origin read timeout 120초, `/images/*`·`/docs/*`·`/artifacts/*`
+
+#### `get_or_create_alb_origin_header()` / `ensure_alb_listener_origin_protection()`
+Secrets Manager에 오리진 헤더 시크릿을 생성·재사용하고, ALB listener를 default 403 + 헤더 일치 시 forward로 맞춤
 
 #### `create_s3_files_session_storage(vpc_info, s3_bucket_name, *, ecs_sg_id="", ecs_task_role_name="")`
 AgentCore·ECS용 S3 Files 세션 스토리지 프로비저닝 (멱등).
@@ -330,7 +343,9 @@ AgentCore Web Search gateway 및 managed web-search 타겟 생성/조회
 | `s3_vectors_bucket_arn()` / `s3_vectors_index_arn()` | S3 Vectors ARN |
 | `ensure_private_subnet_vpc_endpoints()` | ECR/Logs/Secrets/AgentCore/S3 엔드포인트 |
 | `ensure_alb_idle_timeout()` | ALB idle timeout 120초 |
-| `_ensure_cloudfront_alb_origin_timeouts()` / `_ensure_cloudfront_s3_path_behavior()` | CF 타임아웃·S3 path |
+| `get_or_create_alb_origin_header()` | Secrets Manager 오리진 헤더 생성·재사용 |
+| `ensure_alb_listener_origin_protection()` | ALB default 403 + 커스텀 헤더 forward |
+| `_ensure_cloudfront_alb_origin_config()` / `_ensure_cloudfront_s3_path_behavior()` | CF 헤더·타임아웃·S3 path |
 | `_get_or_create_s3files_*` / `ensure_ecs_task_s3files_policy` | S3 Files 프로비저닝 |
 | `_ensure_agent_runtime_vpc_endpoint_access()` | Runtime SG → VPC endpoint |
 | `_ensure_native_buildx_builder()` / `_ensure_docker_disk_space()` / `_promote_ecr_image_tag()` | Docker 빌드 |
@@ -414,17 +429,21 @@ python installer.py --verify-deployment
        • sync role, file system, mount targets, access point
        • agent-runtime-sg / ECS SG / s3files-mount-sg
        ↓
+[5.6/10] ALB origin header (Secrets Manager 랜덤 생성·재사용)
+       ↓
 [6/10] Application Load Balancer (idle timeout 120초)
        ↓
-[7/10] CloudFront (ALB + /images,/docs,/artifacts → S3, origin timeout 120초)
+[7/10] CloudFront (ALB 오리진 헤더 주입 + /images,/docs,/artifacts → S3)
        ↓
 [8/10] 앱 설정·Runtime·컨테이너 이미지
        • mcp.list / skills.list 동기화
        • application/config.json (S3 Files + sharing_url)
        • [11/10] runtime_agent/langgraph/installer.py
+       • ECS task AgentCore IAM refresh (`create_ecs_roles`)
        • ECR + buildx linux/arm64 빌드·push
        ↓
 [9/10] ECS Fargate 배포
+       • ALB listener: default 403, 헤더 일치 시 forward
        • stickiness + S3 Files /mnt/app-data
        ↓
 [10/10] CloudFront readiness 확인
@@ -579,6 +598,6 @@ cd runtime_agent/langgraph
 python uninstaller.py
 ```
 
-삭제 순서(요약): CloudFront 비활성화 → AgentCore Runtime → ECS → ALB → EC2(레거시) → NAT → S3 Files → VPC → KB / S3 Vectors → Gateway / IAM / S3 → CloudFront 삭제 → config.json 정리  
+삭제 순서(요약): CloudFront 비활성화 → AgentCore Runtime → ECS → ALB → EC2(레거시) → NAT → S3 Files → VPC → KB / S3 Vectors → Gateway / Memory / 공유 Secrets / ALB origin header secret / IAM / S3 → CloudFront 삭제 → config.json 정리  
 
 > 공유 Secret(`tavilyapikey`, `notionapikey`)은 다른 프로젝트에서도 쓸 수 있으므로, uninstaller가 삭제하지 않을 수 있습니다. 필요 시 Console/CLI에서 수동 삭제하세요.

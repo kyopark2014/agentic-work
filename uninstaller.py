@@ -47,6 +47,7 @@ agentcore_control_client = boto3.client(
 )
 s3files_client = boto3.client("s3files", region_name=region)
 secrets_client = boto3.client("secretsmanager", region_name=region)
+secretsmanager_client = secrets_client
 
 # Get account ID if not set
 if not account_id:
@@ -55,6 +56,7 @@ if not account_id:
 bucket_name = f"storage-for-{project_name}-{account_id}-{region}"
 vector_index_name = project_name
 vector_bucket_name = f"{project_name}-{account_id}"
+ALB_ORIGIN_HEADER_SECRET_NAME = f"{project_name}/cloudfront-alb-origin-header"
 
 # Configure logging
 def setup_logging():
@@ -2144,6 +2146,24 @@ def delete_secrets(skip_confirmation: bool = False) -> bool:
     return True
 
 
+def delete_alb_origin_header_secret() -> None:
+    """Delete CloudFront→ALB origin verification header from Secrets Manager."""
+    logger.info("Deleting ALB origin header secret")
+    secret_name = ALB_ORIGIN_HEADER_SECRET_NAME
+    try:
+        secretsmanager_client.delete_secret(
+            SecretId=secret_name,
+            ForceDeleteWithoutRecovery=True,
+        )
+        logger.info(f"  ✓ Deleted Secrets Manager secret: {secret_name}")
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("ResourceNotFoundException", "ResourceNotFound"):
+            logger.info(f"  Secret not found: {secret_name}")
+        else:
+            logger.warning(f"  Could not delete secret {secret_name}: {e}")
+
+
 def delete_user_access_cloudwatch_dashboard() -> None:
     """Delete the application user-access CloudWatch dashboard if present."""
     logger.info("Deleting CloudWatch user-access dashboard")
@@ -2334,6 +2354,7 @@ def main():
             skip_confirmation=args.delete_agentcore_memory
         )
         delete_secrets(skip_confirmation=args.delete_shared_secrets)
+        delete_alb_origin_header_secret()
         delete_iam_roles(
             delete_agentcore_gateway_role=agentcore_gateway_deleted,
             delete_agentcore_memory_role=agentcore_memory_deleted,

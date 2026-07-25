@@ -12,6 +12,7 @@ import argparse
 import base64
 import ipaddress
 import re
+import secrets
 import subprocess
 import shutil
 import os
@@ -53,7 +54,8 @@ embedding_dimensions = 1024
 embedding_data_type = "float32"
 distance_metric = "cosine"
 custom_header_name = "X-Custom-Header"
-custom_header_value = f"{project_name}_12dab15e4s31"
+# Origin header secret value lives in Secrets Manager (never hardcode in source).
+ALB_ORIGIN_HEADER_SECRET_NAME = f"{project_name}/cloudfront-alb-origin-header"
 
 # Bedrock Knowledge Base requires these metadata keys as non-filterable on S3 Vectors index
 BEDROCK_NON_FILTERABLE_METADATA_KEYS = [
@@ -80,6 +82,7 @@ agentcore_control_client = boto3.client(
 )
 s3files_client = boto3.client("s3files", region_name=region)
 secrets_client = boto3.client("secretsmanager", region_name=region)
+secretsmanager_client = secrets_client
 
 S3_FILES_SESSION_PREFIX = "agentcore-sessions/"
 
@@ -119,6 +122,215 @@ def setup_logging(log_level=logging.INFO):
 
 
 logger = setup_logging()
+
+
+def _generate_alb_origin_header_value() -> str:
+    """Cryptographically random origin-verification header value."""
+    return secrets.token_urlsafe(32)
+
+
+def get_or_create_alb_origin_header(*, rotate: bool = False) -> str:
+    """
+    Return CloudFront→ALB origin header from Secrets Manager.
+
+    Generates a cryptographically random value on first create (never hardcoded
+    in source). Reuses the stored value on subsequent installs unless rotate=True.
+    """
+    secret_name = ALB_ORIGIN_HEADER_SECRET_NAME
+
+    try:
+        existing = secretsmanager_client.get_secret_value(SecretId=secret_name)
+        current = (existing.get("SecretString") or "").strip()
+        if current and not rotate:
+            logger.info(f"  ✓ Reusing ALB origin header from Secrets Manager: {secret_name}")
+            return current
+        new_value = _generate_alb_origin_header_value()
+        secretsmanager_client.put_secret_value(
+            SecretId=secret_name,
+            SecretString=new_value,
+        )
+        logger.info(f"  ✓ Rotated ALB origin header in Secrets Manager: {secret_name}")
+        return new_value
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ResourceNotFoundException":
+            raise
+
+    new_value = _generate_alb_origin_header_value()
+    try:
+        secretsmanager_client.create_secret(
+            Name=secret_name,
+            Description=(
+                f"CloudFront to ALB origin verification header ({custom_header_name}) "
+                f"for {project_name}"
+            ),
+            SecretString=new_value,
+            Tags=[
+                {"Key": "Name", "Value": secret_name},
+                {"Key": "Project", "Value": project_name},
+            ],
+        )
+        logger.info(f"  ✓ Created ALB origin header secret: {secret_name}")
+        return new_value
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ResourceExistsException":
+            if rotate:
+                new_value = _generate_alb_origin_header_value()
+                secretsmanager_client.put_secret_value(
+                    SecretId=secret_name,
+                    SecretString=new_value,
+                )
+                logger.info(f"  ✓ Rotated ALB origin header in Secrets Manager: {secret_name}")
+                return new_value
+            response = secretsmanager_client.get_secret_value(SecretId=secret_name)
+            return response["SecretString"]
+        raise
+
+
+def _alb_forbidden_default_action() -> Dict:
+    """ALB default action: deny requests missing the origin header."""
+    return {
+        "Type": "fixed-response",
+        "FixedResponseConfig": {
+            "StatusCode": "403",
+            "ContentType": "text/plain",
+            "MessageBody": "Forbidden",
+        },
+    }
+
+
+def _alb_default_action_is_forbidden(actions: Optional[List[Dict]]) -> bool:
+    if not actions:
+        return False
+    action = actions[0]
+    if action.get("Type") != "fixed-response":
+        return False
+    status = str(action.get("FixedResponseConfig", {}).get("StatusCode", ""))
+    return status == "403"
+
+
+def _cloudfront_alb_origin_custom_headers(header_value: str) -> Dict[str, object]:
+    return {
+        "Quantity": 1,
+        "Items": [
+            {
+                "HeaderName": custom_header_name,
+                "HeaderValue": header_value,
+            }
+        ],
+    }
+
+
+def ensure_alb_listener_origin_protection(
+    alb_arn: str,
+    tg_arn: str,
+    header_value: str,
+) -> str:
+    """
+    Ensure HTTP:80 listener denies by default and forwards only when the
+    CloudFront origin header matches.
+    """
+    listener_arn = None
+    existing_listener = None
+    try:
+        listeners = elbv2_client.describe_listeners(LoadBalancerArn=alb_arn)
+        for listener in listeners.get("Listeners", []):
+            if listener["Port"] == 80 and listener["Protocol"] == "HTTP":
+                listener_arn = listener["ListenerArn"]
+                existing_listener = listener
+                logger.warning(f"  Listener already exists on port 80: {listener_arn}")
+                break
+    except ClientError as e:
+        logger.warning(f"  Error checking existing listeners: {e}")
+
+    if not listener_arn:
+        listener_response = elbv2_client.create_listener(
+            LoadBalancerArn=alb_arn,
+            Protocol="HTTP",
+            Port=80,
+            DefaultActions=[_alb_forbidden_default_action()],
+        )
+        listener_arn = listener_response["Listeners"][0]["ListenerArn"]
+        logger.info(f"  ✓ Created ALB listener (default 403): {listener_arn}")
+    elif not _alb_default_action_is_forbidden(existing_listener.get("DefaultActions")):
+        elbv2_client.modify_listener(
+            ListenerArn=listener_arn,
+            DefaultActions=[_alb_forbidden_default_action()],
+        )
+        logger.info("  ✓ Updated ALB listener default action to 403 fixed-response")
+
+    header_rule_arn = None
+    header_rule_matches = False
+    try:
+        rules = elbv2_client.describe_rules(ListenerArn=listener_arn)
+        for rule in rules.get("Rules", []):
+            if rule.get("Priority") == "default":
+                continue
+            for condition in rule.get("Conditions", []):
+                if condition.get("Field") != "http-header":
+                    continue
+                header_cfg = condition.get("HttpHeaderConfig") or {}
+                if header_cfg.get("HttpHeaderName") != custom_header_name:
+                    continue
+                header_rule_arn = rule["RuleArn"]
+                values = header_cfg.get("Values") or []
+                header_rule_matches = header_value in values
+                break
+            if header_rule_arn:
+                break
+    except ClientError as e:
+        logger.debug(f"  Error checking existing rules: {e}")
+
+    forward_action = [{"Type": "forward", "TargetGroupArn": tg_arn}]
+    header_condition = [
+        {
+            "Field": "http-header",
+            "HttpHeaderConfig": {
+                "HttpHeaderName": custom_header_name,
+                "Values": [header_value],
+            },
+        }
+    ]
+
+    if header_rule_arn:
+        elbv2_client.modify_rule(
+            RuleArn=header_rule_arn,
+            Conditions=header_condition,
+            Actions=forward_action,
+        )
+        if header_rule_matches:
+            logger.info("  ✓ ALB custom-header forward rule is up to date")
+        else:
+            logger.info("  ✓ Updated ALB custom-header forward rule with secret value")
+    else:
+        try:
+            elbv2_client.create_rule(
+                ListenerArn=listener_arn,
+                Priority=10,
+                Conditions=header_condition,
+                Actions=forward_action,
+            )
+            logger.info("  ✓ Created ALB rule: custom header -> forward")
+        except ClientError as e:
+            if e.response["Error"]["Code"] in ["PriorityInUse", "RuleAlreadyExists"]:
+                # Priority 10 may be an unrelated rule; replace its conditions.
+                rules = elbv2_client.describe_rules(ListenerArn=listener_arn)
+                for rule in rules.get("Rules", []):
+                    if rule.get("Priority") == "10":
+                        elbv2_client.modify_rule(
+                            RuleArn=rule["RuleArn"],
+                            Conditions=header_condition,
+                            Actions=forward_action,
+                        )
+                        logger.info(
+                            "  ✓ Replaced priority-10 rule with custom-header forward"
+                        )
+                        break
+                else:
+                    raise
+            else:
+                raise
+
+    return listener_arn
 
 
 def create_secrets() -> Dict[str, str]:
@@ -503,11 +715,9 @@ def create_knowledge_base_role() -> str:
     return role_arn
 
 
-def _get_ecs_task_inline_policies() -> List[Dict]:
-    """Least-privilege inline IAM policies for the ECS task (Web UI) role."""
-    bucket_arn, object_arn = _project_s3_bucket_arns()
-    runtime_name = agent_runtime_name(project_name)
-    runtime_resource_arns = [
+def _agent_runtime_arns_for_name(runtime_name: str) -> List[str]:
+    """IAM Resource ARNs for one AgentCore runtime name (+ endpoints)."""
+    return [
         f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/{runtime_name}",
         f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/{runtime_name}-*",
         (
@@ -519,6 +729,72 @@ def _get_ecs_task_inline_policies() -> List[Dict]:
             f"runtime/{runtime_name}-*/runtime-endpoint/*"
         ),
     ]
+
+
+def _read_local_json_config(path: str) -> Dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+
+
+def _ecs_agent_runtime_resource_arns() -> List[str]:
+    """
+    AgentCore runtime ARNs allowed for the ECS Web UI task role.
+
+    Root installer project_name can differ from the Agent Runtime installer
+    projectName. Scan application/config.json and all runtime_agent/*/config.json
+    for naming conventions plus any explicit agent_runtime_arn.
+    """
+    root = os.path.dirname(os.path.abspath(__file__))
+    configs: List[Dict] = [
+        _read_local_json_config(os.path.join(root, "application", "config.json"))
+    ]
+    runtime_agent_root = os.path.join(root, "runtime_agent")
+    if os.path.isdir(runtime_agent_root):
+        for entry in sorted(os.listdir(runtime_agent_root)):
+            config_path = os.path.join(runtime_agent_root, entry, "config.json")
+            if os.path.isfile(config_path):
+                configs.append(_read_local_json_config(config_path))
+
+    name_candidates = {
+        agent_runtime_name(project_name),
+        agent_runtime_name(git_name),
+    }
+    for config in configs:
+        runtime_project = (config.get("projectName") or "").strip()
+        if runtime_project:
+            name_candidates.add(agent_runtime_name(runtime_project))
+
+    arns: List[str] = []
+    seen = set()
+    for name in sorted(n for n in name_candidates if n):
+        for arn in _agent_runtime_arns_for_name(name):
+            if arn not in seen:
+                seen.add(arn)
+                arns.append(arn)
+
+    for config in configs:
+        agent_runtime_arn = (config.get("agent_runtime_arn") or "").strip()
+        if not agent_runtime_arn:
+            continue
+        if agent_runtime_arn not in seen:
+            seen.add(agent_runtime_arn)
+            arns.append(agent_runtime_arn)
+        endpoint_arn = f"{agent_runtime_arn}/runtime-endpoint/*"
+        if endpoint_arn not in seen:
+            seen.add(endpoint_arn)
+            arns.append(endpoint_arn)
+
+    return arns
+
+
+def _get_ecs_task_inline_policies() -> List[Dict]:
+    """Least-privilege inline IAM policies for the ECS task (Web UI) role."""
+    bucket_arn, object_arn = _project_s3_bucket_arns()
+    runtime_resource_arns = _ecs_agent_runtime_resource_arns()
     return [
         {
             "name": f"ecs-task-bedrock-policy-for-{project_name}",
@@ -590,7 +866,8 @@ def _get_ecs_task_inline_policies() -> List[Dict]:
                             "bedrock-agentcore:GetAgentRuntime",
                             "bedrock-agentcore-control:GetAgentRuntime",
                         ],
-                        # Limit to this project's runtime name (not account-wide runtime/*).
+                        # Root project_name and Agent Runtime installer naming can differ.
+                        # See _ecs_agent_runtime_resource_arns.
                         "Resource": runtime_resource_arns,
                     },
                     {
@@ -4246,7 +4523,9 @@ def _find_existing_cloudfront_distribution() -> Optional[Dict]:
     return enabled[0] if enabled else matches[0]
 
 
-def _reuse_cloudfront_distribution(dist: Dict) -> Dict[str, str]:
+def _reuse_cloudfront_distribution(
+    dist: Dict, origin_header_value: str
+) -> Dict[str, str]:
     """Reuse an existing CloudFront distribution and ensure required cache behaviors."""
     dist_id = dist["Id"]
     domain = dist["DomainName"]
@@ -4274,10 +4553,10 @@ def _reuse_cloudfront_distribution(dist: Dict) -> Dict[str, str]:
         )
 
     try:
-        _ensure_cloudfront_alb_origin_timeouts(dist_id)
+        _ensure_cloudfront_alb_origin_config(dist_id, origin_header_value)
     except Exception as e:
         logger.warning(
-            f"Could not update CloudFront ALB origin timeouts (reusing distribution anyway): {e}"
+            f"Could not update CloudFront ALB origin config (reusing distribution anyway): {e}"
         )
 
     return {"id": dist_id, "domain": domain}
@@ -4312,10 +4591,12 @@ def _cloudfront_alb_custom_origin_config() -> Dict[str, object]:
     }
 
 
-def _ensure_cloudfront_alb_origin_timeouts(
-    dist_id: str, timeout_seconds: int = SSE_ORIGIN_READ_TIMEOUT_SECONDS
+def _ensure_cloudfront_alb_origin_config(
+    dist_id: str,
+    origin_header_value: str,
+    timeout_seconds: int = SSE_ORIGIN_READ_TIMEOUT_SECONDS,
 ) -> None:
-    """Ensure CloudFront ALB origin read timeout supports long SSE tool runs."""
+    """Ensure CloudFront ALB origin sends the secret header and supports long SSE reads."""
     dist_config_response = cloudfront_client.get_distribution_config(Id=dist_id)
     dist_config = dist_config_response["DistributionConfig"]
     etag = dist_config_response["ETag"]
@@ -4327,18 +4608,34 @@ def _ensure_cloudfront_alb_origin_timeouts(
         if origin.get("Id") != alb_origin_id:
             continue
         custom = origin.setdefault("CustomOriginConfig", {})
-        if custom.get("OriginReadTimeout") == timeout_seconds:
-            logger.info(
-                f"  CloudFront ALB origin read timeout already {timeout_seconds}s"
-            )
-            return
-        custom["OriginReadTimeout"] = timeout_seconds
+        if custom.get("OriginReadTimeout") != timeout_seconds:
+            custom["OriginReadTimeout"] = timeout_seconds
+            updated = True
         custom.setdefault("OriginKeepaliveTimeout", 5)
-        updated = True
+
+        desired_headers = _cloudfront_alb_origin_custom_headers(origin_header_value)
+        current_headers = origin.get("CustomHeaders") or {"Quantity": 0, "Items": []}
+        current_items = current_headers.get("Items") or []
+        header_ok = any(
+            item.get("HeaderName") == custom_header_name
+            and item.get("HeaderValue") == origin_header_value
+            for item in current_items
+        )
+        if not header_ok or current_headers.get("Quantity") != 1:
+            origin["CustomHeaders"] = desired_headers
+            updated = True
         break
+    else:
+        logger.warning(
+            f"  CloudFront ALB origin {alb_origin_id} not found; skipping origin config update"
+        )
+        return
 
     if not updated:
-        logger.warning(f"  CloudFront ALB origin {alb_origin_id} not found; skipping timeout update")
+        logger.info(
+            f"  CloudFront ALB origin header/timeout already configured "
+            f"(timeout={timeout_seconds}s)"
+        )
         return
 
     cloudfront_client.update_distribution(
@@ -4346,8 +4643,21 @@ def _ensure_cloudfront_alb_origin_timeouts(
         DistributionConfig=dist_config,
         IfMatch=etag,
     )
-    logger.info(f"  ✓ CloudFront ALB origin read timeout set to {timeout_seconds}s")
-    logger.warning("  Note: CloudFront origin timeout changes may take 15-20 minutes to deploy")
+    logger.info(
+        f"  ✓ CloudFront ALB origin updated "
+        f"(custom header + read timeout {timeout_seconds}s)"
+    )
+    logger.warning(
+        "  Note: CloudFront origin changes may take 15-20 minutes to deploy"
+    )
+
+
+def _ensure_cloudfront_alb_origin_timeouts(
+    dist_id: str, timeout_seconds: int = SSE_ORIGIN_READ_TIMEOUT_SECONDS
+) -> None:
+    """Backward-compatible wrapper; prefer _ensure_cloudfront_alb_origin_config."""
+    header_value = get_or_create_alb_origin_header(rotate=False)
+    _ensure_cloudfront_alb_origin_config(dist_id, header_value, timeout_seconds)
 
 
 def _cloudfront_s3_cache_behavior(path_pattern: str, s3_origin_id: str) -> Dict[str, object]:
@@ -4394,13 +4704,17 @@ def _ensure_cloudfront_s3_path_behavior(dist_id: str, path_pattern: str, s3_orig
     logger.warning("  Note: CloudFront behavior changes may take 15-20 minutes to deploy")
 
 
-def create_cloudfront_distribution(alb_info: Dict[str, str], s3_bucket_name: str) -> Dict[str, str]:
+def create_cloudfront_distribution(
+    alb_info: Dict[str, str],
+    s3_bucket_name: str,
+    origin_header_value: str,
+) -> Dict[str, str]:
     """Create CloudFront distribution with hybrid ALB + S3 origins."""
     logger.info("[7/10] Creating CloudFront distribution (ALB + S3 hybrid)")
 
     existing = _find_existing_cloudfront_distribution()
     if existing:
-        return _reuse_cloudfront_distribution(existing)
+        return _reuse_cloudfront_distribution(existing, origin_header_value)
     
     # Check for existing Origin Access Identity or create new one (needed before creating distribution)
     logger.info("  Checking for existing Origin Access Identity for S3...")
@@ -4503,10 +4817,9 @@ def create_cloudfront_distribution(alb_info: Dict[str, str], s3_bucket_name: str
                     "Id": f"alb-{project_name}",
                     "DomainName": alb_info["dns"],
                     "CustomOriginConfig": _cloudfront_alb_custom_origin_config(),
-                    "CustomHeaders": {
-                        "Quantity": 0,
-                        "Items": []
-                    },
+                    "CustomHeaders": _cloudfront_alb_origin_custom_headers(
+                        origin_header_value
+                    ),
                     "OriginPath": ""
                 },
                 {
@@ -5564,68 +5877,15 @@ def create_alb_target_group_for_ecs(vpc_info: Dict[str, str]) -> str:
     return tg_arn
 
 
-def create_alb_listener_with_target_group(alb_info: Dict[str, str], tg_arn: str) -> str:
-    """Create ALB listener forwarding to the ECS target group."""
-    listener_arn = None
-    try:
-        listeners = elbv2_client.describe_listeners(LoadBalancerArn=alb_info["arn"])
-        for listener in listeners.get("Listeners", []):
-            if listener["Port"] == 80 and listener["Protocol"] == "HTTP":
-                listener_arn = listener["ListenerArn"]
-                logger.warning(f"  Listener already exists on port 80: {listener_arn}")
-                break
-    except ClientError as e:
-        logger.warning(f"  Error checking existing listeners: {e}")
-
-    if not listener_arn:
-        listener_response = elbv2_client.create_listener(
-            LoadBalancerArn=alb_info["arn"],
-            Protocol="HTTP",
-            Port=80,
-            DefaultActions=[{"Type": "forward", "TargetGroupArn": tg_arn}],
-        )
-        listener_arn = listener_response["Listeners"][0]["ListenerArn"]
-        logger.info(f"  ✓ Created ALB listener: {listener_arn}")
-
-    rule_exists = False
-    try:
-        rules = elbv2_client.describe_rules(ListenerArn=listener_arn)
-        for rule in rules.get("Rules", []):
-            if rule.get("Priority") == "10":
-                for condition in rule.get("Conditions", []):
-                    if (
-                        condition.get("Field") == "http-header"
-                        and condition.get("HttpHeaderConfig", {}).get("HttpHeaderName") == custom_header_name
-                    ):
-                        rule_exists = True
-                        break
-                if rule_exists:
-                    break
-    except ClientError as e:
-        logger.debug(f"  Error checking existing rules: {e}")
-
-    if not rule_exists:
-        try:
-            elbv2_client.create_rule(
-                ListenerArn=listener_arn,
-                Priority=10,
-                Conditions=[
-                    {
-                        "Field": "http-header",
-                        "HttpHeaderConfig": {
-                            "HttpHeaderName": custom_header_name,
-                            "Values": [custom_header_value],
-                        },
-                    }
-                ],
-                Actions=[{"Type": "forward", "TargetGroupArn": tg_arn}],
-            )
-            logger.info("  ✓ Created rule for custom header")
-        except ClientError as e:
-            if e.response["Error"]["Code"] not in ["PriorityInUse", "RuleAlreadyExists"]:
-                raise
-
-    return listener_arn
+def create_alb_listener_with_target_group(
+    alb_info: Dict[str, str],
+    tg_arn: str,
+    origin_header_value: str,
+) -> str:
+    """Create ALB listener: 403 by default, forward only with origin header."""
+    return ensure_alb_listener_origin_protection(
+        alb_info["arn"], tg_arn, origin_header_value
+    )
 
 
 def _ensure_private_subnets(vpc_info: Dict[str, str]) -> List[str]:
@@ -5880,9 +6140,13 @@ def deploy_ecs_service(
     app_environment: Dict[str, str],
     log_group_name: str,
     s3_files_info: Optional[Dict[str, object]] = None,
+    origin_header_value: str = "",
 ) -> Dict[str, str]:
     """Create ECS task definition and Fargate service behind the ALB."""
     logger.info("[9/10] Deploying ECS Fargate service")
+
+    if not origin_header_value:
+        origin_header_value = get_or_create_alb_origin_header(rotate=False)
 
     ensure_ecs_service_linked_role()
 
@@ -5894,7 +6158,9 @@ def deploy_ecs_service(
     private_subnets = _ensure_private_subnets(vpc_info)
     cluster_arn = create_ecs_cluster()
     tg_arn = create_alb_target_group_for_ecs(vpc_info)
-    listener_arn = create_alb_listener_with_target_group(alb_info, tg_arn)
+    listener_arn = create_alb_listener_with_target_group(
+        alb_info, tg_arn, origin_header_value
+    )
 
     task_family = f"task-for-{project_name}"
     service_name = f"service-for-{project_name}"
@@ -6459,94 +6725,10 @@ def create_alb_target_group_and_listener(alb_info: Dict[str, str], instance_id: 
             else:
                 raise
     
-    # Check if listener already exists
-    listener_arn = None
-    try:
-        listeners = elbv2_client.describe_listeners(LoadBalancerArn=alb_info["arn"])
-        for listener in listeners.get("Listeners", []):
-            if listener["Port"] == 80 and listener["Protocol"] == "HTTP":
-                listener_arn = listener["ListenerArn"]
-                logger.warning(f"  Listener already exists on port 80: {listener_arn}")
-                break
-    except ClientError as e:
-        logger.warning(f"  Error checking existing listeners: {e}")
-    
-    # Create listener if it doesn't exist
-    if not listener_arn:
-        logger.debug("Creating ALB listener on port 80")
-        try:
-            listener_response = elbv2_client.create_listener(
-                LoadBalancerArn=alb_info["arn"],
-                Protocol="HTTP",
-                Port=80,
-                DefaultActions=[
-                    {
-                        "Type": "forward",
-                        "TargetGroupArn": tg_arn
-                    }
-                ]
-            )
-            listener_arn = listener_response["Listeners"][0]["ListenerArn"]
-            logger.debug(f"Listener created: {listener_arn}")
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "DuplicateListener":
-                # Try to get the existing listener again
-                listeners = elbv2_client.describe_listeners(LoadBalancerArn=alb_info["arn"])
-                for listener in listeners.get("Listeners", []):
-                    if listener["Port"] == 80 and listener["Protocol"] == "HTTP":
-                        listener_arn = listener["ListenerArn"]
-                        logger.warning(f"  Listener already exists on port 80: {listener_arn}")
-                        break
-            else:
-                raise
-    
-    # Check if rule already exists for custom header
-    rule_exists = False
-    try:
-        rules = elbv2_client.describe_rules(ListenerArn=listener_arn)
-        for rule in rules.get("Rules", []):
-            # Check if rule has Priority 10 and matches our custom header condition
-            if rule.get("Priority") == "10":
-                for condition in rule.get("Conditions", []):
-                    if (condition.get("Field") == "http-header" and 
-                        condition.get("HttpHeaderConfig", {}).get("HttpHeaderName") == custom_header_name):
-                        rule_exists = True
-                        logger.warning(f"  Rule with Priority 10 for custom header already exists: {rule['RuleArn']}")
-                        break
-                if rule_exists:
-                    break
-    except ClientError as e:
-        logger.debug(f"  Error checking existing rules: {e}")
-    
-    # Add rule for custom header if it doesn't exist
-    if not rule_exists:
-        logger.debug("Creating rule for custom header")
-        try:
-            elbv2_client.create_rule(
-                ListenerArn=listener_arn,
-                Priority=10,
-                Conditions=[
-                    {
-                        "Field": "http-header",
-                        "HttpHeaderConfig": {
-                            "HttpHeaderName": custom_header_name,
-                            "Values": [custom_header_value]
-                        }
-                    }
-                ],
-                Actions=[
-                    {
-                        "Type": "forward",
-                        "TargetGroupArn": tg_arn
-                    }
-                ]
-            )
-            logger.info(f"  ✓ Created rule for custom header")
-        except ClientError as e:
-            if e.response["Error"]["Code"] in ["PriorityInUse", "RuleAlreadyExists"]:
-                logger.warning(f"  Rule with Priority 10 already exists")
-            else:
-                raise
+    origin_header_value = get_or_create_alb_origin_header(rotate=False)
+    listener_arn = ensure_alb_listener_origin_protection(
+        alb_info["arn"], tg_arn, origin_header_value
+    )
     
     logger.info(f"✓ ALB target group and listener created")
     logger.info(f"  Target group: {tg_arn}")
@@ -7590,13 +7772,19 @@ def main():
             ecs_task_role_name=ecs_task_role_name,
         )
         logger.info("S3 Files session storage created...")
+
+        # 5.6. CloudFront→ALB origin verification header (Secrets Manager)
+        logger.info("Creating/loading ALB origin header secret...")
+        origin_header_value = get_or_create_alb_origin_header()
         
         # 6. Create ALB
         alb_info = create_alb(vpc_info)
         logger.info(f"ALB created...")
         
         # 7. Create CloudFront distribution
-        cloudfront_info = create_cloudfront_distribution(alb_info, s3_bucket_name)
+        cloudfront_info = create_cloudfront_distribution(
+            alb_info, s3_bucket_name, origin_header_value
+        )
         logger.info(f"CloudFront distribution created...")
         
         # 8. Build and push Docker image to ECR, then deploy ECS service
@@ -7638,6 +7826,11 @@ def main():
         else:
             logger.warning("Langgraph agent runtime installation failed or was skipped.")
 
+        # Refresh ECS task role so AgentCore Resource ARNs include the real runtime
+        # (e.g. agentic_work-*), not only root project_name naming.
+        ecs_roles = create_ecs_roles()
+        logger.info("ECS task AgentCore IAM policy refreshed for installed runtime...")
+
         repository_uri = create_ecr_repository()
         image_build_tag = None
         if args.skip_docker_build:
@@ -7671,6 +7864,7 @@ def main():
             app_environment,
             log_group_name,
             s3_files_info=s3_files_info,
+            origin_header_value=origin_header_value,
         )
         logger.info("ECS service deployed...")
 
