@@ -388,6 +388,57 @@ def delete_inline_policies_if_present(role_name: str, policy_names: List[str]) -
                 raise
 
 
+def _bedrock_knowledge_base_trust_policy() -> Dict:
+    """Trust policy for Bedrock Knowledge Base service role (AWS recommended)."""
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"Service": "bedrock.amazonaws.com"},
+                "Action": "sts:AssumeRole",
+                "Condition": {
+                    "StringEquals": {"aws:SourceAccount": account_id},
+                    "ArnLike": {
+                        "aws:SourceArn": (
+                            f"arn:aws:bedrock:{region}:{account_id}:knowledge-base/*"
+                        )
+                    },
+                },
+            }
+        ],
+    }
+
+
+def wait_for_iam_role_propagation(role_name: str, wait_seconds: int = 15) -> None:
+    """Wait for IAM role and inline policies to propagate."""
+    logger.info(f"  Waiting {wait_seconds}s for IAM role propagation: {role_name}")
+    time.sleep(wait_seconds)
+
+    expected_policies = {
+        f"kb-bedrock-policy-for-{project_name}",
+        f"kb-s3-policy-for-{project_name}",
+        f"kb-opensearch-policy-for-{project_name}",
+    }
+    for attempt in range(3):
+        try:
+            attached = iam_client.list_role_policies(RoleName=role_name)
+            missing = expected_policies - set(attached.get("PolicyNames", []))
+            if not missing:
+                logger.info("  ✓ Knowledge Base role inline policies are attached")
+                return
+            logger.debug(
+                f"  Waiting for inline policies (attempt {attempt + 1}/3): {sorted(missing)}"
+            )
+        except ClientError as e:
+            logger.debug(f"  Could not list role policies yet: {e}")
+        time.sleep(5)
+
+    logger.warning(
+        "  Some Knowledge Base role inline policies may not be visible yet; continuing"
+    )
+
+
 def _project_s3_bucket_arns() -> Tuple[str, str]:
     """Return (bucket ARN, object ARN) for the project storage bucket."""
     bucket_arn = f"arn:aws:s3:::{bucket_name}"
@@ -408,10 +459,10 @@ def create_knowledge_base_role() -> str:
     delete_inline_policies_if_present(
         role_name,
         [
-            f"kb-bedrock-policy-for-{project_name}",
-            f"kb-opensearch-policy-for-{project_name}",
-            f"kb-opensearch-policy-for-{project_name}",
-            f"kb-s3-policy-for-{project_name}",
+            f"bedrock-invoke-policy-for-{project_name}",
+            f"bedrock-agent-bedrock-policy-for-{project_name}",
+            f"bedrock-agent-s3vectors-policy-for-{project_name}",
+            f"knowledge-base-s3-policy-for-{project_name}",
             f"bedrock-agent-opensearch-policy-for-{project_name}",
         ],
     )
