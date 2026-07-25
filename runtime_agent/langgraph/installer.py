@@ -336,6 +336,84 @@ def update_knowledge_base_config() -> bool:
 # IAM Policy and Role Creation Functions
 # ============================================================================
 
+def agent_runtime_name(project_name: str) -> str:
+    """Return Bedrock AgentCore runtime name (e.g. strands_runtime)."""
+    return project_name.replace("-", "_")
+
+
+def _project_agent_runtime_resource_arns(config) -> list:
+    """IAM Resource ARNs limited to this project's AgentCore runtime (+ endpoints)."""
+    region = config["region"]
+    account_id = config["accountId"]
+    project_name = config.get("projectName", "agentcore")
+    runtime_name = agent_runtime_name(project_name)
+    arns = [
+        f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/{runtime_name}",
+        f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/{runtime_name}-*",
+        (
+            f"arn:aws:bedrock-agentcore:{region}:{account_id}:"
+            f"runtime/{runtime_name}/runtime-endpoint/*"
+        ),
+        (
+            f"arn:aws:bedrock-agentcore:{region}:{account_id}:"
+            f"runtime/{runtime_name}-*/runtime-endpoint/*"
+        ),
+    ]
+    agent_runtime_arn = (config.get("agent_runtime_arn") or "").strip()
+    if agent_runtime_arn:
+        if agent_runtime_arn not in arns:
+            arns.append(agent_runtime_arn)
+        endpoint_arn = f"{agent_runtime_arn}/runtime-endpoint/*"
+        if endpoint_arn not in arns:
+            arns.append(endpoint_arn)
+    return arns
+
+
+def _project_s3_resource_arns(config) -> tuple:
+    """Return (bucket_arns, object_arns) for project storage (+ optional vector bucket)."""
+    region = config["region"]
+    account_id = config["accountId"]
+    project_name = config.get("projectName", "agentcore")
+    s3_bucket = config.get(
+        "s3_bucket",
+        f"storage-for-{project_name}-{account_id}-{region}",
+    )
+    bucket_arns = [f"arn:aws:s3:::{s3_bucket}"]
+    object_arns = [f"arn:aws:s3:::{s3_bucket}/*"]
+
+    # Optional vector / alternate bucket names from config (never account-wide *).
+    for key in ("vector_bucket_name",):
+        extra = (config.get(key) or "").strip()
+        if not extra or extra == s3_bucket:
+            continue
+        bucket_arn = f"arn:aws:s3:::{extra}"
+        if bucket_arn not in bucket_arns:
+            bucket_arns.append(bucket_arn)
+            object_arns.append(f"{bucket_arn}/*")
+
+    s3_arn = (config.get("s3_arn") or "").strip()
+    if s3_arn.startswith("arn:aws:s3:::") and s3_arn not in bucket_arns:
+        bucket_arns.append(s3_arn)
+        object_arns.append(f"{s3_arn}/*")
+    return bucket_arns, object_arns
+
+
+def _project_secret_resource_arns(config) -> list:
+    """Secrets Manager ARNs used by this project (Tavily only; no Cognito stubs)."""
+    region = config["region"]
+    account_id = config["accountId"]
+    project_name = config.get("projectName", "agentcore")
+    secret_arns = [
+        f"arn:aws:secretsmanager:{region}:{account_id}:secret:tavilyapikey-{project_name}*",
+    ]
+    kb_name = (config.get("knowledge_base_name") or "").strip()
+    if kb_name and kb_name != project_name:
+        secret_arns.append(
+            f"arn:aws:secretsmanager:{region}:{account_id}:secret:tavilyapikey-{kb_name}*"
+        )
+    return secret_arns
+
+
 def create_bedrock_agentcore_policy(config):
     """Create IAM policy for Bedrock AgentCore access"""
     region = config['region']
@@ -345,10 +423,9 @@ def create_bedrock_agentcore_policy(config):
         "agentcore_websearch_gateway_region",
         config.get("agentcore_gateway_region", "us-east-1"),
     )
-    s3_bucket = config.get(
-        "s3_bucket",
-        f"storage-for-{projectName}-{accountId}-{region}",
-    )
+    runtime_resource_arns = _project_agent_runtime_resource_arns(config)
+    bucket_arns, object_arns = _project_s3_resource_arns(config)
+    secret_arns = _project_secret_resource_arns(config)
     
     policy_name = f"AmazonBedrockAgentCoreRuntimePolicyFor{projectName}"
     policy_description = f"Policy for accessing Bedrock AgentCore Runtime endpoints"
@@ -357,17 +434,28 @@ def create_bedrock_agentcore_policy(config):
         "Version": "2012-10-17",
         "Statement": [
             {
-                "Sid": "BedrockAgentCoreRuntime",
+                "Sid": "WorkloadAccessToken",
                 "Effect": "Allow",
                 "Action": [
                     "bedrock-agentcore:GetWorkloadAccessToken",
                     "bedrock-agentcore:GetWorkloadAccessTokenForJWT",
                     "bedrock-agentcore:GetWorkloadAccessTokenForUserId",
+                ],
+                "Resource": [
+                    (
+                        f"arn:aws:bedrock-agentcore:{region}:{accountId}:"
+                        f"workload-identity-directory/default/workload-identity/*"
+                    ),
+                ],
+            },
+            {
+                "Sid": "InvokeAgentCoreGatewayAndWebSearch",
+                "Effect": "Allow",
+                "Action": [
                     "bedrock-agentcore:InvokeGateway",
                     "bedrock-agentcore:InvokeWebSearch",
                 ],
                 "Resource": [
-                    f"arn:aws:bedrock-agentcore:{region}:{accountId}:*",
                     f"arn:aws:bedrock-agentcore:{gateway_region}:{accountId}:gateway/*",
                     (
                         f"arn:aws:bedrock-agentcore:{gateway_region}:"
@@ -388,7 +476,6 @@ def create_bedrock_agentcore_policy(config):
 
             {
                 # ListAgentRuntimes is account-scoped; IAM requires Resource "*".
-                # Used by mcp_config to resolve aws-tavily (and sibling) runtime ARNs.
                 "Sid": "ListAgentRuntimes",
                 "Effect": "Allow",
                 "Action": [
@@ -406,9 +493,7 @@ def create_bedrock_agentcore_policy(config):
                     "bedrock-agentcore:InvokeAgentRuntime",
                     "bedrock-agentcore:InvokeAgentRuntimeWithWebResponse",
                 ],
-                "Resource": [
-                    f"arn:aws:bedrock-agentcore:*:{accountId}:runtime/*",
-                ],
+                "Resource": runtime_resource_arns,
             },
             {
                 "Sid": "GetAgentCoreGateway",
@@ -480,13 +565,7 @@ def create_bedrock_agentcore_policy(config):
                     "secretsmanager:GetSecretValue",
                     "secretsmanager:DescribeSecret",
                 ],
-                "Resource": [
-                    f"arn:aws:secretsmanager:{region}:{accountId}:secret:tavilyapikey-{projectName}*",
-                    f"arn:aws:secretsmanager:{region}:{accountId}:secret:tavilyapikey*",
-                    f"arn:aws:secretsmanager:{region}:{accountId}:secret:notionapikey*",
-                    f"arn:aws:secretsmanager:{region}:{accountId}:secret:{projectName}/cognito/credentials*",
-                    f"arn:aws:secretsmanager:{region}:{accountId}:secret:{projectName}/credentials*",
-                ]
+                "Resource": secret_arns
             },
             {
                 "Sid": "ECRImagePull",
@@ -535,9 +614,7 @@ def create_bedrock_agentcore_policy(config):
                     "s3:ListBucket",
                     "s3:GetBucketLocation",
                 ],
-                "Resource": [
-                    f"arn:aws:s3:::{s3_bucket}"
-                ]
+                "Resource": bucket_arns,
             },
             {
                 "Sid": "ProjectS3Objects",
@@ -547,9 +624,7 @@ def create_bedrock_agentcore_policy(config):
                     "s3:PutObject",
                     "s3:DeleteObject",
                 ],
-                "Resource": [
-                    f"arn:aws:s3:::{s3_bucket}/*"
-                ]
+                "Resource": object_arns,
             },
             {
                 "Sid": "VpcNetworkInterface",
@@ -700,30 +775,44 @@ def attach_policy_to_role(role_name, policy_arn):
         return False
 
 def create_trust_policy_for_bedrock(config):
-    """Create trust policy for Bedrock AgentCore"""
-    accountId = config['accountId']
-    
-    trust_policy = {
+    """Trust policy for AgentCore Runtime: service principal only + confused-deputy guards.
+
+    Does not trust account root. SourceArn is limited to this project's runtime name.
+    """
+    account_id = config["accountId"]
+    region = config["region"]
+    project_name = config.get("projectName", "agentcore")
+    runtime_name = agent_runtime_name(project_name)
+    source_arns = [
+        f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/{runtime_name}",
+        f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/{runtime_name}-*",
+    ]
+    agent_runtime_arn = (config.get("agent_runtime_arn") or "").strip()
+    if agent_runtime_arn and agent_runtime_arn not in source_arns:
+        source_arns.append(agent_runtime_arn)
+
+    return {
         "Version": "2012-10-17",
         "Statement": [
             {
+                "Sid": "AssumeRolePolicy",
                 "Effect": "Allow",
                 "Principal": {
                     "Service": "bedrock-agentcore.amazonaws.com"
                 },
-                "Action": "sts:AssumeRole"
-            },
-            {
-                "Effect": "Allow",
-                "Principal": {
-                    "AWS": f"arn:aws:iam::{accountId}:root"
+                "Action": "sts:AssumeRole",
+                "Condition": {
+                    "StringEquals": {
+                        "aws:SourceAccount": account_id,
+                    },
+                    "ArnLike": {
+                        "aws:SourceArn": source_arns,
+                    },
                 },
-                "Action": "sts:AssumeRole"
             }
-        ]
+        ],
     }
-    
-    return trust_policy
+
 
 def create_bedrock_agentcore_role(config):
     """Create IAM role for Bedrock AgentCore MCP access"""
@@ -1376,10 +1465,6 @@ def push_to_ecr():
 # ============================================================================
 # Agent Runtime Creation/Update Functions
 # ============================================================================
-
-def agent_runtime_name(project_name: str) -> str:
-    """Return Bedrock AgentCore runtime name (e.g. agentic_work)."""
-    return project_name.replace("-", "_")
 
 
 def get_latest_image_tag(config):

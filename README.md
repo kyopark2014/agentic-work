@@ -2008,16 +2008,16 @@ if __name__ == "__main__":
 1. **역할 분리** — 배포자(installer 실행 IAM)와 런타임(ECS / AgentCore / KB) 권한을 분리하고, 런타임만 앱이 실제로 호출하는 API로 한정합니다.
 2. **최소 Action** — `bedrock:*`, `s3:*`, `ec2:*` 같은 서비스 와일드카드를 쓰지 않고, Invoke·Retrieve·Get/Put 등 필요한 Action만 허용합니다.
 3. **Resource 스코프** — `Resource: "*"` 대신 프로젝트 S3 버킷, Knowledge Base, Runtime/Gateway ARN, AOSS `collection/*`, Tavily secret 등 **이 배포의 리소스**로 한정합니다.
-4. **조건·Trust 축소** — Gateway는 `SourceAccount`/`SourceArn`, S3 Files는 Access Point ARN condition, ECS Task trust는 `ecs-tasks.amazonaws.com`만 허용합니다.
+4. **조건·Trust 축소** — Gateway·**AgentCore Runtime**은 `SourceAccount`/`SourceArn`, S3 Files는 Access Point ARN condition, ECS Task trust는 `ecs-tasks.amazonaws.com`만 허용합니다. AgentCore Runtime trust는 **account root를 포함하지 않습니다**.
 5. **죽은 권한 제거** — 미사용 역할(`create_agent_role`)과 CE/Lambda/Cognito 등 코드에서 쓰지 않는 정책을 제거합니다.
 
 installer가 만드는 **런타임 역할** 요약:
 
 | 역할 | 축소 요지 |
 |------|-----------|
-| ECS Task Role (`role-ecs-task-for-…`) | Bedrock Invoke/Mantle/KB ingest, AgentCore `InvokeAgentRuntime` + runtime 조회, 프로젝트 S3 버킷만 |
+| ECS Task Role (`role-ecs-task-for-…`) | Bedrock Invoke/Mantle/KB ingest, AgentCore `InvokeAgentRuntime`을 **프로젝트 runtime 이름**으로 한정, 프로젝트 S3 버킷만 |
 | Knowledge Base Role | `bedrock:InvokeModel`(+inference profile), 프로젝트 S3 Get/List, `aoss:APIAccessAll`을 `collection/*`로 한정 |
-| AgentCore Runtime Role (`AmazonBedrockAgentCoreRuntimePolicyFor…`) | Invoke·Retrieve·Mantle·secret 읽기·프로젝트 S3·VPC ENI·ECR pull·로그/메트릭만 |
+| AgentCore Runtime Role (`AmazonBedrockAgentCoreRuntimePolicyFor…`) | Trust: `bedrock-agentcore` + `SourceAccount`/`SourceArn`(프로젝트 runtime). 권한: 프로젝트 runtime ARN, Tavily secret만, 프로젝트 S3, Gateway/workload-identity, VPC ENI·ECR·로그 |
 | Websearch Gateway Role | `SourceAccount`/`SourceArn` 조건 유지 |
 | S3 Files 정책 | Access Point ARN condition 유지 |
 
