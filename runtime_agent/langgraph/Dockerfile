@@ -6,6 +6,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     nodejs \
     npm \
+    # myslide: cairosvg / SVG→PNG (runtime + compile deps for cairocffi on slim)
+    build-essential \
+    pkg-config \
+    libffi-dev \
+    libcairo2 \
+    libcairo2-dev \
+    libpango-1.0-0 \
+    libpangocairo-1.0-0 \
+    libgdk-pixbuf-2.0-0 \
+    shared-mime-info \
+    librsvg2-bin \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install boto3 botocore --upgrade
@@ -19,9 +30,11 @@ RUN pip install Pillow pytz tavily-python langchain-text-splitters
 RUN pip install requests beautifulsoup4
 RUN pip install python-docx openpyxl reportlab matplotlib pandas finance-datareader pypdf pdfplumber pyyaml
 RUN pip install colorama rich
+# myslide / pptx QA: PPTX edit + SVG→PNG (avoid runtime pip install delays)
+RUN pip install python-pptx cairosvg
 
-# Skills that use docx-js / pptxgenjs via bash/node (local install for require())
-RUN npm install docx pptxgenjs
+# Skills that use docx-js / pptxgenjs / sharp via bash/node (local install for require())
+RUN npm install docx pptxgenjs sharp
 ENV NODE_PATH=/app/node_modules
 
 # OpenTelemetry (ADOT + LangChain instrumentation for AgentCore Evaluations)
