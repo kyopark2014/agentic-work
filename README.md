@@ -515,7 +515,6 @@ function MarkdownText({ content }: { content: string }) {
 | `GET`/`POST` | `/api/session` | 세션 조회·생성. 쿠키는 HMAC 서명 토큰 (`v1.<payload>.<sig>`) |
 | `DELETE` | `/api/session` | 세션 쿠키 삭제 (로그아웃) |
 | `GET` | `/api/config` | Skill·MCP·Model 목록 및 기본값 |
-| `PATCH` | `/api/config/defaults` | 기본 Skill·MCP 저장 |
 | `GET`/`POST` | `/api/tasks` | 태스크 목록·생성 |
 | `GET`/`PATCH`/`DELETE` | `/api/tasks/{id}` | 태스크 조회·수정·삭제 |
 | `GET` | `/api/tasks/{id}/messages` | 태스크 메시지 목록 |
@@ -1781,6 +1780,7 @@ Long-term 조회가 잘 되려면:
 - 이 한도는 **사용자 수**가 아니라 **strategy 종류**(UserPreference / Summary / Semantic / Episodic 등)에 대한 제한입니다. 사용자 격리는 strategy를 늘리는 게 아니라 namespace의 `{actorId}`로 합니다. 현재 기본 구성은 3개라 여유(최대 6)가 있습니다.
 - 과거 구현처럼 actor마다 strategy를 만들면 6명에서 막히고, 신규 사용자는 short-term(`CreateEvent`)만 되고 long-term 추출·`recall_memory`가 비게 됩니다.
 - **기존 Memory 마이그레이션**: actor 이름 strategy가 6개까지 채워진 경우, 미사용 strategy를 삭제한 뒤 Runtime을 재기동하면 `create_strategy_if_not_exists`가 `UserPreference` / `Summary` / `Semantic`을 추가합니다. 리터럴 `/users/<old_actor>`에 있던 과거 record는 그대로이며, 신규 추출부터 템플릿 경로로 쌓입니다.
+
 #### MCP `recall_memory`
 
 | 파일 | 역할 |

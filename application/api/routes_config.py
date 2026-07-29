@@ -64,11 +64,6 @@ def load_capability_list(filename: str) -> list[str]:
         return []
 
 
-class DefaultsPatch(BaseModel):
-    default_skills: list[str] | None = None
-    default_mcp_servers: list[str] | None = None
-
-
 class LlmGatewaySettings(BaseModel):
     url: str = ""
     # Empty string means "keep existing stored key" (never echoed to clients).
@@ -248,15 +243,3 @@ def verify_llm_gateway(
     if result.get("ok"):
         _save_llm_gateway(url, key if key_provided else None)
     return result
-
-
-@router.patch("/defaults")
-def patch_defaults(
-    body: DefaultsPatch,
-    _admin: str = Depends(require_admin),
-):
-    utils.save_favorite_tools(
-        skills=body.default_skills,
-        mcp_servers=body.default_mcp_servers,
-    )
-    return {"ok": True}

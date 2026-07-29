@@ -91,20 +91,6 @@ def load_favorite_tools() -> dict[str, list[str]]:
     return favorites
 
 
-def save_favorite_tools(
-    *, skills: list[str] | None = None, mcp_servers: list[str] | None = None
-) -> dict[str, list[str]]:
-    favorites = load_favorite_tools()
-    if skills is not None:
-        favorites["SKILL"] = [v for v in skills if isinstance(v, str) and v.strip()]
-    if mcp_servers is not None:
-        favorites["MCP"] = [v for v in mcp_servers if isinstance(v, str) and v.strip()]
-
-    with open(favorite_tools_path, "w", encoding="utf-8") as f:
-        json.dump(favorites, f, ensure_ascii=False, indent=2)
-    return favorites
-
-
 def get_initial_tool_defaults() -> tuple[list[str], list[str]]:
     favorite_tools = load_favorite_tools()
     default_skills = favorite_tools.get("SKILL") or []

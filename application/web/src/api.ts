@@ -111,14 +111,6 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ url: body.url, key: body.key ?? "" }),
     }),
-  patchDefaults: (body: {
-    default_skills?: string[];
-    default_mcp_servers?: string[];
-  }) =>
-    request<{ ok: boolean }>("/api/config/defaults", {
-      method: "PATCH",
-      body: JSON.stringify(body),
-    }),
   listTasks: () => request<{ tasks: Task[] }>("/api/tasks"),
   createTask: (body: Partial<Task>) =>
     request<Task>("/api/tasks", {
