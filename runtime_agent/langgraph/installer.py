@@ -681,6 +681,8 @@ def create_bedrock_agentcore_policy(config):
                     "xray:PutTraceSegments",
                     "xray:PutTelemetryRecords",
                     "xray:PutAttributes",
+                    "xray:GetSamplingRules",
+                    "xray:GetSamplingTargets",
                 ],
                 "Resource": "*"
             },

@@ -30,6 +30,7 @@ mcp
 # Runtime / shared utilities
 httpx
 uv
+aiohttp>=3.14.1,<4.0.0
 requests
 aiosqlite
 pyyaml

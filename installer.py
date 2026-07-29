@@ -5947,14 +5947,81 @@ def _require_arm64_build_host(context: str) -> None:
 
 
 NATIVE_BUILDX_BUILDER = "ecs-native-builder"
+# docker-container driver pushes via BuildKit directly (avoids Docker Desktop
+# containerd image-store HEAD→403 against ECR).
+ECR_CONTAINER_BUILDX_BUILDER = "ecs-ecr-builder"
 
 
 def _normalize_buildx_builder_name(name: str) -> str:
     return name.strip().rstrip("*")
 
 
-def _list_docker_driver_builders() -> list[str]:
-    """Return buildx builder names that use the docker driver."""
+def _docker_uses_containerd_snapshotter() -> bool:
+    """Return True when the daemon stores images via containerd snapshotter.
+
+    Docker Desktop / Engine 29+ with containerd enabled shows ``unpacking to``
+    during buildx export and often fails ECR push with HEAD 403 on blobs.
+    """
+    try:
+        result = subprocess.run(
+            ["docker", "info", "--format", "{{json .DriverStatus}}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            raw = result.stdout.strip()
+            if "io.containerd.snapshotter" in raw or "containerd.snapshotter" in raw:
+                return True
+            try:
+                status = json.loads(raw)
+                if isinstance(status, list):
+                    for item in status:
+                        if not isinstance(item, (list, tuple)) or len(item) < 2:
+                            continue
+                        key = str(item[0]).lower()
+                        val = str(item[1]).lower()
+                        if "driver-type" in key and "containerd" in val:
+                            return True
+                        if "snapshotter" in key:
+                            return True
+            except json.JSONDecodeError:
+                pass
+
+        info = subprocess.run(
+            ["docker", "info"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        text = f"{info.stdout}\n{info.stderr}".lower()
+        if "driver-type: io.containerd.snapshotter" in text:
+            return True
+        if "storage driver" in text and "overlayfs" in text and "containerd" in text:
+            # Docker Desktop containerd store often reports overlayfs + containerd.
+            if "io.containerd" in text:
+                return True
+    except Exception:
+        pass
+
+    # Docker Desktop macOS setting (best-effort when daemon JSON is unavailable).
+    desktop_settings = os.path.expanduser(
+        "~/Library/Group Containers/group.com.docker/settings-store.json"
+    )
+    try:
+        with open(desktop_settings, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+        if settings.get("UseContainerdSnapshotter") is True:
+            return True
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    return False
+
+
+def _list_buildx_builders_by_driver(driver: str) -> list[str]:
+    """Return buildx builder names for the given driver (docker / docker-container)."""
     builders: list[str] = []
 
     fmt = subprocess.run(
@@ -5967,7 +6034,7 @@ def _list_docker_driver_builders() -> list[str]:
     if fmt.returncode == 0:
         for line in fmt.stdout.splitlines():
             parts = line.strip().split()
-            if len(parts) >= 2 and parts[1] == "docker":
+            if len(parts) >= 2 and parts[1] == driver:
                 name = _normalize_buildx_builder_name(parts[0])
                 if name and name not in builders:
                     builders.append(name)
@@ -5989,24 +6056,30 @@ def _list_docker_driver_builders() -> list[str]:
                 if len(parts) < 2:
                     continue
                 name = _normalize_buildx_builder_name(parts[0])
-                driver = parts[1]
-                if driver == "docker" and name not in builders:
+                listed_driver = parts[1]
+                if listed_driver == driver and name not in builders:
                     builders.append(name)
 
-    for fallback_name in ("default", "desktop-linux"):
-        if fallback_name in builders:
-            continue
-        inspect = subprocess.run(
-            ["docker", "buildx", "inspect", fallback_name],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-        if inspect.returncode == 0:
-            builders.append(fallback_name)
+    if driver == "docker":
+        for fallback_name in ("default", "desktop-linux"):
+            if fallback_name in builders:
+                continue
+            inspect = subprocess.run(
+                ["docker", "buildx", "inspect", fallback_name],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            if inspect.returncode == 0:
+                builders.append(fallback_name)
 
     return builders
+
+
+def _list_docker_driver_builders() -> list[str]:
+    """Return buildx builder names that use the docker driver."""
+    return _list_buildx_builders_by_driver("docker")
 
 
 def _current_docker_context() -> Optional[str]:
@@ -6034,6 +6107,21 @@ def _use_buildx_builder(name: str) -> None:
     if use.returncode != 0:
         err = (use.stderr or use.stdout).strip()
         raise RuntimeError(f"Failed to select buildx builder '{name}': {err}")
+
+
+def _bootstrap_buildx_builder() -> bool:
+    bootstrap = subprocess.run(
+        ["docker", "buildx", "inspect", "--bootstrap"],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    if bootstrap.returncode != 0:
+        err = (bootstrap.stderr or bootstrap.stdout).strip()
+        logger.warning(f"  buildx bootstrap failed ({err})")
+        return False
+    return True
 
 
 def _select_existing_docker_builder() -> Optional[str]:
@@ -6065,12 +6153,80 @@ def _select_existing_docker_builder() -> Optional[str]:
     return None
 
 
+def _ensure_docker_container_buildx_builder() -> bool:
+    """Create/select a docker-container buildx builder for ECR registry push."""
+    inspect = subprocess.run(
+        ["docker", "buildx", "inspect", ECR_CONTAINER_BUILDX_BUILDER],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if inspect.returncode != 0:
+        create = subprocess.run(
+            [
+                "docker", "buildx", "create",
+                "--name", ECR_CONTAINER_BUILDX_BUILDER,
+                "--driver", "docker-container",
+                "--use",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        if create.returncode != 0:
+            err = (create.stderr or create.stdout).strip()
+            # Reuse any existing healthy docker-container builder.
+            for name in _list_buildx_builders_by_driver("docker-container"):
+                try:
+                    _use_buildx_builder(name)
+                    if _bootstrap_buildx_builder():
+                        logger.info(
+                            f"  Reusing docker-container buildx builder: {name} "
+                            f"(create {ECR_CONTAINER_BUILDX_BUILDER} failed: {err})"
+                        )
+                        return True
+                except RuntimeError:
+                    continue
+            logger.warning(
+                f"  docker-container buildx builder setup failed ({err})"
+            )
+            return False
+    else:
+        _use_buildx_builder(ECR_CONTAINER_BUILDX_BUILDER)
+
+    if not _bootstrap_buildx_builder():
+        return False
+    logger.info(
+        f"  ✓ Using docker-container buildx builder for ECR push: "
+        f"{ECR_CONTAINER_BUILDX_BUILDER}"
+    )
+    return True
+
+
 def _ensure_native_buildx_builder() -> bool:
     """Ensure a usable buildx builder is selected for ECR push.
 
     Returns True when buildx is ready, False when callers should use classic
     ``docker build`` + ``docker push`` (native ARM64 EC2 hosts).
+
+    When Docker Desktop containerd image store is enabled, prefer a
+    docker-container builder so BuildKit pushes directly to ECR (avoids
+    containerd remotes HEAD→403 on missing blobs).
     """
+    if _docker_uses_containerd_snapshotter():
+        logger.info(
+            "  Detected containerd image store; preferring docker-container "
+            "buildx builder for ECR push"
+        )
+        if _ensure_docker_container_buildx_builder():
+            return True
+        logger.warning(
+            "  Falling back to docker-driver buildx builder "
+            "(containerd ECR push may fail with HEAD 403)"
+        )
+
     selected: Optional[str] = None
 
     inspect = subprocess.run(
@@ -6123,17 +6279,9 @@ def _ensure_native_buildx_builder() -> bool:
     if selected:
         _use_buildx_builder(selected)
 
-    bootstrap = subprocess.run(
-        ["docker", "buildx", "inspect", "--bootstrap"],
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
-    if bootstrap.returncode != 0:
-        err = (bootstrap.stderr or bootstrap.stdout).strip()
+    if not _bootstrap_buildx_builder():
         logger.warning(
-            f"  buildx bootstrap failed ({err}); "
+            "  buildx bootstrap failed; "
             "falling back to classic docker build + push."
         )
         return False
@@ -6141,19 +6289,47 @@ def _ensure_native_buildx_builder() -> bool:
     return True
 
 
+def _ecr_docker_login(registry: str) -> None:
+    """Refresh docker login credentials for the ECR registry."""
+    login_cmd = [
+        "aws", "ecr", "get-login-password",
+        "--region", region,
+    ]
+    login_result = subprocess.run(login_cmd, capture_output=True, text=True, check=False)
+    if login_result.returncode != 0:
+        raise RuntimeError(f"Failed to get ECR login password: {login_result.stderr.strip()}")
+
+    docker_login = subprocess.run(
+        ["docker", "login", "--username", "AWS", "--password-stdin", registry],
+        input=login_result.stdout,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if docker_login.returncode != 0:
+        raise RuntimeError(f"Docker login to ECR failed: {docker_login.stderr.strip()}")
+
+
+def _is_ecr_push_forbidden_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "403" in msg and ("forbidden" in msg or "head request" in msg)
+
+
 def _build_and_push_with_buildx(
     image_uri: str,
     docker_platform: str,
     project_root: str,
 ) -> None:
+    # oci-mediatypes=false keeps Docker schema2 manifests that ECR accepts
+    # reliably; --provenance/--sbom false avoids attestation index pushes.
     _run_command_streaming(
         [
             "docker", "buildx", "build",
             "--platform", docker_platform,
             "--provenance=false",
             "--sbom=false",
-            "-t", image_uri,
-            "--push",
+            "--output",
+            f"type=image,name={image_uri},push=true,oci-mediatypes=false",
             ".",
         ],
         cwd=project_root,
