@@ -560,6 +560,7 @@ def create_bedrock_agentcore_policy(config):
                     "bedrock-agentcore:ListSessions",
                     "bedrock-agentcore:GetMemory",
                     "bedrock-agentcore:UpdateMemory",
+                    "bedrock-agentcore:ListMemories",
                     "bedrock-agentcore-control:GetMemory",
                     "bedrock-agentcore-control:UpdateMemory",
                     "bedrock-agentcore-control:ListMemories",
