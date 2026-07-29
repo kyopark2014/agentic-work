@@ -36,8 +36,8 @@ MIN_BOTO3_VERSION_FOR_AGENTCORE_CONNECTOR = "1.43.32"
 git_name = "agentic-work"
 
 # SSE streaming: long tool runs can go 30s+ without tokens; CloudFront/ALB must stay open.
-SSE_ORIGIN_READ_TIMEOUT_SECONDS = 120
-ALB_IDLE_TIMEOUT_SECONDS = 120
+SSE_ORIGIN_READ_TIMEOUT_SECONDS = 600
+ALB_IDLE_TIMEOUT_SECONDS = 600
 
 
 def agent_runtime_name(project_name: str) -> str:
