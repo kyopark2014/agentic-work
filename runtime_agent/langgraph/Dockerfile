@@ -28,7 +28,7 @@ RUN pip install bedrock-agentcore uv
 RUN pip install "mcp>=1.9.0,<2"
 RUN pip install Pillow pytz tavily-python langchain-text-splitters
 RUN pip install requests beautifulsoup4
-RUN pip install python-docx openpyxl reportlab matplotlib pandas finance-datareader pypdf pdfplumber pyyaml
+RUN pip install python-docx openpyxl reportlab matplotlib pandas finance-datareader pypdf pdfplumber pyyaml defusedxml lxml
 RUN pip install colorama rich
 # myslide / pptx QA: PPTX edit + SVG→PNG (avoid runtime pip install delays)
 RUN pip install python-pptx cairosvg
