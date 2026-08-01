@@ -36,16 +36,35 @@ export interface AppConfig {
   projectName: string;
   google_client_id?: string;
   local_auth_bypass?: boolean;
+  /** Present only after authentication. */
   is_admin?: boolean;
+  skills?: string[];
+  mcp_servers?: string[];
+  models?: string[];
+  gateway_models?: string[];
+  default_model?: string;
+  default_gateway_model?: string;
+  default_skills?: string[];
+  default_mcp_servers?: string[];
+  llm_gateway_configured?: boolean;
+}
+
+/** True when /api/config returned authenticated capability catalogs. */
+export function hasAuthenticatedConfig(
+  config: AppConfig | null | undefined,
+): config is AppConfig & {
   skills: string[];
   mcp_servers: string[];
   models: string[];
-  gateway_models?: string[];
   default_model: string;
-  default_gateway_model?: string;
-  default_skills: string[];
-  default_mcp_servers: string[];
-  llm_gateway_configured?: boolean;
+} {
+  return Boolean(
+    config &&
+      Array.isArray(config.skills) &&
+      Array.isArray(config.mcp_servers) &&
+      Array.isArray(config.models) &&
+      typeof config.default_model === "string",
+  );
 }
 
 export interface DashboardSummary {

@@ -108,8 +108,8 @@ export const appDataService = {
       if (latest.length > 0) return latest[0];
       return await api.createTask({
         model_name: config.default_model,
-        skills: config.default_skills,
-        mcp_servers: config.default_mcp_servers,
+        skills: config.default_skills ?? [],
+        mcp_servers: config.default_mcp_servers ?? [],
         memory_enabled: true,
         llm_gateway_enabled: llmGatewayReady,
       });

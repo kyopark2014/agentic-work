@@ -165,6 +165,23 @@ def _gateway_ui_models() -> list[str]:
 
 @router.get("")
 def get_config(request: Request):
+    """Return public auth bootstrap fields; full capability lists only when logged in.
+
+    Unauthenticated clients get only what the login screen needs
+    (project name, Google OAuth client id, local-auth bypass flag).
+    Model / MCP / skill catalogs and gateway details require a session.
+    """
+    config = utils.load_config()
+    public = {
+        "projectName": config.get("projectName", "agent"),
+        "google_client_id": (config.get("google_client_id") or "").strip(),
+        "local_auth_bypass": local_auth_bypass_enabled(request),
+    }
+
+    session_user = get_optional_user_id(request)
+    if not session_user:
+        return public
+
     skill_options = load_capability_list("skills.list")
     mcp_options = load_capability_list("mcp.list")
     default_skills, default_mcp = utils.get_initial_tool_defaults()
@@ -174,7 +191,6 @@ def get_config(request: Request):
         default_skills = ["skill-creator"]
     if not default_mcp:
         logger.info("No initial MCP defaults matched current capability list")
-    config = utils.load_config()
     gateway_url, gateway_key = _llm_gateway_from_config()
     gateway_models = _gateway_ui_models()
     default_gateway_model = (
@@ -182,12 +198,9 @@ def get_config(request: Request):
         if DEFAULT_GATEWAY_MODEL in gateway_models
         else (gateway_models[0] if gateway_models else DEFAULT_MODEL)
     )
-    session_user = get_optional_user_id(request)
     return {
-        "projectName": config.get("projectName", "agent"),
-        "google_client_id": (config.get("google_client_id") or "").strip(),
-        "local_auth_bypass": local_auth_bypass_enabled(request),
-        "is_admin": bool(session_user and is_admin_user(session_user)),
+        **public,
+        "is_admin": is_admin_user(session_user),
         "skills": skill_options,
         "mcp_servers": mcp_options,
         "models": MODELS,

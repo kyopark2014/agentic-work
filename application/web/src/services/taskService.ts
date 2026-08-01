@@ -20,8 +20,8 @@ export function buildNewTaskDefaults(
 ): CreateTaskDefaults {
   return {
     model_name: activeTask?.model_name ?? config.default_model,
-    skills: activeTask?.skills ?? config.default_skills,
-    mcp_servers: activeTask?.mcp_servers ?? config.default_mcp_servers,
+    skills: activeTask?.skills ?? config.default_skills ?? [],
+    mcp_servers: activeTask?.mcp_servers ?? config.default_mcp_servers ?? [],
     guardrail_enabled: activeTask?.guardrail_enabled ?? false,
     memory_enabled: activeTask?.memory_enabled ?? true,
     llm_gateway_enabled: activeTask?.llm_gateway_enabled ?? false,
@@ -31,8 +31,8 @@ export function buildNewTaskDefaults(
 export function buildFallbackTaskDefaults(config: AppConfig): CreateTaskDefaults {
   return {
     model_name: config.default_model,
-    skills: config.default_skills,
-    mcp_servers: config.default_mcp_servers,
+    skills: config.default_skills ?? [],
+    mcp_servers: config.default_mcp_servers ?? [],
     memory_enabled: true,
     llm_gateway_enabled: false,
   };

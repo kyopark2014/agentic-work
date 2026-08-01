@@ -19,6 +19,7 @@ import {
 } from "./services/messageService";
 import { api } from "./api";
 import type { AppConfig, Message, Task } from "./types";
+import { hasAuthenticatedConfig } from "./types";
 import { Sidebar } from "./components/Sidebar";
 import { ChatThread } from "./components/ChatThread";
 import { ChatInput } from "./components/ChatInput";
@@ -134,7 +135,7 @@ export default function App() {
   }, [config?.projectName, userId]);
 
   useEffect(() => {
-    if (!userId || !config) return;
+    if (!userId || !hasAuthenticatedConfig(config)) return;
     if (tasksBootstrappedForUserRef.current === userId) return;
 
     let cancelled = false;
@@ -228,9 +229,10 @@ export default function App() {
       setBootError(null);
       try {
         const session = await appDataService.setSession(credential);
+        // Fetch full config while session cookie is set, before unlocking the app shell.
+        await refreshConfig();
         setUserId(session.user_id.trim());
         setLlmGatewayReady(Boolean(session.llm_gateway_ready));
-        await refreshConfig();
       } catch (err) {
         setBootError(err instanceof Error ? err.message : String(err));
       }
@@ -244,9 +246,9 @@ export default function App() {
       try {
         const session =
           await appDataService.setSessionWithAccessToken(accessToken);
+        await refreshConfig();
         setUserId(session.user_id.trim());
         setLlmGatewayReady(Boolean(session.llm_gateway_ready));
-        await refreshConfig();
       } catch (err) {
         setBootError(err instanceof Error ? err.message : String(err));
       }
@@ -259,9 +261,9 @@ export default function App() {
       setBootError(null);
       try {
         const session = await appDataService.setLocalSession(id.trim());
+        await refreshConfig();
         setUserId(session.user_id.trim());
         setLlmGatewayReady(Boolean(session.llm_gateway_ready));
-        await refreshConfig();
       } catch (err) {
         setBootError(err instanceof Error ? err.message : String(err));
       }
@@ -271,6 +273,7 @@ export default function App() {
 
   async function handleLogout() {
     setBootError(null);
+    const projectName = config?.projectName;
     try {
       await appDataService.logout();
     } catch (err) {
@@ -292,13 +295,28 @@ export default function App() {
     setView("chat");
     setQueuedByTaskId({});
     setQueuePausedByTaskId({});
-    if (config?.projectName) {
-      document.title = formatBrandTitle(config.projectName);
+    // Drop authenticated capability catalogs from memory / re-fetch public bootstrap.
+    try {
+      await refreshConfig();
+    } catch (err) {
+      uiError("config refresh after logout failed", err);
+      setConfig((prev) =>
+        prev
+          ? {
+              projectName: prev.projectName,
+              google_client_id: prev.google_client_id,
+              local_auth_bypass: prev.local_auth_bypass,
+            }
+          : null,
+      );
+    }
+    if (projectName) {
+      document.title = formatBrandTitle(projectName);
     }
   }
 
   async function handleNewTask() {
-    if (!config) return;
+    if (!hasAuthenticatedConfig(config)) return;
     try {
       const defaults = buildNewTaskDefaults(config, activeTask);
       const task = await appDataService.createTask({
