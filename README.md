@@ -2052,6 +2052,15 @@ SG만으로는 공격자가 **자체 CloudFront**를 ALB DNS에 연결해 우회
 
 기본 ALB behavior(앱 API·SPA)에는 TrustedKeyGroups를 걸지 않습니다. HMAC 세션 쿠키와 Signed Cookies는 역할이 다릅니다(앱 인증 vs S3 정적 파일 접근).
 
+### Security response headers
+
+브라우저 응답에 HSTS·CSP·`X-Frame-Options`·`X-Content-Type-Options`·`Referrer-Policy`를 넣습니다.
+
+| 계층 | 내용 |
+|------|------|
+| 앱 미들웨어 | [application/security_headers.py](./application/security_headers.py) — 모든 ALB/SPA/API 응답. CSP는 Google Sign-In(`accounts.google.com`)을 허용. HSTS는 HTTPS viewer에만 |
+| CloudFront | AWS Managed-SecurityHeadersPolicy (`67f7725c-…`)를 default·S3 behavior에 연결. installer `ensure_cloudfront_security_headers()` / 신규 distribution 생성 시 적용 |
+
 ### HMAC session cookie
 
 Web UI 세션은 평문 `user_id` 쿠키가 아니라 **HMAC 서명 토큰**입니다. 쿠키 값을 임의 이메일로 바꿔도 서명이 맞지 않아 401이 납니다.

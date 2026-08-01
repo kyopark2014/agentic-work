@@ -14,6 +14,7 @@ from application.api.routes_chat import router as chat_router
 from application.api.routes_files import router as files_router
 from application.api.routes_rag import router as rag_router
 from application.api.routes_admin import router as admin_router
+from application.security_headers import SecurityHeadersMiddleware
 from application.task_store import init_db
 from application.task_store_persistence import (
     flush_persist,
@@ -81,6 +82,8 @@ app = FastAPI(
     redoc_url="/redoc" if _ENABLE_API_DOCS else None,
     openapi_url="/openapi.json" if _ENABLE_API_DOCS else None,
 )
+
+app.add_middleware(SecurityHeadersMiddleware)
 
 app.include_router(auth_router)
 app.include_router(config_router)

@@ -64,6 +64,10 @@ CLOUDFRONT_SIGNING_KEY_SECRET_NAME = f"{project_name}/cloudfront-signing-key"
 # Shared LLM Gateway fallback key (stripped from APP_CONFIG_JSON; ECS secrets inject).
 LLM_GATEWAY_KEY_SECRET_NAME = f"{project_name}/llm-gateway-key"
 CLOUDFRONT_S3_SIGNED_PATHS = ("/images/*", "/docs/*", "/artifacts/*")
+# AWS managed response headers policy: HSTS, X-Content-Type-Options, X-Frame-Options,
+# Referrer-Policy, XSS-Protection. App middleware adds CSP tailored for Google Sign-In.
+# https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-response-headers-policies.html
+CLOUDFRONT_SECURITY_HEADERS_POLICY_ID = "67f7725c-6f97-4210-82d7-5512b31e9d03"
 
 
 def _s3_prefixes_for_cloudfront() -> List[str]:
@@ -5083,6 +5087,14 @@ def _reuse_cloudfront_distribution(
         )
 
     try:
+        ensure_cloudfront_security_headers(dist_id)
+    except Exception as e:
+        logger.warning(
+            f"Could not attach CloudFront security response headers "
+            f"(reusing distribution anyway): {e}"
+        )
+
+    try:
         oai_id = _find_s3_oai_id_from_distribution(dist_id)
         if oai_id:
             ensure_cloudfront_oai_bucket_policy(bucket_name, oai_id)
@@ -5227,6 +5239,7 @@ def _cloudfront_s3_cache_behavior(
             },
         },
         "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",
+        "ResponseHeadersPolicyId": CLOUDFRONT_SECURITY_HEADERS_POLICY_ID,
         "Compress": True,
     }
     if key_group_id:
@@ -5300,6 +5313,52 @@ def ensure_cloudfront_s3_signed_cookies(dist_id: str, key_group_id: str) -> None
         IfMatch=etag,
     )
     logger.info("  ✓ Updated CloudFront distribution for signed cookies")
+    logger.warning("  Note: CloudFront behavior changes may take 15-20 minutes to deploy")
+
+
+def _behavior_has_security_headers(behavior: Dict) -> bool:
+    return (
+        behavior.get("ResponseHeadersPolicyId") == CLOUDFRONT_SECURITY_HEADERS_POLICY_ID
+    )
+
+
+def ensure_cloudfront_security_headers(dist_id: str) -> None:
+    """Attach AWS Managed-SecurityHeadersPolicy to default + S3 cache behaviors."""
+    dist_config_response = cloudfront_client.get_distribution_config(Id=dist_id)
+    dist_config = dist_config_response["DistributionConfig"]
+    etag = dist_config_response["ETag"]
+    changed = False
+
+    default_behavior = dist_config.get("DefaultCacheBehavior") or {}
+    if not _behavior_has_security_headers(default_behavior):
+        default_behavior["ResponseHeadersPolicyId"] = CLOUDFRONT_SECURITY_HEADERS_POLICY_ID
+        dist_config["DefaultCacheBehavior"] = default_behavior
+        changed = True
+        logger.info("  ✓ CloudFront default behavior: security response headers")
+
+    cache_behaviors = dist_config.get("CacheBehaviors") or {"Quantity": 0, "Items": []}
+    items = list(cache_behaviors.get("Items") or [])
+    for item in items:
+        if _behavior_has_security_headers(item):
+            continue
+        item["ResponseHeadersPolicyId"] = CLOUDFRONT_SECURITY_HEADERS_POLICY_ID
+        changed = True
+        logger.info(
+            "  ✓ CloudFront behavior %s: security response headers",
+            item.get("PathPattern"),
+        )
+
+    if not changed:
+        logger.info("  ✓ CloudFront security response headers already attached")
+        return
+
+    dist_config["CacheBehaviors"] = {"Quantity": len(items), "Items": items}
+    cloudfront_client.update_distribution(
+        Id=dist_id,
+        DistributionConfig=dist_config,
+        IfMatch=etag,
+    )
+    logger.info("  ✓ Updated CloudFront distribution for security response headers")
     logger.warning("  Note: CloudFront behavior changes may take 15-20 minutes to deploy")
 
 
@@ -5427,6 +5486,7 @@ def create_cloudfront_distribution(
             },
             "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",
             "OriginRequestPolicyId": "216adef6-5c7f-47e4-b989-5492eafa07d3",
+            "ResponseHeadersPolicyId": CLOUDFRONT_SECURITY_HEADERS_POLICY_ID,
             "Compress": True
         },
         "CacheBehaviors": {
