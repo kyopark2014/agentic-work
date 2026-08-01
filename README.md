@@ -2071,8 +2071,9 @@ installer 재실행 시 기존 타겟 그룹 attributes가 `app_cookie`로 갱�
 
 | 계층 | 내용 |
 |------|------|
-| 앱 미들웨어 | [application/security_headers.py](./application/security_headers.py) — 모든 ALB/SPA/API 응답. CSP는 Google Sign-In(`accounts.google.com`)을 허용. HSTS는 HTTPS viewer에만 |
-| CloudFront | AWS Managed-SecurityHeadersPolicy (`67f7725c-…`)를 default·S3 behavior에 연결. installer `ensure_cloudfront_security_headers()` / 신규 distribution 생성 시 적용 |
+| 앱 / uvicorn | Web UI 컨테이너·로컬 실행에 `--no-server-header` — `Server: uvicorn` 미발급 |
+| 앱 미들웨어 | [application/security_headers.py](./application/security_headers.py) — HSTS·CSP·frame/nosniff/referrer. CSP는 Google Sign-In 허용 |
+| CloudFront | 프로젝트 custom ResponseHeadersPolicy(`{project}-security-headers`): 보안 헤더 + origin `Server`/`X-Powered-By` 제거. installer `get_or_create_cloudfront_response_headers_policy()` / `ensure_cloudfront_security_headers()` |
 
 ### HMAC session cookie
 

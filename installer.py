@@ -64,10 +64,9 @@ CLOUDFRONT_SIGNING_KEY_SECRET_NAME = f"{project_name}/cloudfront-signing-key"
 # Shared LLM Gateway fallback key (stripped from APP_CONFIG_JSON; ECS secrets inject).
 LLM_GATEWAY_KEY_SECRET_NAME = f"{project_name}/llm-gateway-key"
 CLOUDFRONT_S3_SIGNED_PATHS = ("/images/*", "/docs/*", "/artifacts/*")
-# AWS managed response headers policy: HSTS, X-Content-Type-Options, X-Frame-Options,
-# Referrer-Policy, XSS-Protection. App middleware adds CSP tailored for Google Sign-In.
-# https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-response-headers-policies.html
-CLOUDFRONT_SECURITY_HEADERS_POLICY_ID = "67f7725c-6f97-4210-82d7-5512b31e9d03"
+# Prefer a project custom ResponseHeadersPolicy (security headers + strip origin Server).
+# Managed SecurityHeadersPolicy (67f7725c-…) does not remove Server: uvicorn.
+_cloudfront_response_headers_policy_id: Optional[str] = None
 
 
 def _s3_prefixes_for_cloudfront() -> List[str]:
@@ -5239,7 +5238,7 @@ def _cloudfront_s3_cache_behavior(
             },
         },
         "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",
-        "ResponseHeadersPolicyId": CLOUDFRONT_SECURITY_HEADERS_POLICY_ID,
+        "ResponseHeadersPolicyId": cloudfront_response_headers_policy_id(),
         "Compress": True,
     }
     if key_group_id:
@@ -5316,22 +5315,126 @@ def ensure_cloudfront_s3_signed_cookies(dist_id: str, key_group_id: str) -> None
     logger.warning("  Note: CloudFront behavior changes may take 15-20 minutes to deploy")
 
 
-def _behavior_has_security_headers(behavior: Dict) -> bool:
-    return (
-        behavior.get("ResponseHeadersPolicyId") == CLOUDFRONT_SECURITY_HEADERS_POLICY_ID
-    )
+def get_or_create_cloudfront_response_headers_policy() -> str:
+    """Security headers + remove origin Server (hides uvicorn) for viewer responses.
+
+    Removing Server makes CloudFront emit ``Server: CloudFront`` instead of
+    passing through ``Server: uvicorn``. CSP stays in app middleware (Google Sign-In).
+    """
+    global _cloudfront_response_headers_policy_id
+    if _cloudfront_response_headers_policy_id:
+        return _cloudfront_response_headers_policy_id
+
+    policy_name = f"{project_name}-security-headers"
+    marker: Optional[str] = None
+    while True:
+        kwargs: Dict[str, object] = {"Type": "custom", "MaxItems": "100"}
+        if marker:
+            kwargs["Marker"] = marker
+        resp = cloudfront_client.list_response_headers_policies(**kwargs)
+        policy_list = resp.get("ResponseHeadersPolicyList") or {}
+        for item in policy_list.get("Items") or []:
+            policy = item.get("ResponseHeadersPolicy") or {}
+            cfg = policy.get("ResponseHeadersPolicyConfig") or {}
+            if cfg.get("Name") == policy_name and policy.get("Id"):
+                _cloudfront_response_headers_policy_id = policy["Id"]
+                logger.info(
+                    "  ✓ Using existing CloudFront response headers policy: %s",
+                    _cloudfront_response_headers_policy_id,
+                )
+                return _cloudfront_response_headers_policy_id
+        if not policy_list.get("IsTruncated"):
+            break
+        marker = policy_list.get("NextMarker")
+        if not marker:
+            break
+
+    config = {
+        "Name": policy_name,
+        "Comment": (
+            f"Security headers for {project_name}; strip origin Server header"
+        ),
+        "SecurityHeadersConfig": {
+            "XSSProtection": {
+                "Override": True,
+                "Protection": True,
+                "ModeBlock": True,
+            },
+            "FrameOptions": {"Override": True, "FrameOption": "DENY"},
+            "ReferrerPolicy": {
+                "Override": True,
+                "ReferrerPolicy": "strict-origin-when-cross-origin",
+            },
+            "ContentTypeOptions": {"Override": True},
+            "StrictTransportSecurity": {
+                "Override": True,
+                "AccessControlMaxAgeSec": 31536000,
+                "IncludeSubdomains": True,
+                "Preload": False,
+            },
+        },
+        "RemoveHeadersConfig": {
+            "Quantity": 2,
+            "Items": [
+                {"Header": "Server"},
+                {"Header": "X-Powered-By"},
+            ],
+        },
+    }
+    try:
+        created = cloudfront_client.create_response_headers_policy(
+            ResponseHeadersPolicyConfig=config
+        )
+        _cloudfront_response_headers_policy_id = created["ResponseHeadersPolicy"]["Id"]
+        logger.info(
+            "  ✓ Created CloudFront response headers policy: %s",
+            _cloudfront_response_headers_policy_id,
+        )
+        return _cloudfront_response_headers_policy_id
+    except ClientError as e:
+        # Race or eventual consistency: re-list once by name.
+        logger.warning("  Response headers policy create failed; re-listing: %s", e)
+        marker = None
+        while True:
+            kwargs = {"Type": "custom", "MaxItems": "100"}
+            if marker:
+                kwargs["Marker"] = marker
+            resp = cloudfront_client.list_response_headers_policies(**kwargs)
+            policy_list = resp.get("ResponseHeadersPolicyList") or {}
+            for item in policy_list.get("Items") or []:
+                policy = item.get("ResponseHeadersPolicy") or {}
+                cfg = policy.get("ResponseHeadersPolicyConfig") or {}
+                if cfg.get("Name") == policy_name and policy.get("Id"):
+                    _cloudfront_response_headers_policy_id = policy["Id"]
+                    return _cloudfront_response_headers_policy_id
+            if not policy_list.get("IsTruncated"):
+                break
+            marker = policy_list.get("NextMarker")
+            if not marker:
+                break
+        raise
+
+
+def cloudfront_response_headers_policy_id() -> str:
+    """Cached custom ResponseHeadersPolicy id (create on first use)."""
+    return get_or_create_cloudfront_response_headers_policy()
+
+
+def _behavior_has_security_headers(behavior: Dict, policy_id: str) -> bool:
+    return behavior.get("ResponseHeadersPolicyId") == policy_id
 
 
 def ensure_cloudfront_security_headers(dist_id: str) -> None:
-    """Attach AWS Managed-SecurityHeadersPolicy to default + S3 cache behaviors."""
+    """Attach custom security ResponseHeadersPolicy to default + S3 cache behaviors."""
+    policy_id = cloudfront_response_headers_policy_id()
     dist_config_response = cloudfront_client.get_distribution_config(Id=dist_id)
     dist_config = dist_config_response["DistributionConfig"]
     etag = dist_config_response["ETag"]
     changed = False
 
     default_behavior = dist_config.get("DefaultCacheBehavior") or {}
-    if not _behavior_has_security_headers(default_behavior):
-        default_behavior["ResponseHeadersPolicyId"] = CLOUDFRONT_SECURITY_HEADERS_POLICY_ID
+    if not _behavior_has_security_headers(default_behavior, policy_id):
+        default_behavior["ResponseHeadersPolicyId"] = policy_id
         dist_config["DefaultCacheBehavior"] = default_behavior
         changed = True
         logger.info("  ✓ CloudFront default behavior: security response headers")
@@ -5339,9 +5442,9 @@ def ensure_cloudfront_security_headers(dist_id: str) -> None:
     cache_behaviors = dist_config.get("CacheBehaviors") or {"Quantity": 0, "Items": []}
     items = list(cache_behaviors.get("Items") or [])
     for item in items:
-        if _behavior_has_security_headers(item):
+        if _behavior_has_security_headers(item, policy_id):
             continue
-        item["ResponseHeadersPolicyId"] = CLOUDFRONT_SECURITY_HEADERS_POLICY_ID
+        item["ResponseHeadersPolicyId"] = policy_id
         changed = True
         logger.info(
             "  ✓ CloudFront behavior %s: security response headers",
@@ -5486,7 +5589,7 @@ def create_cloudfront_distribution(
             },
             "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",
             "OriginRequestPolicyId": "216adef6-5c7f-47e4-b989-5492eafa07d3",
-            "ResponseHeadersPolicyId": CLOUDFRONT_SECURITY_HEADERS_POLICY_ID,
+            "ResponseHeadersPolicyId": cloudfront_response_headers_policy_id(),
             "Compress": True
         },
         "CacheBehaviors": {
