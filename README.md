@@ -1818,6 +1818,147 @@ if chat.memory_enabled:
 
 로컬 테스트 시 Web UI를 8501로 띄운 뒤 Memory 토글을 켜고, 선호를 말한 다음(추출이 끝난 뒤) 이후 턴에서 Agent가 `recall_memory`로 불러오는지 확인하면 됩니다.
 
+## RAG
+
+Knowledge Base RAG는 **업로드(Web UI / application)** 와 **검색(Runtime MCP `kb-retriever`)** 으로 나뉩니다. 수동 S3 업로드·콘솔 Sync는 [Knowledge Base 문서 동기화 하기](#knowledge-base-문서-동기화-하기)를 참고하세요.
+
+| 역할 | 경로 | 설명 |
+|------|------|------|
+| 업로드 API | [routes_rag.py](./application/api/routes_rag.py) | `/api/rag/upload` — 세션 `user_id`로 업로드 |
+| 업로드 오케스트레이션 | [rag_service.py](./application/services/rag_service.py) | S3 적재 + sidecar metadata + KB sync |
+| S3 유틸 | [utils.py](./application/utils.py) | `docs/{user_id}/{file_name}` 키로 업로드 |
+| 검색 MCP | [mcp_server_retrieve.py](./runtime_agent/langgraph/mcp_server_retrieve.py), [mcp_retrieve.py](./runtime_agent/langgraph/mcp_retrieve.py) | Bedrock `Retrieve` + metadata filter |
+| MCP 등록 | [mcp_config.py](./runtime_agent/langgraph/mcp_config.py) (`kb-retriever`) | `AGENTCORE_USER_ID`는 `chat.create_agent()`에서 주입 |
+
+관련 AWS 문서:
+
+- [Connect to Amazon S3 for your knowledge base](https://docs.aws.amazon.com/bedrock/latest/userguide/s3-data-source-connector.html) — `.metadata.json` sidecar
+- [Configure and customize queries and response generation](https://docs.aws.amazon.com/bedrock/latest/userguide/kb-test-config.html) — metadata filtering operators
+- [RetrievalFilter](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_agent-runtime_RetrievalFilter.html) — API 필터 스키마
+
+### 업로드와 S3 경로
+
+로그인 `user_id`(예: Google 이메일 `user@example.com`)가 그대로 사용됩니다.
+
+- 문서: `s3://{bucket}/docs/{user_id}/{file_name}`
+- metadata sidecar: `s3://{bucket}/docs/{user_id}/{file_name}.metadata.json`
+
+이메일에는 `/`가 없으므로 S3 폴더명과 metadata `owner`, 검색 필터의 `user_id` 포맷이 동일합니다. 업로드 후 Knowledge Base data source sync(`StartIngestionJob`)를 시작합니다.
+
+### Metadata filtering 소개
+
+Bedrock Knowledge Base는 문서와 **같은 경로**에 `{원본파일명}.metadata.json`을 두면, ingestion 시 metadata attribute를 벡터 스토어에 저장합니다. Retrieve 시 `vectorSearchConfiguration.filter`로 이 속성을 필터링할 수 있습니다.
+
+지원 타입: `STRING`, `NUMBER`, `BOOLEAN`, `STRING_LIST`  
+주요 연산자 예:
+
+| 연산자 | 용도 |
+|--------|------|
+| `equals` / `notEquals` | 값 일치 / 불일치 (`notEquals`는 **키가 없는 문서도 포함**) |
+| `listContains` | `STRING_LIST`에 특정 값이 멤버로 포함되는지 |
+| `greaterThan` 등 | 숫자 비교 |
+| `andAll` / `orAll` | 조건 조합 |
+
+`includeForEmbedding: false`이면 metadata는 **필터 전용**이고 임베딩에는 들어가지 않습니다. `true`이면 key-value가 chunk 텍스트에 이어져 임베딩에 반영됩니다.
+
+**중요:** `.metadata.json`이 없는 문서는 해당 attribute가 `false`로 기본 세팅되지 않고 **속성 부재(absent)** 로 취급됩니다.
+
+- `equals: is_confidential = false` → 속성 없는 문서는 **제외**
+- `notEquals: is_confidential = true` → `false`인 문서 **및** 속성이 없는 문서 **포함**
+
+### 현재 적용된 metadata
+
+업로드 시 `rag_service.build_kb_metadata_document()`이 아래 sidecar를 생성합니다. 모든 attribute의 `includeForEmbedding`은 `false`입니다.
+
+```json
+{
+  "metadataAttributes": {
+    "owner": {
+      "value": {
+        "type": "STRING_LIST",
+        "stringListValue": ["user@example.com"]
+      },
+      "includeForEmbedding": false
+    },
+    "team": {
+      "value": { "type": "STRING", "stringValue": "mycompany" },
+      "includeForEmbedding": false
+    },
+    "created_time": {
+      "value": { "type": "STRING", "stringValue": "2026-08-02T07:37:00Z" },
+      "includeForEmbedding": false
+    },
+    "is_confidential": {
+      "value": { "type": "BOOLEAN", "booleanValue": false },
+      "includeForEmbedding": false
+    }
+  }
+}
+```
+
+| 필드 | 타입 | 기본값 | 비고 |
+|------|------|--------|------|
+| `owner` | `STRING_LIST` | 업로드한 `user_id` 1명 | 여러 owner 등록 가능 |
+| `team` | `STRING` | `mycompany` | |
+| `created_time` | `STRING` | UTC ISO 8601 (`...Z`) | 시각 포함 |
+| `is_confidential` | `BOOLEAN` | `false` | 공유/비기밀 문서 구분용 |
+
+### 현재 적용된 검색 필터
+
+`mcp_retrieve.retrieve()`는 MCP 프로세스 env의 `AGENTCORE_USER_ID`를 읽고, 없으면 검색을 거부합니다.  
+`chat.create_agent()`가 `memory`와 같이 `kb-retriever`에도 `AGENTCORE_USER_ID`를 주입합니다.
+
+현재 기본 필터는 **본인 문서만**:
+
+```json
+{
+  "listContains": {
+    "key": "owner",
+    "value": "user@example.com"
+  }
+}
+```
+
+### 향후 옵션: 비기밀(또는 metadata 없는) 문서
+
+`is_confidential`이 `false`이거나 metadata가 없어 속성이 없는 문서까지 검색하려면 `equals false`가 아니라 `notEquals true`를 사용합니다.
+
+```json
+{
+  "notEquals": {
+    "key": "is_confidential",
+    "value": true
+  }
+}
+```
+
+의미:
+
+- `is_confidential == false` → 포함
+- `is_confidential` 속성 없음 (구버전/수동 업로드) → 포함
+- `is_confidential == true` → 제외
+
+owner 스코프와 함께 쓰려면 `andAll`로 조합합니다.
+
+```json
+{
+  "andAll": [
+    {
+      "listContains": {
+        "key": "owner",
+        "value": "user@example.com"
+      }
+    },
+    {
+      "notEquals": {
+        "key": "is_confidential",
+        "value": true
+      }
+    }
+  ]
+}
+```
+
 ## 배포하기
 
 아래와 같이 EC2를 이용해 배포 환경을 구성합니다.
@@ -1915,7 +2056,9 @@ python uninstaller.py
 
 ### Knowledge Base 문서 동기화 하기 
 
-Knowledge Base에서 문서를 활용하기 위해서는 S3에 문서 등록 및 동기화기 필요합니다. [S3 Console](https://us-west-2.console.aws.amazon.com/s3/home?region=us-west-2)에 접속하여 "storage-for-agentcore-xxxxxxxxxxxx-us-west-2"를 선택하고, 아래와 같이 docs폴더를 생성한 후에 파일을 업로드 합니다. 
+Web UI RAG 업로드·metadata filtering·사용자별 검색은 [RAG](#rag)를 참고하세요.
+
+Knowledge Base에서 문서를 활용하기 위해서는 S3에 문서 등록 및 동기화가 필요합니다. [S3 Console](https://us-west-2.console.aws.amazon.com/s3/home?region=us-west-2)에 접속하여 "storage-for-agentcore-xxxxxxxxxxxx-us-west-2"를 선택하고, 아래와 같이 docs폴더를 생성한 후에 파일을 업로드 합니다. 
 
 <img width="400" alt="image" src="https://github.com/user-attachments/assets/482f635e-a38d-4525-b9a3-fb1c2a9089c8" />
 

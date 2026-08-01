@@ -44,7 +44,7 @@ def _validate_filename(filename: str) -> str:
 
 @router.post("/upload")
 async def upload_to_rag(request: Request, file: UploadFile = File(...)):
-    require_user_id(request)
+    user_id = require_user_id(request)
 
     file_name = _validate_filename(file.filename or "")
     file_bytes = await file.read()
@@ -52,6 +52,6 @@ async def upload_to_rag(request: Request, file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Empty file")
 
     try:
-        return ingest_rag_upload(file_bytes, file_name)
+        return ingest_rag_upload(file_bytes, file_name, user_id=user_id)
     except RagServiceError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc

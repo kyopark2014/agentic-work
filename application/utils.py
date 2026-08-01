@@ -215,8 +215,31 @@ def get_contents_type(file_name: str) -> str:
     return content_type
 
 
-def upload_to_s3(file_bytes: bytes, file_name: str) -> dict | None:
-    """Upload a file to S3 under docs/ (or images/) and return upload metadata."""
+def _sanitize_s3_user_segment(user_id: str | None) -> str | None:
+    """Return a safe single path segment for per-user S3 folders, or None."""
+    if not user_id:
+        return None
+    # Collapse path separators so user_id cannot escape the intended prefix.
+    segment = (
+        str(user_id)
+        .strip()
+        .replace("/", "_")
+        .replace("\\", "_")
+        .replace("..", "_")
+    )
+    return segment or None
+
+
+def upload_to_s3(
+    file_bytes: bytes,
+    file_name: str,
+    user_id: str | None = None,
+) -> dict | None:
+    """Upload a file to S3 under docs/ (or images/) and return upload metadata.
+
+    When ``user_id`` is provided, the object key becomes
+    ``{prefix}/{user_id}/{file_name}`` so each user has a separate folder.
+    """
     if not s3_bucket:
         logger.error("s3_bucket is not configured")
         return None
@@ -231,7 +254,13 @@ def upload_to_s3(file_bytes: bytes, file_name: str) -> dict | None:
         else:
             prefix = s3_prefix
 
-        s3_key = f"{prefix}/{file_name}"
+        user_segment = _sanitize_s3_user_segment(user_id)
+        if user_segment:
+            s3_key = f"{prefix}/{user_segment}/{file_name}"
+            relative_url_path = f"{prefix}/{parse.quote(user_segment)}/{parse.quote(file_name)}"
+        else:
+            s3_key = f"{prefix}/{file_name}"
+            relative_url_path = f"{prefix}/{parse.quote(file_name)}"
         user_meta = {"content_type": content_type}
 
         put_params = {
@@ -250,7 +279,7 @@ def upload_to_s3(file_bytes: bytes, file_name: str) -> dict | None:
 
         url = None
         if sharing_url:
-            url = f"{sharing_url.rstrip('/')}/{prefix}/{parse.quote(file_name)}"
+            url = f"{sharing_url.rstrip('/')}/{relative_url_path}"
 
         return {
             "file_name": file_name,

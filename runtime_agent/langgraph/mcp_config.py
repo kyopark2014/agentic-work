@@ -126,6 +126,7 @@ def load_config(mcp_type):
                     "args": [f"{workingDir}/mcp_server_retrieve.py"],
                     "env": {
                         "PYTHONPATH": workingDir,
+                        # AGENTCORE_USER_ID is injected at runtime in chat.create_agent()
                     },
                 }
             }

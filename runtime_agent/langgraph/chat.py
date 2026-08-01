@@ -1771,8 +1771,8 @@ async def create_agent(
 
     server_params = langgraph_agent.load_multiple_mcp_server_parameters(mcp_json)
 
-    # Pass current user_id to memory MCP via process env
-    for server_name in ("memory",):
+    # Pass current user_id to per-user MCP servers via process env
+    for server_name in ("memory", "kb-retriever"):
         params = server_params.get(server_name)
         if params and params.get("transport") == "stdio":
             env = dict(params.get("env") or {})
