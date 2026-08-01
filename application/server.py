@@ -39,6 +39,15 @@ logger.info("Agent backend mode: %s (docker agent backend disabled)", backend_mo
 _APPLICATION_DIR = os.path.dirname(os.path.abspath(__file__))
 _WEB_DIST = os.path.join(_APPLICATION_DIR, "web", "dist")
 
+# Swagger/ReDoc/OpenAPI expose full API surface — off by default (production).
+# Set ENABLE_API_DOCS=1 for local debugging (run_local.sh sets this).
+_ENABLE_API_DOCS = os.environ.get("ENABLE_API_DOCS", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -64,7 +73,14 @@ async def lifespan(app: FastAPI):
     logger.info("Task store shutdown persist complete")
 
 
-app = FastAPI(title="Agent UI", version="1.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="Agent UI",
+    version="1.0.0",
+    lifespan=lifespan,
+    docs_url="/docs" if _ENABLE_API_DOCS else None,
+    redoc_url="/redoc" if _ENABLE_API_DOCS else None,
+    openapi_url="/openapi.json" if _ENABLE_API_DOCS else None,
+)
 
 app.include_router(auth_router)
 app.include_router(config_router)

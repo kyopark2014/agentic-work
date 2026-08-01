@@ -520,6 +520,8 @@ function MarkdownText({ content }: { content: string }) {
 | `GET` | `/api/tasks/{id}/messages` | 태스크 메시지 목록 |
 | `POST` | `/api/tasks/{id}/chat` | 채팅 SSE 스트림 (`data: {...}`) |
 
+`/docs`, `/redoc`, `/openapi.json`은 기본 비활성입니다(운영 ECS). 로컬에서만 `ENABLE_API_DOCS=1`([run_local.sh](./run_local.sh) 기본값)로 Swagger를 켤 수 있습니다.
+
 채팅 요청은 `agentcore_client.run_agent` → AgentCore Runtime으로 전달되며, 태스크마다 고유한 `runtime_session_id`로 checkpoint가 격리됩니다.
 
 ### 세션 쿠키 (HMAC)

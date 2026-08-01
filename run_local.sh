@@ -38,4 +38,7 @@ fi
 
 echo "==> Starting uvicorn on 0.0.0.0:${PORT}"
 echo "    Open http://localhost:${PORT}"
+# Local-only: Swagger UI at /docs (disabled by default in production/ECS).
+export ENABLE_API_DOCS="${ENABLE_API_DOCS:-1}"
+export ALLOW_LOCAL_AUTH_BYPASS="${ALLOW_LOCAL_AUTH_BYPASS:-1}"
 exec uvicorn application.server:app --host 0.0.0.0 --port "${PORT}"
