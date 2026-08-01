@@ -1003,6 +1003,32 @@ select {
   cursor: not-allowed;
 }
 
+.chat-steer-btn {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.chat-steer-btn:hover:not(:disabled),
+.chat-steer-btn:focus-visible {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-primary);
+  outline: none;
+}
+
+.chat-steer-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .chat-add-menu {
   width: 100%;
   background: var(--bg-secondary);
@@ -1115,6 +1141,7 @@ select {
 }
 
 .chat-send-btn {
+  position: relative;
   width: 32px;
   height: 32px;
   flex-shrink: 0;
@@ -1137,6 +1164,65 @@ select {
 .chat-send-btn:disabled {
   opacity: 0.45;
   cursor: not-allowed;
+}
+
+/* Waiting / streaming: accent stop disc with spinning progress ring (clickable) */
+.chat-send-btn.is-waiting {
+  background: var(--accent);
+  color: #ffffff;
+  opacity: 0.85;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.chat-send-btn.is-waiting:hover {
+  background: var(--accent-hover);
+  opacity: 1;
+}
+
+.chat-send-btn.is-waiting:disabled {
+  opacity: 0.85;
+  cursor: pointer;
+}
+
+.chat-send-stop {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  background: #ffffff;
+  z-index: 1;
+}
+
+.chat-send-progress {
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg,
+    transparent 60deg,
+    var(--accent-hover) 140deg,
+    #5ecfad 220deg,
+    transparent 300deg,
+    transparent 360deg
+  );
+  -webkit-mask: radial-gradient(
+    farthest-side,
+    transparent calc(100% - 2.5px),
+    #000 calc(100% - 2.5px)
+  );
+  mask: radial-gradient(
+    farthest-side,
+    transparent calc(100% - 2.5px),
+    #000 calc(100% - 2.5px)
+  );
+  animation: chat-send-spin 0.9s linear infinite;
+}
+
+@keyframes chat-send-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .send-btn {
