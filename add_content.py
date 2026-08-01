@@ -4,8 +4,8 @@ Upload content to S3 and sync Knowledge Base data source
 """
 
 import boto3
-import json
 import os
+import sys
 import logging
 from botocore.exceptions import ClientError
 
@@ -14,17 +14,25 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 workingDir = os.path.dirname(os.path.abspath(__file__))
-config_path = os.path.join(workingDir, "application", "config.json")
+_strands_dir = os.path.join(workingDir, "runtime_agent", "strands")
+if _strands_dir not in sys.path:
+    sys.path.insert(0, _strands_dir)
 
-def load_config():
-    """Load configuration from config.json"""
-    try:
-        with open(config_path, 'r') as f:
-            return json.load(f)
-    except Exception as e:
-        logger.error(f"Error loading config: {e}")
-        logger.error(f"Try again after using 'python installer.py' to install the application")
+import utils  # noqa: E402
+
+_app_config_path = os.path.join(workingDir, "application", "config.json")
+
+
+def _require_config():
+    """Load shared config (application/config.json via utils.load_config)."""
+    config = utils.load_config(_app_config_path if os.path.isfile(_app_config_path) else None)
+    if not config.get("s3_bucket") or not config.get("knowledge_base_id"):
+        logger.error(
+            "Missing s3_bucket/knowledge_base_id in config. "
+            "Run `python installer.py` first to deploy and write application/config.json."
+        )
         exit(1)
+    return config
 
 def check_file_exists_in_s3(s3_client, bucket_name, key):
     """Check if file already exists in S3"""
@@ -66,7 +74,6 @@ def get_contents_type(file_name):
 def upload_file_to_s3(s3_client, local_file, bucket_name, s3_key):
     """Upload file to S3"""
     try:
-        # Read file content
         with open(local_file, 'rb') as f:
             file_bytes = f.read()
         
@@ -74,12 +81,10 @@ def upload_file_to_s3(s3_client, local_file, bucket_name, s3_key):
         logger.info(f"Uploading {local_file} to s3://{bucket_name}/{s3_key}")
         logger.info(f"Content type: {content_type}")
 
-        # Prepare metadata
         user_meta = {  # user-defined metadata
             "content_type": content_type
         }
         
-        # Prepare put_object parameters
         put_params = {
             'Bucket': bucket_name,
             'Key': s3_key,
@@ -87,7 +92,6 @@ def upload_file_to_s3(s3_client, local_file, bucket_name, s3_key):
             'Metadata': user_meta
         }
         
-        # Set ContentType if it's not "no info"
         if content_type != "no info":
             put_params['ContentType'] = content_type
         
@@ -96,7 +100,6 @@ def upload_file_to_s3(s3_client, local_file, bucket_name, s3_key):
         if content_type == "application/pdf":
             put_params['ContentDisposition'] = 'inline'
         
-        # Upload to S3
         response = s3_client.put_object(**put_params)
         logger.info(f"✓ Successfully uploaded to S3. ETag: {response.get('ETag', 'N/A')}")
 
@@ -113,7 +116,6 @@ def upload_file_to_s3(s3_client, local_file, bucket_name, s3_key):
 def sync_knowledge_base(bedrock_client, knowledge_base_id):
     """Sync Knowledge Base data source"""
     try:
-        # Get data sources for the knowledge base
         response = bedrock_client.list_data_sources(knowledgeBaseId=knowledge_base_id)
         
         if not response['dataSourceSummaries']:
@@ -122,7 +124,6 @@ def sync_knowledge_base(bedrock_client, knowledge_base_id):
             
         data_source_id = response['dataSourceSummaries'][0]['dataSourceId']
         
-        # Start ingestion job
         ingestion_response = bedrock_client.start_ingestion_job(
             knowledgeBaseId=knowledge_base_id,
             dataSourceId=data_source_id
@@ -137,34 +138,27 @@ def sync_knowledge_base(bedrock_client, knowledge_base_id):
         return False
 
 def main():
-    # Load configuration
-    config = load_config()
+    config = _require_config()
     region = config['region']
     s3_bucket = config['s3_bucket']
     knowledge_base_id = config['knowledge_base_id']
     
-    # Initialize AWS clients
     s3_client = boto3.client('s3', region_name=region)
     bedrock_client = boto3.client('bedrock-agent', region_name=region)
     
-    # File to upload
     local_file = "contents/error_code.pdf"
     s3_key = "docs/error_code.pdf"
     
-    # Check if file exists locally
     if not os.path.exists(local_file):
         logger.error(f"File not found: {local_file}")
         return False
     
-    # Check if file already exists in S3
     if check_file_exists_in_s3(s3_client, s3_bucket, s3_key):
         logger.info(f"File already exists in S3, skipping upload: {s3_key}")
     else:
-        # Upload file to S3
         if not upload_file_to_s3(s3_client, local_file, s3_bucket, s3_key):
             return False
     
-    # Sync Knowledge Base
     if sync_knowledge_base(bedrock_client, knowledge_base_id):
         logger.info("✓ Knowledge Base sync initiated successfully")
         return True

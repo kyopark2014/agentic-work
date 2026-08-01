@@ -14,15 +14,16 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install \
+RUN pip install --upgrade "setuptools>=83.0.0" \
+    && pip install \
     fastapi \
-    python-multipart \
+    "python-multipart>=0.0.31" \
+    "urllib3>=2.7.0" \
     uvicorn[standard] \
     boto3 \
     cryptography \
     langchain_aws \
     langchain-openai \
-    langchain-anthropic \
     "openai>=2.41.0" \
     aws-bedrock-token-generator \
     requests
@@ -30,7 +31,11 @@ RUN pip install \
 COPY . .
 COPY --from=frontend /web/dist /app/application/web/dist
 
-RUN chmod +x /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh \
+    && useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser \
+    && chown -R appuser:appuser /app
+
+USER appuser
 
 EXPOSE 8501
 

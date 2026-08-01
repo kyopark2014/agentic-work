@@ -19,12 +19,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     librsvg2-bin \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install boto3 botocore --upgrade
+RUN pip install --upgrade "setuptools>=83.0.0" \
+    && pip install "urllib3>=2.7.0" boto3 botocore --upgrade
 RUN pip install langchain_aws langchain langchain_community langgraph langchain-openai langchain-anthropic "openai>=2.41.0" aws-bedrock-token-generator
 RUN pip install langgraph-checkpoint-sqlite aiosqlite
 # Keep FastMCP (mcp.server.fastmcp). mcp 2.x removed it; pin 1.x for stdio MCP servers.
 RUN pip install "mcp>=1.9.0,<2" langchain-mcp-adapters awslabs.aws-documentation-mcp-server
-RUN pip install bedrock-agentcore uv
+RUN pip install "bedrock-agentcore>=1.18.1" uv
 RUN pip install "mcp>=1.9.0,<2"
 RUN pip install Pillow pytz tavily-python langchain-text-splitters
 RUN pip install requests beautifulsoup4
@@ -42,6 +43,11 @@ RUN pip install aws-opentelemetry-distro>=0.10.0
 RUN pip install opentelemetry-instrumentation-langchain
 
 COPY . .
+
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser \
+    && chown -R appuser:appuser /app
+
+USER appuser
 
 # Add the current directory to Python path
 ENV PYTHONPATH=/app

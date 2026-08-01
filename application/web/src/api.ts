@@ -179,6 +179,7 @@ export const api = {
     taskId: string,
     prompt: string,
     files: string[] = [],
+    signal?: AbortSignal,
   ): AsyncGenerator<StreamEvent> {
     uiLog("chat:stream start", { taskId, prompt, files });
     const res = await fetch(`/api/tasks/${taskId}/chat`, {
@@ -186,11 +187,12 @@ export const api = {
       credentials: "include",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ prompt, files }),
+      signal,
     });
     if (!res.ok || !res.body) {
       const body = await res.text();
       uiError("chat:stream request failed", { status: res.status, body });
-      throw new Error(body);
+      throw new Error("Chat request failed. Please try again.");
     }
 
     const reader = res.body.getReader();
@@ -198,31 +200,43 @@ export const api = {
     let buffer = "";
     let eventCount = 0;
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const parts = buffer.split("\n\n");
-      buffer = parts.pop() ?? "";
-      for (const part of parts) {
-        const line = part
-          .split("\n")
-          .find((l) => l.startsWith("data:"));
-        if (!line) continue;
-        const payload = line.slice(5).trim();
-        if (!payload) continue;
-        const event = JSON.parse(payload) as StreamEvent;
-        eventCount += 1;
-        if (event.type === "token") {
-          const text = event.data ?? "";
-          uiLog("chat:sse token", { chars: text.length, preview: text.slice(0, 80) });
-        } else if (event.type === "error") {
-          uiError("chat:sse error", event);
-        } else {
-          uiLog(`chat:sse ${event.type}`, event);
+    try {
+      while (true) {
+        if (signal?.aborted) {
+          throw new DOMException("Aborted", "AbortError");
         }
-        yield event;
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() ?? "";
+        for (const part of parts) {
+          const line = part
+            .split("\n")
+            .find((l) => l.startsWith("data:"));
+          if (!line) continue;
+          const payload = line.slice(5).trim();
+          if (!payload) continue;
+          const event = JSON.parse(payload) as StreamEvent;
+          eventCount += 1;
+          if (event.type === "token") {
+            const text = event.data ?? "";
+            uiLog("chat:sse token", { chars: text.length, preview: text.slice(0, 80) });
+          } else if (event.type === "error") {
+            uiError("chat:sse error", event);
+          } else {
+            uiLog(`chat:sse ${event.type}`, event);
+          }
+          yield event;
+        }
       }
+    } catch (err) {
+      try {
+        await reader.cancel();
+      } catch {
+        /* ignore cancel errors */
+      }
+      throw err;
     }
 
     uiLog("chat:stream end", { taskId, eventCount });

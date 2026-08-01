@@ -1,912 +1,286 @@
-import boto3
-from botocore.config import Config
-from botocore.exceptions import ClientError, ConnectionError as BotocoreConnectionError
-from botocore.exceptions import EndpointConnectionError, ProxyConnectionError
+"""AgentCore runtime client facade (LangGraph AgentCore invoke + SSE)."""
+
+from __future__ import annotations
+
 import json
-import os
 import logging
 import sys
 
+import boto3
+from botocore.config import Config
+
 try:
-    from application import utils
-    from application import chat
+    from application.agentcore_runtime import (
+        bedrock_region,
+        load_agentcore_config,
+        projectName,
+        runtime_session_id_for,
+    )
+    from application.agentcore_sse import (
+        _finalize_agent_result,
+        _process_sse_event,
+        add_notification,
+        normalize_bedrock_message_content,
+        tool_info_list,
+        tool_name_list,
+        tool_result_list,
+        tool_slot_update,
+        update_streaming_result,
+    )
+    from application.tool_result_parsers import get_tool_info
 except ImportError:
-    import utils
-    import chat
+    from agentcore_runtime import (
+        bedrock_region,
+        load_agentcore_config,
+        projectName,
+        runtime_session_id_for,
+    )
+    from agentcore_sse import (
+        _finalize_agent_result,
+        _process_sse_event,
+        add_notification,
+        normalize_bedrock_message_content,
+        tool_info_list,
+        tool_name_list,
+        tool_result_list,
+        tool_slot_update,
+        update_streaming_result,
+    )
+    from tool_result_parsers import get_tool_info
 
 logging.basicConfig(
-    level=logging.INFO,  # Default to INFO level
-    format='%(filename)s:%(lineno)d | %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stderr)
-    ]
+    level=logging.INFO,
+    format="%(filename)s:%(lineno)d | %(message)s",
+    handlers=[logging.StreamHandler(sys.stderr)],
 )
 logger = logging.getLogger("agentcore_client")
 
-config = utils.load_config()
-
-bedrock_region = config['region']
-accountId = config['accountId']
-projectName = config['projectName']
-
-def add_notification(notification_queue, message):
-    if notification_queue is not None:
-        notification_queue.notify(message)
-
-def update_streaming_result(notification_queue, message):
-    if notification_queue is not None:
-        notification_queue.stream(message)
-
-def commit_streaming_segment(notification_queue, message: str):
-    if notification_queue is not None:
-        notification_queue.commit_text_segment(message)
-
-def on_tool_use_started(
-    notification_queue,
-    current: str,
-    tool_use_id: str,
-    tool_info_list: dict,
-) -> str:
-    """Commit pre-tool assistant text when a new tool call starts."""
-    if not tool_use_id or tool_use_id in tool_info_list:
-        return current
-    commit_streaming_segment(notification_queue, current)
-    tool_info_list[tool_use_id] = True
-    return ""
-
-def tool_slot_update(notification_queue, slot_key: str, message: str):
-    if notification_queue is not None:
-        notification_queue.tool_update(slot_key, message)
-
-def _format_tool_input(input_value) -> str:
-    if isinstance(input_value, (dict, list)):
-        return json.dumps(input_value, ensure_ascii=False)
-    return str(input_value)
-
-def _runtime_id_from_arn(arn: str) -> str:
-    """Extract agentRuntimeId from an AgentCore runtime ARN."""
-    return arn.rsplit("/", 1)[-1] if arn else ""
-
-
-def _candidate_runtime_names(agent_name: str, agent_type: str | None) -> list:
-    names = [agent_name]
-    project_slug = projectName.replace("-", "_")
-    names.append(project_slug)
-    names.append(f"runtime_{project_slug}")
-    if agent_type:
-        normalized = agent_type.replace("-", "_")
-        names.append(f"agent_runtime_{normalized}")
-        names.append(normalized)
-        names.append(f"runtime_{normalized}")
-        names.append(f"{project_slug}_{normalized}")
-    seen = set()
-    return [name for name in names if not (name in seen or seen.add(name))]
-
-
-def _lookup_runtime_by_name(agent_name: str, agent_type: str | None) -> str | None:
-    """Find a READY AgentCore runtime ARN by candidate name."""
-    candidate_names = _candidate_runtime_names(agent_name, agent_type)
-    client = boto3.client("bedrock-agentcore-control", region_name=bedrock_region)
-    response = client.list_agent_runtimes()
-    runtimes = response.get("agentRuntimes", [])
-    logger.info(f"Looking up agent runtime in {len(runtimes)} runtimes")
-    logger.info(f"Candidate runtime names: {candidate_names}")
-
-    for agent_runtime in runtimes:
-        if agent_runtime.get("agentRuntimeName") in candidate_names:
-            arn = agent_runtime.get("agentRuntimeArn")
-            logger.info(f"Matched runtime '{agent_runtime.get('agentRuntimeName')}': {arn}")
-            return arn
-
-    logger.error(f"No agent runtime matched candidates: {candidate_names}")
-    return None
-
-
-def _validation_unavailable(exc: Exception) -> bool:
-    if isinstance(exc, (ProxyConnectionError, EndpointConnectionError, BotocoreConnectionError)):
-        return True
-    message = str(exc).lower()
-    return "proxy" in message or "could not connect" in message or "connection" in message
-
-
-def _is_runtime_arn_valid(arn: str) -> bool:
-    """Return True if the AgentCore runtime ARN still exists."""
-    runtime_id = _runtime_id_from_arn(arn)
-    if not runtime_id:
-        return False
-
-    client = boto3.client("bedrock-agentcore-control", region_name=bedrock_region)
-    try:
-        client.get_agent_runtime(agentRuntimeId=runtime_id)
-        return True
-    except ClientError as e:
-        code = e.response.get("Error", {}).get("Code", "")
-        if code in ("ResourceNotFoundException", "ValidationException"):
-            return False
-        raise
-
-
-def load_agentcore_config(agent_name, agent_type=None):
-    """Resolve AgentCore runtime ARN from config or Bedrock control plane."""
-    configured_arns = []
-    direct_arn = config.get("agent_runtime_arn")
-    if direct_arn:
-        configured_arns.append(("agent_runtime_arn", direct_arn))
-    if agent_type:
-        typed_arn = config.get(f"agent_runtime_arn_{agent_type}")
-        if typed_arn and typed_arn not in {arn for _, arn in configured_arns}:
-            configured_arns.append((f"agent_runtime_arn_{agent_type}", typed_arn))
-
-    for key, arn in configured_arns:
-        try:
-            if _is_runtime_arn_valid(arn):
-                logger.info(f"Using {key} from config: {arn}")
-                return arn
-        except Exception as exc:
-            if _validation_unavailable(exc):
-                logger.warning(
-                    "Runtime ARN validation unavailable (%s); using %s from config: %s",
-                    exc,
-                    key,
-                    arn,
-                )
-                return arn
-            raise
-        logger.warning(
-            f"Configured {key} is missing or deleted; falling back to runtime name lookup: {arn}"
-        )
-
-    try:
-        return _lookup_runtime_by_name(agent_name, agent_type)
-    except Exception as exc:
-        if configured_arns and _validation_unavailable(exc):
-            key, arn = configured_arns[0]
-            logger.warning(
-                "Runtime lookup unavailable (%s); using %s from config: %s",
-                exc,
-                key,
-                arn,
-            )
-            return arn
-        raise
-
-tool_info_list = dict()
-tool_result_list = dict()
-tool_name_list = dict()
-
-
-def normalize_bedrock_message_content(content):
-    """
-    LangChain/Bedrock/Claude가 반환하는 message.content를 화면용 문자열로 만든다.
-    - str: 그대로
-    - list[dict]: Anthropic content blocks (type text, tool_use 등)에서 텍스트만 이어붙임
-    - dict: 단일 블록이면 text 키 사용
-    """
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, dict):
-        if content.get("type") == "text" and "text" in content:
-            return str(content["text"])
-        if "text" in content:
-            return str(content["text"])
-        return json.dumps(content, ensure_ascii=False)
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, dict):
-                if block.get("type") == "text" and "text" in block:
-                    parts.append(str(block["text"]))
-                elif "text" in block:
-                    parts.append(str(block["text"]))
-                elif block.get("type") == "tool_use":
-                    continue
-                else:
-                    parts.append(json.dumps(block, ensure_ascii=False))
-            else:
-                parts.append(str(block))
-        return "".join(parts)
-    return str(content)
-
-
-def _sanitize_reference_text(text: str, max_len: int) -> str:
-    """Collapse whitespace/newlines and strip markdown that breaks list links."""
-    if not text:
-        return ""
-    cleaned = " ".join(str(text).replace("\r", "\n").split())
-    cleaned = cleaned.replace("```", "`").replace("[", "\\[").replace("]", "\\]")
-    if len(cleaned) > max_len:
-        cleaned = cleaned[: max_len - 3].rstrip(" .") + "..."
-    return cleaned
-
-
-def _format_references_markdown(references: list) -> str:
-    """Build a Reference section safe for markdown list rendering."""
-    lines = ["\n\n### Reference"]
-    for i, reference in enumerate(references, start=1):
-        title = _sanitize_reference_text(reference.get("title") or "Untitled", 120)
-        content = _sanitize_reference_text(reference.get("content") or "", 100)
-        url = (reference.get("url") or "").strip()
-        page = reference.get("page")
-        page_suffix = f" , {page} page" if page is not None else ""
-        if url:
-            lines.append(
-                f"{i}. [{title}]({url}){page_suffix} — {content}" if content
-                else f"{i}. [{title}]({url}){page_suffix}"
-            )
-        else:
-            lines.append(
-                f"{i}. {title}{page_suffix} — {content}" if content
-                else f"{i}. {title}{page_suffix}"
-            )
-    return "\n".join(lines) + "\n"
-
-
-
-def _build_tool_reference(ref_item: dict) -> dict:
-    """Build a display reference from a RAG doc item."""
-    reference = ref_item.get("reference") or {}
-    contents = ref_item.get("contents") or ""
-    content_text = contents[:100] + "..." if len(contents) > 100 else contents
-    result = {
-        "url": reference.get("url"),
-        "title": reference.get("title"),
-        "content": content_text,
-    }
-    if reference.get("page") is not None:
-        result["page"] = reference["page"]
-    return result
-
-
-def _extract_rag_references_from_payload(json_data) -> list:
-    """Extract RAG {contents, reference} items from MCP tool payloads."""
-    refs = []
-    if isinstance(json_data, dict):
-        # Dict iteration yields keys; only accept real RAG items as values.
-        if "reference" in json_data and "contents" in json_data:
-            refs.append(_build_tool_reference(json_data))
-            return refs
-        for value in json_data.values():
-            if isinstance(value, dict) and "reference" in value and "contents" in value:
-                refs.append(_build_tool_reference(value))
-        return refs
-
-    if not isinstance(json_data, list):
-        return refs
-
-    for item in json_data:
-        if not isinstance(item, dict):
-            continue
-        # MCP content block: {"type": "text", "text": "<json string of docs>"}
-        if "text" in item and ("type" not in item or item.get("type") == "text"):
-            text_val = item.get("text")
-            if isinstance(text_val, str):
-                try:
-                    text_json = json.loads(text_val)
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                refs.extend(_extract_rag_references_from_payload(text_json))
-            continue
-        if "reference" in item and "contents" in item:
-            refs.append(_build_tool_reference(item))
-    return refs
-
-
-def get_tool_info(tool_name, tool_content):
-    tool_references = []    
-    urls = []
-    content = ""
-
-    # tavily
-    if isinstance(tool_content, str) and "Title:" in tool_content and "URL:" in tool_content and "Content:" in tool_content:
-        logger.info("Tavily parsing...")
-        items = tool_content.split("\n\n")
-        for i, item in enumerate(items):
-            # logger.info(f"item[{i}]: {item}")
-            if "Title:" in item and "URL:" in item and "Content:" in item:
-                try:
-                    title_part = item.split("Title:")[1].split("URL:")[0].strip()
-                    url_part = item.split("URL:")[1].split("Content:")[0].strip()
-                    content_part = item.split("Content:")[1].strip().replace("\n", "")
-                    
-                    logger.info(f"title_part: {title_part}")
-                    logger.info(f"url_part: {url_part}")
-                    logger.info(f"content_part: {content_part}")
-
-                    content += f"{content_part}\n\n"
-                    
-                    tool_references.append({
-                        "url": url_part,
-                        "title": title_part,
-                        "content": content_part[:100] + "..." if len(content_part) > 100 else content_part
-                    })
-                except Exception as e:
-                    logger.info(f"Parsing error: {str(e)}")
-                    continue                
-
-    # OpenSearch
-    elif tool_name == "SearchIndexTool": 
-        if ":" in tool_content:
-            extracted_json_data = tool_content.split(":", 1)[1].strip()
-            try:
-                json_data = json.loads(extracted_json_data)
-                # logger.info(f"extracted_json_data: {extracted_json_data[:200]}")
-            except json.JSONDecodeError:
-                logger.info("JSON parsing error")
-                json_data = {}
-        else:
-            json_data = {}
-        
-        if "hits" in json_data:
-            hits = json_data["hits"]["hits"]
-            if hits:
-                logger.info(f"hits[0]: {hits[0]}")
-
-            for hit in hits:
-                text = hit["_source"]["text"]
-                metadata = hit["_source"]["metadata"]
-                
-                content += f"{text}\n\n"
-
-                filename = metadata["name"].split("/")[-1]
-                # logger.info(f"filename: {filename}")
-                
-                content_part = text.replace("\n", "")
-                tool_references.append({
-                    "url": metadata["url"], 
-                    "title": filename,
-                    "content": content_part[:100] + "..." if len(content_part) > 100 else content_part
-                })
-                
-        logger.info(f"content: {content}")
-        
-    # Knowledge Base
-    elif tool_name == "QueryKnowledgeBases": 
-        try:
-            # Handle case where tool_content contains multiple JSON objects
-            if tool_content.strip().startswith('{'):
-                # Parse each JSON object individually
-                json_objects = []
-                current_pos = 0
-                brace_count = 0
-                start_pos = -1
-                
-                for i, char in enumerate(tool_content):
-                    if char == '{':
-                        if brace_count == 0:
-                            start_pos = i
-                        brace_count += 1
-                    elif char == '}':
-                        brace_count -= 1
-                        if brace_count == 0 and start_pos != -1:
-                            try:
-                                json_obj = json.loads(tool_content[start_pos:i+1])
-                                # logger.info(f"json_obj: {json_obj}")
-                                json_objects.append(json_obj)
-                            except json.JSONDecodeError:
-                                logger.info(f"JSON parsing error: {tool_content[start_pos:i+1][:100]}")
-                            start_pos = -1
-                
-                json_data = json_objects
-            else:
-                # Try original method
-                json_data = json.loads(tool_content)                
-            # logger.info(f"json_data: {json_data}")
-
-            # Build content
-            if isinstance(json_data, list):
-                for item in json_data:
-                    if isinstance(item, dict) and "content" in item:
-                        content_text = item["content"].get("text", "")
-                        content += content_text + "\n\n"
-
-                        uri = "" 
-                        if "location" in item:
-                            if "s3Location" in item["location"]:
-                                uri = item["location"]["s3Location"]["uri"]
-                                # logger.info(f"uri (list): {uri}")
-                                ext = uri.split(".")[-1]
-
-                                # # if ext is an image 
-                                # url = sharing_url + "/" + s3_prefix + "/" + uri.split("/")[-1]
-                                # if ext in ["jpg", "jpeg", "png", "gif", "bmp", "tiff", "ico", "webp"]:
-                                #     url = sharing_url + "/" + capture_prefix + "/" + uri.split("/")[-1]
-                                # logger.info(f"url: {url}")
-                                
-                                tool_references.append({
-                                    "url": url, 
-                                    "title": uri.split("/")[-1],
-                                    "content": content_text[:100] + "..." if len(content_text) > 100 else content_text
-                                })          
-                
-        except json.JSONDecodeError as e:
-            logger.info(f"JSON parsing error: {e}")
-            json_data = {}
-            content = tool_content  # Use original content if parsing fails
-
-        logger.info(f"content: {content}")
-        logger.info(f"tool_references: {tool_references}")
-
-    # aws document
-    elif tool_name == "search_documentation":
-        try:
-            # Handle case where tool_content is already a list (e.g., from toolResult)
-            if isinstance(tool_content, list):
-                # Extract text from list items if they have 'text' key
-                json_data = []
-                for item in tool_content:
-                    if isinstance(item, dict) and 'text' in item:
-                        try:
-                            parsed_text = json.loads(item['text'])
-                            if isinstance(parsed_text, dict) and 'search_results' in parsed_text:
-                                json_data = parsed_text['search_results']
-                            elif isinstance(parsed_text, list):
-                                json_data = parsed_text
-                            else:
-                                json_data.append(parsed_text)
-                        except (json.JSONDecodeError, TypeError):
-                            logger.info(f"Failed to parse text from list item: {item}")
-                    elif isinstance(item, dict):
-                        json_data.append(item)
-                    else:
-                        json_data.append(item)
-            elif isinstance(tool_content, str):
-                json_data = json.loads(tool_content)
-            else:
-                json_data = tool_content
-            
-            # Ensure json_data is iterable
-            if not isinstance(json_data, list):
-                json_data = [json_data]
-            
-            for item in json_data:
-                logger.info(f"item: {item}")
-                
-                if isinstance(item, str):
-                    try:
-                        item = json.loads(item)
-                    except json.JSONDecodeError:
-                        logger.info(f"Failed to parse item as JSON: {item}")
-                        continue
-                
-                if isinstance(item, dict) and 'url' in item and 'title' in item:
-                    url = item['url']
-                    title = item['title']
-                    context_text = item.get('context', '')
-                    content_text = context_text[:100] + "..." if len(context_text) > 100 else context_text
-                    content += context_text + "\n\n"
-                    tool_references.append({
-                        "url": url,
-                        "title": title,
-                        "content": content_text
-                    })
-                else:
-                    logger.info(f"Invalid item format: {item}")
-                    
-        except json.JSONDecodeError as e:
-            logger.info(f"JSON parsing error: {e}, tool_content type: {type(tool_content)}")
-            pass
-        except Exception as e:
-            logger.error(f"Error processing search_documentation: {e}")
-            pass
-
-        logger.info(f"content: {content}")
-        logger.info(f"tool_references: {tool_references}")
-            
-    # ArXiv
-    elif tool_name == "search_papers" and "papers" in tool_content:
-        try:
-            json_data = json.loads(tool_content)
-
-            papers = json_data['papers']
-            for paper in papers:
-                url = paper['url']
-                title = paper['title']
-                abstract = paper['abstract'].replace("\n", "")
-                content_text = abstract[:100] + "..." if len(abstract) > 100 else abstract
-                content += f"{content_text}\n\n"
-                logger.info(f"url: {url}, title: {title}, content: {content_text}")
-
-                tool_references.append({
-                    "url": url,
-                    "title": title,
-                    "content": content_text
-                })
-        except json.JSONDecodeError:
-            logger.info(f"JSON parsing error: {tool_content}")
-            pass
-
-        logger.info(f"content: {content}")
-        logger.info(f"tool_references: {tool_references}")
-
-    # aws-knowledge
-    elif tool_name == "aws___read_documentation":
-        logger.info(f"#### {tool_name} ####")
-        if isinstance(tool_content, dict):
-            json_data = tool_content
-        elif isinstance(tool_content, list):
-            json_data = tool_content
-        else:
-            json_data = json.loads(tool_content)
-        
-        logger.info(f"json_data: {json_data}")
-        payload = json_data["response"]["payload"]
-        if "content" in payload:
-            payload_content = payload["content"]
-            if "result" in payload_content:
-                result = payload_content["result"]
-                logger.info(f"result: {result}")
-                if isinstance(result, str) and "AWS Documentation from" in result:
-                    logger.info(f"Processing AWS Documentation format: {result}")
-                    try:
-                        # Extract URL from "AWS Documentation from https://..."
-                        url_start = result.find("https://")
-                        if url_start != -1:
-                            # Find the colon after the URL (not inside the URL)
-                            url_end = result.find(":", url_start)
-                            if url_end != -1:
-                                # Check if the colon is part of the URL or the separator
-                                url_part = result[url_start:url_end]
-                                # If the colon is immediately after the URL, use it as separator
-                                if result[url_end:url_end+2] == ":\n":
-                                    url = url_part
-                                    content_start = url_end + 2  # Skip the colon and newline
-                                else:
-                                    # Try to find the actual URL end by looking for space or newline
-                                    space_pos = result.find(" ", url_start)
-                                    newline_pos = result.find("\n", url_start)
-                                    if space_pos != -1 and newline_pos != -1:
-                                        url_end = min(space_pos, newline_pos)
-                                    elif space_pos != -1:
-                                        url_end = space_pos
-                                    elif newline_pos != -1:
-                                        url_end = newline_pos
-                                    else:
-                                        url_end = len(result)
-                                    
-                                    url = result[url_start:url_end]
-                                    content_start = url_end + 1
-                                
-                                # Remove trailing colon from URL if present
-                                if url.endswith(":"):
-                                    url = url[:-1]
-                                
-                                # Extract content after the URL
-                                if content_start < len(result):
-                                    content_text = result[content_start:].strip()
-                                    # Truncate content for display
-                                    display_content = content_text[:100] + "..." if len(content_text) > 100 else content_text
-                                    display_content = display_content.replace("\n", "")
-                                    
-                                    tool_references.append({
-                                        "url": url,
-                                        "title": "AWS Documentation",
-                                        "content": display_content
-                                    })
-                                    content += content_text + "\n\n"
-                                    logger.info(f"Extracted URL: {url}")
-                                    logger.info(f"Extracted content length: {len(content_text)}")
-                    except Exception as e:
-                        logger.error(f"Error parsing AWS Documentation format: {e}")
-        logger.info(f"content: {content}")
-        logger.info(f"tool_references: {tool_references}")
-
-    else:        
-        try:
-            if isinstance(tool_content, dict):
-                json_data = tool_content
-            elif isinstance(tool_content, list):
-                json_data = tool_content
-            else:
-                json_data = json.loads(tool_content)
-            
-            logger.info(f"json_data: {json_data}")
-            if isinstance(json_data, dict) and "path" in json_data:  # path
-                path = json_data["path"]
-                if isinstance(path, list):
-                    for url in path:
-                        urls.append(url)
-                else:
-                    urls.append(path)            
-
-            # RAG retrieve returns MCP blocks: [{"type":"text","text":"[{contents,reference}...]"}]
-            extracted = _extract_rag_references_from_payload(json_data)
-            tool_references.extend(extracted)
-                
-            logger.info(f"tool_references: {tool_references}")
-
-        except json.JSONDecodeError:
-            pass
-
-    return content, urls, tool_references
-
-def run_agent(prompt, user_id, mcp_servers, model_name, runtime_session_id, notification_queue=None, skill_list=None, guardrail_enabled=None, memory_enabled=None, llm_gateway_enabled=None, llm_gateway_url=None, llm_gateway_key=None, files=None):
-    tool_info_list.clear()
-    tool_result_list.clear()
-    tool_name_list.clear()
-    if notification_queue is not None:
-        notification_queue.reset()
-
-    references = []
-    image_url = []
-    
-    logger.info(f"user_id: {user_id}")
-
-    payload = json.dumps({
-        "prompt": prompt,
-        "mcp_servers": mcp_servers,
-        "model_name": model_name,
-        "user_id": user_id,
-        "skill_list": skill_list or [],
-        "guardrail_enabled": bool(guardrail_enabled) if guardrail_enabled is not None else True,
-        "memory_enabled": bool(memory_enabled) if memory_enabled is not None else True,
-        "llm_gateway_enabled": bool(llm_gateway_enabled) if llm_gateway_enabled is not None else False,
-        "llm_gateway_url": llm_gateway_url or "",
-        "llm_gateway_key": llm_gateway_key or "",
-        "runtime_session_id": runtime_session_id,
-        "files": files or [],
-    })
-
-    agent_type = "langgraph"
-    runtime_name = projectName.replace('-', '_') + '_' + agent_type
-    agent_runtime_arn = load_agentcore_config(runtime_name, agent_type=agent_type)
-    print(f"agent_runtime_arn: {agent_runtime_arn}")
-
-    logger.info(f"agent_runtime_arn: {agent_runtime_arn}")
-    logger.info(f"Payload: {payload}")
-    
-    if agent_runtime_arn is None:
-        logger.error(f"agent_runtime_arn is not found")
-        return f"Error: agent_runtime_arn is not found", []
-
-    try:
-        # Configure boto3 client with longer timeout for streaming responses
+__all__ = [
+    "AgentCoreService",
+    "run_agent",
+    "load_agentcore_config",
+    "runtime_session_id_for",
+    "get_tool_info",
+    "add_notification",
+    "update_streaming_result",
+    "tool_slot_update",
+    "normalize_bedrock_message_content",
+]
+
+AGENTCORE_READ_TIMEOUT_SECONDS = 300
+AGENTCORE_CONNECT_TIMEOUT_SECONDS = 60
+AGENTCORE_MAX_ATTEMPTS = 3
+DEFAULT_AGENT_TYPE = "langgraph"
+
+
+class AgentCoreService:
+    """Orchestrates AgentCore runtime resolution, invoke, and stream processing."""
+
+    def __init__(self, region: str | None = None, agent_type: str = DEFAULT_AGENT_TYPE):
+        self.region = region or bedrock_region
+        self.agent_type = agent_type
+
+    def create_runtime_client(self):
         boto_config = Config(
-            read_timeout=300,  # 5 minutes
-            connect_timeout=60,
-            retries={'max_attempts': 0}
+            read_timeout=AGENTCORE_READ_TIMEOUT_SECONDS,
+            connect_timeout=AGENTCORE_CONNECT_TIMEOUT_SECONDS,
+            retries={"mode": "standard", "max_attempts": AGENTCORE_MAX_ATTEMPTS},
         )
-        agent_core_client = boto3.client(
-            'bedrock-agentcore', 
-            region_name=bedrock_region,
-            config=boto_config
+        return boto3.client(
+            "bedrock-agentcore",
+            region_name=self.region,
+            config=boto_config,
         )
-        logger.info(f"runtime_session_id: {runtime_session_id}")
-        response = agent_core_client.invoke_agent_runtime(
-            agentRuntimeArn=agent_runtime_arn,
-            runtimeSessionId=runtime_session_id,
-            payload=payload,
-            qualifier="DEFAULT" # DEFAULT or LATEST
+
+    def resolve_runtime_arn(self, agent_type: str | None = None) -> str | None:
+        at = agent_type or self.agent_type
+        runtime_name = projectName.replace("-", "_") + "_" + at
+        return load_agentcore_config(runtime_name, agent_type=at)
+
+    def build_payload(
+        self,
+        *,
+        prompt,
+        user_id,
+        mcp_servers,
+        model_name,
+        runtime_session_id,
+        skill_list=None,
+        guardrail_enabled=None,
+        memory_enabled=None,
+        llm_gateway_enabled=None,
+        llm_gateway_url=None,
+        llm_gateway_key=None,
+        files=None,
+    ) -> str:
+        return json.dumps(
+            {
+                "prompt": prompt,
+                "mcp_servers": mcp_servers,
+                "model_name": model_name,
+                "user_id": user_id,
+                "skill_list": skill_list or [],
+                "guardrail_enabled": (
+                    bool(guardrail_enabled) if guardrail_enabled is not None else True
+                ),
+                "memory_enabled": (
+                    bool(memory_enabled) if memory_enabled is not None else True
+                ),
+                "llm_gateway_enabled": (
+                    bool(llm_gateway_enabled) if llm_gateway_enabled is not None else False
+                ),
+                "llm_gateway_url": llm_gateway_url or "",
+                "llm_gateway_key": llm_gateway_key or "",
+                "runtime_session_id": runtime_session_id,
+                "files": files or [],
+            }
         )
-        
-        result = current = ""
-        processed_data = set()  # Prevent duplicate data
-        tool_input_cache: dict[str, dict] = {}
-        
-        # stream response
-        if "text/event-stream" in response.get("contentType", ""):
-            for line in response["response"].iter_lines(chunk_size=10):
-                line = line.decode("utf-8")
-                if line:
-                    print(f"-> {line}")
-                
-                tool_name = ""
-                if line.startswith('data: '):
-                    data = line[6:].strip()  # Remove "data:" prefix and whitespace
-                    if data:  # Only process non-empty data
-                        # Check for duplicate data
-                        if data in processed_data:
-                            # logger.info(f"Skipping duplicate data: {data[:50]}...")
-                            continue
-                        processed_data.add(data)
-                        
-                        try:
-                            data_json = json.loads(data)
 
-                            if agent_type == 'strands':
-                                if 'data' in data_json:
-                                    text = normalize_bedrock_message_content(data_json['data'])
-                                    logger.info(f"[data] {text}")
-                                    current += text
-                                    update_streaming_result(notification_queue, current)
+    def process_event_stream(self, response, notification_queue, stream_state: dict) -> None:
+        processed_data = set()
+        if "text/event-stream" not in response.get("contentType", ""):
+            return
 
-                                elif 'result' in data_json:
-                                    final_output = data_json['result']
-                                    logger.info(f"[result] {final_output}")
+        for line in response["response"].iter_lines(chunk_size=10):
+            line = line.decode("utf-8")
+            if line:
+                print(f"-> {line}")
 
-                                    result = final_output.get('messages', [])
-                                    logger.info(f"result: {result}")
+            if not line.startswith("data: "):
+                continue
 
-                                    if "image_url" in final_output:
-                                        image_url = final_output.get('image_url', [])
-                                        logger.info(f"image_url: {image_url}")                
+            data = line[6:].strip()
+            if not data or data in processed_data:
+                continue
+            processed_data.add(data)
 
-                                elif 'toolResult' in data_json:
-                                    toolResult = data_json['toolResult']
-                                    toolUseId = data_json['toolUseId']
-                                    if data_json.get('tool'):
-                                        tool_name_list[toolUseId] = data_json['tool']
-                                    tool_name = tool_name_list.get(toolUseId, data_json.get('tool', 'unknown'))
-                                    logger.info(f"[tool_result] {toolResult}")
+            try:
+                data_json = json.loads(data)
+                _process_sse_event(
+                    data_json,
+                    notification_queue,
+                    stream_state,
+                    agent_type=self.agent_type,
+                )
+            except json.JSONDecodeError:
+                logger.info("Not JSON: %s", data)
+            except Exception as e:
+                logger.error("Error processing data: %s", e, exc_info=True)
+                continue
 
-                                    effective_input = tool_input_cache.get(toolUseId, {})
-                                    current = on_tool_use_started(
-                                        notification_queue, current, toolUseId, tool_info_list
-                                    )
-                                    tool_slot_update(
-                                        notification_queue,
-                                        f"{toolUseId}:input",
-                                        f"Tool: {tool_name}, Input: {_format_tool_input(effective_input)}",
-                                    )
-
-                                    tool_slot_update(notification_queue, f"{toolUseId}:result", f"Tool Result: {str(toolResult)}")
-
-                                    content, urls, refs = get_tool_info(tool_name, toolResult)
-                                    if refs:
-                                        for r in refs:
-                                            references.append(r)
-                                        logger.info(f"refs: {refs}")
-                                    if urls:
-                                        for url in urls:
-                                            image_url.append(url)
-                                        logger.info(f"urls: {urls}")
-
-                                    if content:
-                                        logger.info(f"content: {content}")    
-
-                                elif 'tool' in data_json:
-                                    tool = data_json['tool']
-                                    input = data_json.get('input', {})
-                                    toolUseId = data_json['toolUseId']
-                                    tool_name_list[toolUseId] = tool
-                                    if isinstance(input, dict) and input:
-                                        tool_input_cache[toolUseId] = input
-                                    effective_input = tool_input_cache.get(
-                                        toolUseId,
-                                        input if isinstance(input, dict) else {},
-                                    )
-                                    current = on_tool_use_started(
-                                        notification_queue, current, toolUseId, tool_info_list
-                                    )
-                                    if effective_input:
-                                        tool_slot_update(
-                                            notification_queue,
-                                            f"{toolUseId}:input",
-                                            f"Tool: {tool}, Input: {_format_tool_input(effective_input)}",
-                                        )
-                                    
-                            elif agent_type == 'langgraph': # langgraph
-                                if 'data' in data_json:
-                                    text = normalize_bedrock_message_content(data_json['data'])
-                                    logger.info(f"[data] {text}")
-                                    current += text
-                                    update_streaming_result(notification_queue, current)
-                                elif 'result' in data_json:
-                                    final_output = data_json['result']
-                                    logger.info(f"[result] {final_output}")
-
-                                    messages = final_output.get('messages', [])
-                                    raw_content = messages[-1].get('content') if messages else ""
-                                    result = normalize_bedrock_message_content(raw_content)
-                                    logger.info(f"result: {result}")
-
-                                    if "image_url" in final_output:
-                                        image_url = final_output.get('image_url', [])
-                                        logger.info(f"image_url: {image_url}")                                        
-
-                                elif 'toolResult' in data_json:
-                                    toolResult = data_json['toolResult']
-                                    toolUseId = data_json['toolUseId']
-                                    if data_json.get('tool'):
-                                        tool_name_list[toolUseId] = data_json['tool']
-                                    tool_name = tool_name_list.get(toolUseId, data_json.get('tool', 'unknown'))
-                                    logger.info(f"[tool_result] {toolResult}")
-
-                                    logger.info(f"tool result: {toolUseId}")
-                                    effective_input = tool_input_cache.get(toolUseId, {})
-                                    current = on_tool_use_started(
-                                        notification_queue, current, toolUseId, tool_info_list
-                                    )
-                                    tool_slot_update(
-                                        notification_queue,
-                                        f"{toolUseId}:input",
-                                        f"Tool: {tool_name}, Input: {_format_tool_input(effective_input)}",
-                                    )
-
-                                    tool_slot_update(notification_queue, f"{toolUseId}:result", f"Tool Result: {str(toolResult)}")
-
-                                    content, urls, refs = get_tool_info(tool_name, toolResult)
-                                    if refs:
-                                        for r in refs:
-                                            references.append(r)
-                                        logger.info(f"refs: {refs}")
-                                    if urls:
-                                        for url in urls:
-                                            image_url.append(url)
-                                        logger.info(f"urls: {urls}")
-
-                                    if content:
-                                        logger.info(f"content: {content}")      
-
-                                elif 'tool' in data_json:
-                                    tool = data_json['tool']
-                                    input = data_json.get('input', {})
-                                    toolUseId = data_json['toolUseId']
-                                    tool_name_list[toolUseId] = tool
-                                    logger.info(f"[tool] {tool}, [input] {input}, [toolUseId] {toolUseId}")
-                                    if isinstance(input, dict) and input:
-                                        tool_input_cache[toolUseId] = input
-                                    effective_input = tool_input_cache.get(
-                                        toolUseId,
-                                        input if isinstance(input, dict) else {},
-                                    )
-                                    current = on_tool_use_started(
-                                        notification_queue, current, toolUseId, tool_info_list
-                                    )
-                                    if effective_input:
-                                        logger.info(f"tool info: {toolUseId}")
-                                        tool_slot_update(
-                                            notification_queue,
-                                            f"{toolUseId}:input",
-                                            f"Tool: {tool}, Input: {_format_tool_input(effective_input)}",
-                                        )
-                                    
-                            else: # claude
-                                if 'TextBlock' in data_json:
-                                    TextBlock = data_json['TextBlock']
-                                    logger.info(f"TextBlock: {TextBlock}")
-                                    update_streaming_result(notification_queue, TextBlock)
-
-                                    result = TextBlock
-
-                                elif 'tools' in data_json:
-                                    tools = data_json['tools']
-                                    logger.info(f"[tools] {tools}")
-                                    add_notification(notification_queue, f"Tools: {tools}")
-
-                                elif 'ToolUseBlock' in data_json:
-                                    ToolUseBlock = data_json['ToolUseBlock']
-                                    input = data_json['input']
-                                    logger.info(f"tool: {ToolUseBlock}, input: {input}")
-                                    add_notification(notification_queue, f"Tool: {ToolUseBlock}, Input: {input}")
-                                    
-                                elif 'ToolResultBlock' in data_json:
-                                    ToolResultBlock = data_json['ToolResultBlock']
-                                    logger.info(f"ToolResult: {ToolResultBlock}")
-
-                                    logger.info(f"tool result: {ToolResultBlock}")                                    
-                                    add_notification(notification_queue, f"Tool Result: {str(ToolResultBlock)}")
-
-                                    content, urls, refs = get_tool_info(tool_name, ToolResultBlock)
-                                    if refs:
-                                        for r in refs:
-                                            references.append(r)
-                                        logger.info(f"refs: {refs}")
-                                    if urls:
-                                        for url in urls:
-                                            image_url.append(url)
-                                        logger.info(f"urls: {urls}")
-
-                                    if content:
-                                        logger.info(f"content: {content}")              
-                        
-                        except json.JSONDecodeError:
-                            logger.info(f"Not JSON: {data}")
-                        except Exception as e:
-                            logger.error(f"Error processing data: {e}", exc_info=True)
-                            continue
-        
-        if references:
-            result += _format_references_markdown(references)
-
+    def run(
+        self,
+        prompt,
+        user_id,
+        mcp_servers,
+        model_name,
+        runtime_session_id,
+        notification_queue=None,
+        skill_list=None,
+        guardrail_enabled=None,
+        memory_enabled=None,
+        llm_gateway_enabled=None,
+        llm_gateway_url=None,
+        llm_gateway_key=None,
+        files=None,
+    ):
+        tool_info_list.clear()
+        tool_result_list.clear()
+        tool_name_list.clear()
         if notification_queue is not None:
-            notification_queue.result(result)
-    
-        logger.info(f"result: {result}")
-        return result, image_url
-        
-    except Exception as e:
-        error_msg = f"Unexpected error: {str(e)}"
-        logger.error(error_msg)
-        return f"Error: {error_msg}", []
+            notification_queue.reset()
+
+        references: list = []
+        image_url: list = []
+
+        logger.info("user_id: %s", user_id)
+
+        payload = self.build_payload(
+            prompt=prompt,
+            user_id=user_id,
+            mcp_servers=mcp_servers,
+            model_name=model_name,
+            runtime_session_id=runtime_session_id,
+            skill_list=skill_list,
+            guardrail_enabled=guardrail_enabled,
+            memory_enabled=memory_enabled,
+            llm_gateway_enabled=llm_gateway_enabled,
+            llm_gateway_url=llm_gateway_url,
+            llm_gateway_key=llm_gateway_key,
+            files=files,
+        )
+
+        agent_runtime_arn = self.resolve_runtime_arn()
+        print(f"agent_runtime_arn: {agent_runtime_arn}")
+        logger.info("agent_runtime_arn: %s", agent_runtime_arn)
+        logger.info("Payload: %s", payload)
+
+        if agent_runtime_arn is None:
+            logger.error("agent_runtime_arn is not found")
+            return "Error: agent_runtime_arn is not found", []
+
+        try:
+            agent_core_client = self.create_runtime_client()
+            logger.info("runtime_session_id: %s", runtime_session_id)
+            response = agent_core_client.invoke_agent_runtime(
+                agentRuntimeArn=agent_runtime_arn,
+                runtimeSessionId=runtime_session_id,
+                payload=payload,
+                qualifier="DEFAULT",
+            )
+
+            stream_state = {
+                "result": "",
+                "current": "",
+                "image_url": image_url,
+                "references": references,
+                "tool_input_cache": {},
+            }
+            self.process_event_stream(response, notification_queue, stream_state)
+
+            result = _finalize_agent_result(
+                stream_state["result"],
+                stream_state["current"],
+                stream_state["references"],
+                notification_queue,
+            )
+            image_url = stream_state["image_url"]
+
+            logger.info("result: %s", result)
+            return result, image_url
+
+        except Exception:
+            logger.exception("Unexpected error while running agent")
+            return "An error occurred processing your request", []
+
+
+def run_agent(
+    prompt,
+    user_id,
+    mcp_servers,
+    model_name,
+    runtime_session_id,
+    notification_queue=None,
+    skill_list=None,
+    guardrail_enabled=None,
+    memory_enabled=None,
+    llm_gateway_enabled=None,
+    llm_gateway_url=None,
+    llm_gateway_key=None,
+    files=None,
+):
+    return AgentCoreService().run(
+        prompt,
+        user_id,
+        mcp_servers,
+        model_name,
+        runtime_session_id,
+        notification_queue=notification_queue,
+        skill_list=skill_list,
+        guardrail_enabled=guardrail_enabled,
+        memory_enabled=memory_enabled,
+        llm_gateway_enabled=llm_gateway_enabled,
+        llm_gateway_url=llm_gateway_url,
+        llm_gateway_key=llm_gateway_key,
+        files=files,
+    )

@@ -1,5 +1,54 @@
 **/__pycache__
 **/*.pyc
-application/data/
+**/node_modules
+**/dist
 .git
 .gitignore
+.gitattributes
+.github/
+.DS_Store
+**/*.tsbuildinfo
+
+# Local / IDE
+.venv/
+venv/
+.env
+.env.*
+.vscode/
+.idea/
+.cursor/
+*.log
+
+# App local data (not for image)
+application/data/
+application/web/node_modules
+application/web/dist
+
+# Infra must never ship in the web image (was ~5GB with providers/cdk.out)
+cdk/
+terraform/
+**/.terraform/
+**/cdk.out/
+**/*.tfstate*
+**/*.tfvars
+
+# Runtime agent: keep sources (application/info.py loads strands/info.py),
+# but skip installers, tests, local state, and heavy skill payloads if unused by UI.
+runtime_agent/strands/installer.py
+runtime_agent/strands/uninstaller.py
+runtime_agent/strands/update.py
+runtime_agent/strands/test_*.py
+runtime_agent/strands/artifacts/
+runtime_agent/strands/config.json
+runtime_agent/strands/agentcore.json
+runtime_agent/strands/.bedrock_agentcore.yaml
+runtime_agent/strands/.venv/
+runtime_agent/strands/build/
+runtime_agent/strands/dist/
+runtime_agent/strands/*.egg-info/
+
+# Docs / misc
+*.md
+docs/
+.protoshield/
+scripts/
