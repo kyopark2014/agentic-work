@@ -6731,18 +6731,25 @@ def create_alb_target_group_for_ecs(vpc_info: Dict[str, str]) -> str:
         tg_arn = tg_response["TargetGroups"][0]["TargetGroupArn"]
         logger.info(f"  ✓ Created ECS target group: {tg_arn}")
 
-    # SQLite working-copy is per-task; stickiness keeps create/chat on the same target
-    # during rolling deploys when two tasks are briefly registered.
+    # Prefer application-cookie stickiness over lb_cookie.
+    # Duration-based lb_cookie emits AWSALB / AWSALBCORS without configurable
+    # Secure/HttpOnly flags (AWS platform limitation). Binding to our HMAC session
+    # cookie (agent_user_id: HttpOnly + Secure on HTTPS) keeps same-target routing
+    # for SQLite working-copy consistency without those ALB cookies.
     try:
         elbv2_client.modify_target_group_attributes(
             TargetGroupArn=tg_arn,
             Attributes=[
                 {"Key": "stickiness.enabled", "Value": "true"},
-                {"Key": "stickiness.type", "Value": "lb_cookie"},
-                {"Key": "stickiness.lb_cookie.duration_seconds", "Value": "86400"},
+                {"Key": "stickiness.type", "Value": "app_cookie"},
+                {"Key": "stickiness.app_cookie.cookie_name", "Value": "agent_user_id"},
+                {"Key": "stickiness.app_cookie.duration_seconds", "Value": "86400"},
             ],
         )
-        logger.info("  ✓ Enabled ALB target group stickiness (lb_cookie, 86400s)")
+        logger.info(
+            "  ✓ Enabled ALB target group stickiness "
+            "(app_cookie=agent_user_id, 86400s)"
+        )
     except ClientError as e:
         logger.warning(f"  Could not enable target group stickiness: {e}")
 

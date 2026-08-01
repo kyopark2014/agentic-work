@@ -2052,6 +2052,19 @@ SG만으로는 공격자가 **자체 CloudFront**를 ALB DNS에 연결해 우회
 
 기본 ALB behavior(앱 API·SPA)에는 TrustedKeyGroups를 걸지 않습니다. HMAC 세션 쿠키와 Signed Cookies는 역할이 다릅니다(앱 인증 vs S3 정적 파일 접근).
 
+### ALB stickiness cookies
+
+타겟 그룹 stickiness는 **application cookie**(`agent_user_id`)를 사용합니다.
+
+| 항목 | 내용 |
+|------|------|
+| 이전 | `lb_cookie` → ALB가 `AWSALB` / `AWSALBCORS` 발급. Secure·HttpOnly를 **설정할 수 없음** ([AWS](https://repost.aws/knowledge-center/elb-secure-flag-alb-cookies)) |
+| 현재 | `app_cookie` + 쿠키 이름 `agent_user_id` (앱이 HttpOnly·Secure(HTTPS)·SameSite=Lax로 발급) |
+| Viewer HTTPS | CloudFront `ViewerProtocolPolicy=redirect-to-https` (브라우저↔CloudFront는 HTTPS) |
+| CF→ALB | HTTP + origin custom header (ALB에서 TLS 종료하지 않음) |
+
+installer 재실행 시 기존 타겟 그룹 attributes가 `app_cookie`로 갱신됩니다.
+
 ### Security response headers
 
 브라우저 응답에 HSTS·CSP·`X-Frame-Options`·`X-Content-Type-Options`·`Referrer-Policy`를 넣습니다.

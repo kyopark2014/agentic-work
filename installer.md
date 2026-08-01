@@ -182,7 +182,9 @@ Runtime은 access point ARN이 있으면 **`s3FilesAccessPoint` + VPC 모드**, 
 - **타겟 그룹**: ECS Fargate 태스크 (IP 타겟, 포트 8501)
 - **헬스체크**: `/api/health`
 - **Idle timeout**: 120초 (`ALB_IDLE_TIMEOUT_SECONDS`) — 장시간 SSE 스트림 유지
-- **Stickiness**: `lb_cookie` 86400초 (태스크별 SQLite working-copy 일관성)
+- **Stickiness**: `app_cookie` on `agent_user_id` (86400초). SQLite working-copy 일관성용.  
+  `lb_cookie`(AWSALB/AWSALBCORS)는 Secure/HttpOnly를 설정할 수 없어 사용하지 않음 ([AWS guidance](https://repost.aws/knowledge-center/elb-secure-flag-alb-cookies)).  
+  세션 쿠키는 앱이 HttpOnly + Secure(HTTPS) + SameSite=Lax로 발급.
 - **Origin 보호**: listener default = **403 fixed-response**, `X-Custom-Header` 일치 시에만 ECS target group으로 forward (`ensure_alb_listener_origin_protection`)
 
 ### 6. CloudFront 배포
