@@ -110,6 +110,9 @@ def update(
     if userId != user_id:
         user_id = userId
         logger.info(f"user_id: {user_id}")
+    # Isolate generated files under workspace/{user_id}/artifacts
+    langgraph_agent.set_user_artifacts(user_id)
+    skill.set_user_artifacts(user_id)
 
     if model_name != modelName:
         model_name = modelName
@@ -1774,7 +1777,13 @@ async def create_agent(
     # Pass current user_id to per-user MCP servers via process env.
     # UI may send "knowledge base"; load_selected_config maps it to "kb-retriever".
     scoped_user_id = user_id if user_id else "default"
-    for server_name in ("memory", "kb-retriever", "knowledge base"):
+    for server_name in (
+        "memory",
+        "kb-retriever",
+        "knowledge base",
+        "imageGeneration",
+        "image_generation",
+    ):
         params = server_params.get(server_name)
         if params and params.get("transport") == "stdio":
             env = dict(params.get("env") or {})

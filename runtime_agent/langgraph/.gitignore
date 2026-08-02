@@ -3,3 +3,6 @@ __pycache__
 # configuration
 config.json
 agentcore.json
+
+# per-user generated files
+workspace/

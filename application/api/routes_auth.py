@@ -257,6 +257,7 @@ def set_session(body: SessionRequest, request: Request, response: Response) -> S
 
         user_id = idinfo["email"].strip()
         _set_user_cookie(response, request, user_id)
+        utils.ensure_user_artifacts_dir(user_id)
         try:
             from application import task_store
 
@@ -285,6 +286,7 @@ def set_session(body: SessionRequest, request: Request, response: Response) -> S
                 detail="Local auth bypass is disabled",
             )
         _set_user_cookie(response, request, local_user_id)
+        utils.ensure_user_artifacts_dir(local_user_id)
         try:
             from application import task_store
 
@@ -309,6 +311,8 @@ def get_session(request: Request, response: Response) -> SessionResponse | None:
     user_id = get_optional_user_id(request)
     if not user_id:
         return None
+    # Ensure workspace survives process restarts for an existing cookie session
+    utils.ensure_user_artifacts_dir(user_id)
     # Refresh CloudFront signed cookies while the session is still valid.
     if not cloudfront_cookies.set_signed_cookies(
         response,
