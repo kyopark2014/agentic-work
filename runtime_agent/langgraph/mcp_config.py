@@ -170,21 +170,6 @@ def load_config(mcp_type):
             }
         }
 
-    elif mcp_type == "aws-drawio":
-        return {
-            "mcpServers": {
-                "drawio": {
-                    "command": "npx",
-                    "args": [
-                        "-y",
-                        "https://github.com/aws-samples/sample-drawio-mcp/releases/latest/download/drawio-mcp-server-latest.tgz",
-                        "--no-cache"
-                    ],
-                    "type": "stdio"
-                }
-            }
-        }
-
     elif mcp_type == "notion":
         return {
             "mcpServers": {
