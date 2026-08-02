@@ -40,8 +40,12 @@ def sanitize_image_filename(filename: str) -> str:
     return f"{stem}_{unique}{ext}"
 
 
-def upload_chat_image(file_bytes: bytes, file_name: str) -> dict[str, Any]:
-    """Upload ``file_bytes`` to S3 under images/ for chat attachment.
+def upload_chat_image(
+    file_bytes: bytes,
+    file_name: str,
+    user_id: str | None = None,
+) -> dict[str, Any]:
+    """Upload ``file_bytes`` to S3 under images/{user_id}/ for chat attachment.
 
     Raises:
         FileUploadServiceError: when the file is empty, S3 upload fails, or
@@ -51,9 +55,9 @@ def upload_chat_image(file_bytes: bytes, file_name: str) -> dict[str, Any]:
         raise FileUploadServiceError(400, "Empty file")
 
     try:
-        upload_result = utils.upload_to_s3(file_bytes, file_name)
+        upload_result = utils.upload_to_s3(file_bytes, file_name, user_id=user_id)
     except Exception:
-        logger.exception("S3 upload failed for file=%s", file_name)
+        logger.exception("S3 upload failed for file=%s user=%s", file_name, user_id)
         raise FileUploadServiceError(500, "Failed to upload file to S3") from None
     if not upload_result:
         raise FileUploadServiceError(500, "Failed to upload file to S3")
@@ -64,7 +68,8 @@ def upload_chat_image(file_bytes: bytes, file_name: str) -> dict[str, Any]:
         )
 
     logger.info(
-        "File upload complete: file=%s s3_key=%s url=%s",
+        "File upload complete: user=%s file=%s s3_key=%s url=%s",
+        user_id,
         file_name,
         upload_result.get("s3_key"),
         upload_result.get("url"),
