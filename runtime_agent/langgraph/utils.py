@@ -17,13 +17,14 @@ logger = logging.getLogger("utils")
 
 workingDir = os.path.dirname(os.path.abspath(__file__))
 config_path = os.path.join(workingDir, "config.json")
-# AgentCore session mount (/mnt/workspace); local fallback is .session_storage.
+# Prefer AgentCore /mnt/workspace; local fallback is .session_storage.
 SESSION_STORAGE_DIR = os.environ.get(
     "SESSION_STORAGE_DIR",
     "/mnt/workspace"
     if os.path.isdir("/mnt/workspace")
     else os.path.join(workingDir, ".session_storage"),
 )
+SKILLS_DIR = os.path.join(workingDir, "skills")
 
 
 def sanitize_user_path_segment(user_id: str | None) -> str | None:
@@ -53,6 +54,114 @@ def ensure_user_artifacts_dir(user_id: str | None) -> str:
     os.makedirs(artifacts_dir, exist_ok=True)
     logger.info("user artifacts dir ready: %s", artifacts_dir)
     return artifacts_dir
+
+
+def get_user_skills_dir(user_id: str | None) -> str:
+    """Absolute path to {SESSION_STORAGE_DIR}/{user_id}/skills (does not create)."""
+    segment = sanitize_user_path_segment(user_id) or "default"
+    return os.path.join(SESSION_STORAGE_DIR, segment, "skills")
+
+
+def ensure_user_skills_dir(user_id: str | None) -> str:
+    """Create {SESSION_STORAGE_DIR}/{user_id}/skills if needed and return it."""
+    skills_dir = get_user_skills_dir(user_id)
+    os.makedirs(skills_dir, exist_ok=True)
+    logger.info("user skills dir ready: %s", skills_dir)
+    return skills_dir
+
+
+def get_user_skills_list_path(user_id: str | None) -> str:
+    """Absolute path to {SESSION_STORAGE_DIR}/{user_id}/skills.list (does not create)."""
+    segment = sanitize_user_path_segment(user_id) or "default"
+    return os.path.join(SESSION_STORAGE_DIR, segment, "skills.list")
+
+
+def list_skill_dir_names(skills_dir: str) -> list[str]:
+    """Return subdirectory names that contain SKILL.md under skills_dir."""
+    if not os.path.isdir(skills_dir):
+        return []
+    names: list[str] = []
+    try:
+        entries = sorted(os.listdir(skills_dir))
+    except OSError as e:
+        logger.warning("Failed to list skills directory %s: %s", skills_dir, e)
+        return []
+    for entry in entries:
+        if os.path.isfile(os.path.join(skills_dir, entry, "SKILL.md")):
+            names.append(entry)
+    return names
+
+
+def load_skills_list_file(path: str) -> list[str]:
+    """Load skill names from a skills.list file (ignore blanks/comments)."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return [
+                line.strip()
+                for line in f
+                if line.strip() and not line.strip().startswith("#")
+            ]
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        logger.warning("Failed to read skills.list %s: %s", path, e)
+        return []
+
+
+def builtin_skill_names() -> list[str]:
+    """Builtin skill names discovered by scanning SKILLS_DIR for SKILL.md."""
+    return list_skill_dir_names(SKILLS_DIR)
+
+
+def _merged_skill_names(user_id: str | None) -> list[str]:
+    """Builtin skills/ dirs + per-user skill-creator skills (deduped, stable order)."""
+    merged: list[str] = []
+    seen: set[str] = set()
+    for name in builtin_skill_names() + list_skill_dir_names(get_user_skills_dir(user_id)):
+        if name not in seen:
+            merged.append(name)
+            seen.add(name)
+    return merged
+
+
+def write_user_skills_list(user_id: str | None, names: list[str] | None = None) -> str:
+    """Write {SESSION_STORAGE_DIR}/{user_id}/skills.list and return its path."""
+    ensure_user_skills_dir(user_id)
+    path = get_user_skills_list_path(user_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    merged = names if names is not None else _merged_skill_names(user_id)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(merged) + ("\n" if merged else ""))
+    logger.info("wrote user skills.list (%d skills) -> %s", len(merged), path)
+    return path
+
+
+def ensure_user_skills_list(user_id: str | None) -> str:
+    """Use {SESSION_STORAGE_DIR}/{user_id}/skills.list; create it if missing.
+
+    When creating, seed from builtin ``skills/`` plus ``{user-id}/skills/``.
+    If the file already exists, only newly discovered skill-creator dirs are appended.
+    """
+    ensure_user_skills_dir(user_id)
+    path = get_user_skills_list_path(user_id)
+    if not os.path.isfile(path):
+        return write_user_skills_list(user_id)
+
+    existing = load_skills_list_file(path)
+    seen = set(existing)
+    appended = [
+        name
+        for name in list_skill_dir_names(get_user_skills_dir(user_id))
+        if name not in seen
+    ]
+    if appended:
+        return write_user_skills_list(user_id, existing + appended)
+    return path
+
+
+def update_user_skills_list(user_id: str | None) -> str:
+    """Refresh {SESSION_STORAGE_DIR}/{user_id}/skills.list from skills dirs."""
+    return write_user_skills_list(user_id)
 
 
 def load_config():

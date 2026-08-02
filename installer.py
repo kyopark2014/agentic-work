@@ -5759,9 +5759,14 @@ def _skill_name_from_skill_md(skill_md_path: str, fallback: str) -> str:
 
 
 def update_skills_list_from_directory() -> List[str]:
-    """Rewrite runtime_agent/langgraph/skills.list from skills/*/SKILL.md names."""
+    """Rewrite application/skills.list from runtime_agent/langgraph/skills/*/SKILL.md names.
+
+    Runtime no longer ships a langgraph/skills.list; per-user lists live under
+    {SESSION_STORAGE_DIR}/{user_id}/skills.list. application/skills.list is the
+    builtin seed used when those per-user lists are created.
+    """
     skills_dir = os.path.join(_project_root(), "runtime_agent", "langgraph", "skills")
-    list_path = os.path.join(_project_root(), "runtime_agent", "langgraph", "skills.list")
+    list_path = os.path.join(_project_root(), "application", "skills.list")
 
     if not os.path.isdir(skills_dir):
         raise FileNotFoundError(f"Missing skills directory: {skills_dir}")
@@ -5781,23 +5786,27 @@ def update_skills_list_from_directory() -> List[str]:
             f.write("\n")
 
     logger.info(
-        f"  ✓ Updated skills.list from {skills_dir} "
+        f"  ✓ Updated application/skills.list from {skills_dir} "
         f"({len(ordered_names)} skill(s)): {', '.join(ordered_names)}"
     )
     return ordered_names
 
 
 def sync_application_capability_lists() -> None:
-    """Update skills.list from skills/, then overwrite application/*.list from langgraph."""
+    """Refresh application capability lists before image build.
+
+    - skills.list: rebuild from runtime_agent/langgraph/skills/*/SKILL.md
+    - mcp.list: copy from runtime_agent/langgraph/mcp.list
+    """
     update_skills_list_from_directory()
-    for filename in ("mcp.list", "skills.list"):
-        src = os.path.join(_project_root(), "runtime_agent", "langgraph", filename)
-        dst = os.path.join(_project_root(), "application", filename)
-        if not os.path.isfile(src):
-            raise FileNotFoundError(f"Missing capability list: {src}")
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        shutil.copyfile(src, dst)
-        logger.info(f"  ✓ Overwrote application/{filename} from runtime_agent/langgraph/{filename}")
+
+    src = os.path.join(_project_root(), "runtime_agent", "langgraph", "mcp.list")
+    dst = os.path.join(_project_root(), "application", "mcp.list")
+    if not os.path.isfile(src):
+        raise FileNotFoundError(f"Missing capability list: {src}")
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.copyfile(src, dst)
+    logger.info("  ✓ Overwrote application/mcp.list from runtime_agent/langgraph/mcp.list")
 
 
 def write_application_config(config_data: Dict, *, merge_existing: bool = True) -> bool:
@@ -6630,7 +6639,7 @@ def build_and_push_docker_image(
     """Build Docker image from Dockerfile and push to ECR."""
     logger.info("[8/10] Building and pushing Docker image to ECR")
 
-    # Overwrite application mcp.list / skills.list from runtime before image build.
+    # Rebuild application/skills.list from skills/; copy mcp.list before image build.
     sync_application_capability_lists()
 
     if shutil.which("docker") is None:
@@ -7221,10 +7230,12 @@ def deploy_ecs_service(
             [
                 {"name": "TASK_DB_MOUNT", "value": app_data_mount},
                 {"name": "TASK_DB_PROJECT", "value": project_name},
+                # Same S3 Files root as AgentCore /mnt/workspace (skills.list, skills/).
+                {"name": "SESSION_STORAGE_DIR", "value": app_data_mount},
             ]
         )
         logger.info(
-            "  ECS task will mount S3 Files at %s for tasks.db persistence",
+            "  ECS task will mount S3 Files at %s for tasks.db + session storage",
             app_data_mount,
         )
 

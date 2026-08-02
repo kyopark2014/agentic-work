@@ -110,9 +110,10 @@ def update(
     if userId != user_id:
         user_id = userId
         logger.info(f"user_id: {user_id}")
-    # Isolate generated files under {SESSION_STORAGE_DIR}/{user_id}/artifacts
-    langgraph_agent.set_user_artifacts(user_id)
-    skill.set_user_artifacts(user_id)
+    # Isolate artifacts + user skills under {SESSION_STORAGE_DIR}/{user_id}/
+    # and ensure {user_id}/skills.list exists (create if missing).
+    langgraph_agent.set_user_workspace(user_id)
+    skill.set_user_workspace(user_id)
 
     if model_name != modelName:
         model_name = modelName
