@@ -44,6 +44,9 @@ RUN pip install opentelemetry-instrumentation-langchain
 
 COPY . .
 
+# architecture-drawer: local draw.io CLI (vendored drawio-jsapi)
+RUN cd skills/architecture-drawer/scripts && npm install --omit=dev
+
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser \
     && chown -R appuser:appuser /app
 
