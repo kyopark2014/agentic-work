@@ -639,6 +639,7 @@ uvicorn application.server:app --host 0.0.0.0 --port 8501
 |------|--------|------|
 | CloudFront ALB origin **Origin Read Timeout** | 30초 | 도구 실행 중 SSE `data:` 이벤트가 30초 이상 없으면 CloudFront가 origin 연결을 끊음 |
 | ALB **idle timeout** | 60초 | 긴 스트림에서 ALB가 유휴 연결을 먼저 종료할 수 있음 |
+| App **AGENT_STREAM_TIMEOUT** | 1200초 | SSE 소비 루프가 이 시간을 넘기면 `Agent timeout`으로 종료. 이전 300초에서는 긴 docx/코드 수정 루프가 잘림 |
 | 프론트엔드 | `done` 이벤트 대기 | 스트림이 조기 종료되면 optimistic UI만 남고 assistant 메시지가 확정되지 않음 |
 
 백엔드(`agentcore_client.py`)까지는 응답이 도달하지만, **CloudFront → 브라우저** 구간에서 SSE가 끊기는 것이 핵심입니다.
@@ -653,6 +654,7 @@ uvicorn application.server:app --host 0.0.0.0 --port 8501
 **단기 — 애플리케이션**
 
 - `application/api/routes_chat.py`: 도구 실행 대기 중 **15초마다 SSE heartbeat** (`: keepalive\n\n`) 전송
+- `application/services/chat_stream_service.py`: `AGENT_STREAM_TIMEOUT_SECONDS=1200`. 타임아웃/클라이언트 끊김 후에도 agent worker 완료 시 **late persist**로 assistant 메시지를 DB에 저장(새로고침 시 노출)
 - `application/web/src/hooks/useChatStream.ts`: `done` 없이 스트림이 종료되면 **에러 메시지** 표시
 
 #### 배포·확인

@@ -18,7 +18,11 @@ from application.runtime_mode import run_agent
 logger = logging.getLogger("chat_stream_service")
 
 SSE_HEARTBEAT_INTERVAL_SECONDS = 15
-AGENT_STREAM_TIMEOUT_SECONDS = 300
+# Long skill runs (docx/pptx + debug loops) routinely exceed 5 minutes.
+AGENT_STREAM_TIMEOUT_SECONDS = 1200
+# After SSE times out / client disconnects, wait this long for the agent
+# worker to finish so the final answer can still be persisted for refresh.
+LATE_PERSIST_WAIT_SECONDS = 1800
 STREAMING_PREFIX_COMPARISON_LENGTH = 80
 CLIENT_SAFE_AGENT_ERROR = "Agent processing failed"
 CLIENT_SAFE_AGENT_TIMEOUT = "Agent timeout"
@@ -326,6 +330,136 @@ class ChatStreamService:
         worker.start()
         return worker
 
+    def _consume_queue_item(
+        self,
+        item: dict[str, Any],
+        *,
+        tool_events: list[dict[str, Any]],
+        tool_meta: dict[str, dict[str, Any]],
+        streamed_text: str,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Apply one notification-queue item to the timeline. Returns (text, emit)."""
+        mapped = self.map_sink_event(item)
+        if not mapped:
+            return streamed_text, []
+
+        if mapped["type"] == "token":
+            before = streamed_text
+            streamed_text, committed = self.handle_token(
+                tool_events, streamed_text, mapped["data"]
+            )
+            events: list[dict[str, Any]] = []
+            if streamed_text == before and committed is None:
+                return streamed_text, events
+            if committed:
+                events.append(committed)
+            events.append(mapped)
+            return streamed_text, events
+
+        if mapped["type"] == "text":
+            committed = self.flush_text_segment(tool_events, mapped["data"])
+            events = [committed] if committed else []
+            return "", events
+
+        if mapped["type"] in ("tool", "tool_result", "info"):
+            events = []
+            if mapped["type"] in ("tool", "tool_result"):
+                committed = self.flush_text_segment(tool_events, streamed_text)
+                if mapped["type"] == "tool":
+                    streamed_text = ""
+                if committed:
+                    events.append(committed)
+            events.extend(self.track_tool_event(tool_events, tool_meta, mapped))
+            return streamed_text, events
+
+        return streamed_text, [mapped]
+
+    def _build_final_payload(
+        self,
+        *,
+        result_holder: dict[str, Any],
+        tool_events: list[dict[str, Any]],
+        streamed_text: str,
+    ) -> tuple[str, list[str], list[dict[str, Any]]]:
+        authoritative_final = (result_holder.get("content") or "").strip()
+        final_content = authoritative_final or streamed_text
+        if authoritative_final:
+            self.set_final_text_in_timeline(tool_events, final_content)
+        else:
+            self.flush_text_segment(tool_events, streamed_text)
+            self.set_final_text_in_timeline(tool_events, final_content)
+        images = result_holder.get("images") or []
+        return final_content, images, tool_events
+
+    def _spawn_late_persist(
+        self,
+        *,
+        message_queue: queue.Queue,
+        result_holder: dict[str, Any],
+        tool_events: list[dict[str, Any]],
+        tool_meta: dict[str, dict[str, Any]],
+        streamed_text: str,
+        on_assistant_done: Any,
+        on_flush: Any,
+    ) -> None:
+        """Keep draining the agent queue after SSE ends; persist the final answer."""
+
+        def _late_persist() -> None:
+            text = streamed_text
+            deadline = time.monotonic() + LATE_PERSIST_WAIT_SECONDS
+            try:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        logger.warning(
+                            "Late persist timed out waiting for agent worker"
+                        )
+                        return
+                    try:
+                        item = message_queue.get(timeout=min(5.0, remaining))
+                    except queue.Empty:
+                        continue
+                    if item is None:
+                        break
+                    text, _ = self._consume_queue_item(
+                        item,
+                        tool_events=tool_events,
+                        tool_meta=tool_meta,
+                        streamed_text=text,
+                    )
+
+                if "error" in result_holder:
+                    logger.info(
+                        "Late persist skipped: agent worker error=%s",
+                        result_holder.get("error"),
+                    )
+                    return
+
+                final_content, images, events = self._build_final_payload(
+                    result_holder=result_holder,
+                    tool_events=tool_events,
+                    streamed_text=text,
+                )
+                if not (final_content or events):
+                    logger.info("Late persist skipped: empty final payload")
+                    return
+
+                logger.info(
+                    "Late persist saving assistant message (%s chars, %s events)",
+                    len(final_content),
+                    len(events),
+                )
+                on_assistant_done(final_content, images, events)
+                on_flush()
+            except Exception:
+                logger.exception("Late persist failed")
+
+        threading.Thread(
+            target=_late_persist,
+            name="chat-late-persist",
+            daemon=True,
+        ).start()
+
     def iter_sse_events(
         self,
         *,
@@ -339,12 +473,17 @@ class ChatStreamService:
         tool_events: list[dict[str, Any]] = []
         tool_meta: dict[str, dict[str, Any]] = {}
         streamed_text = ""
+        sse_closed_early = False
 
         try:
             deadline = time.monotonic() + self.stream_timeout
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    logger.warning(
+                        "Agent SSE stream timed out after %ss; scheduling late persist",
+                        self.stream_timeout,
+                    )
                     on_assistant_error(CLIENT_SAFE_AGENT_TIMEOUT)
                     yield sse_event({"type": "error", "data": CLIENT_SAFE_AGENT_TIMEOUT})
                     yield sse_event(
@@ -354,7 +493,17 @@ class ChatStreamService:
                             "images": [],
                         }
                     )
-                    break
+                    sse_closed_early = True
+                    self._spawn_late_persist(
+                        message_queue=message_queue,
+                        result_holder=result_holder,
+                        tool_events=tool_events,
+                        tool_meta=tool_meta,
+                        streamed_text=streamed_text,
+                        on_assistant_done=on_assistant_done,
+                        on_flush=on_flush,
+                    )
+                    return
 
                 try:
                     item = message_queue.get(
@@ -367,41 +516,14 @@ class ChatStreamService:
                 if item is None:
                     break
 
-                mapped = self.map_sink_event(item)
-                if not mapped:
-                    continue
-
-                if mapped["type"] == "token":
-                    before = streamed_text
-                    streamed_text, committed = self.handle_token(
-                        tool_events, streamed_text, mapped["data"]
-                    )
-                    if streamed_text == before and committed is None:
-                        continue
-                    if committed:
-                        yield sse_event(committed)
-                    yield sse_event(mapped)
-                    continue
-                if mapped["type"] == "text":
-                    committed = self.flush_text_segment(tool_events, mapped["data"])
-                    streamed_text = ""
-                    if committed:
-                        yield sse_event(committed)
-                    continue
-                if mapped["type"] in ("tool", "tool_result", "info"):
-                    if mapped["type"] in ("tool", "tool_result"):
-                        committed = self.flush_text_segment(tool_events, streamed_text)
-                        if mapped["type"] == "tool":
-                            streamed_text = ""
-                        if committed:
-                            yield sse_event(committed)
-                    for tool_event in self.track_tool_event(
-                        tool_events, tool_meta, mapped
-                    ):
-                        yield sse_event(tool_event)
-                    continue
-
-                yield sse_event(mapped)
+                streamed_text, events_to_emit = self._consume_queue_item(
+                    item,
+                    tool_events=tool_events,
+                    tool_meta=tool_meta,
+                    streamed_text=streamed_text,
+                )
+                for event in events_to_emit:
+                    yield sse_event(event)
 
             if "error" in result_holder:
                 safe_error = result_holder.get("error") or CLIENT_SAFE_AGENT_ERROR
@@ -411,24 +533,41 @@ class ChatStreamService:
                 yield sse_event({"type": "done", "content": error_text, "images": []})
                 return
 
-            authoritative_final = (result_holder.get("content") or "").strip()
-            final_content = authoritative_final or streamed_text
-            if authoritative_final:
-                self.set_final_text_in_timeline(tool_events, final_content)
-            else:
-                self.flush_text_segment(tool_events, streamed_text)
-                self.set_final_text_in_timeline(tool_events, final_content)
-            images = result_holder.get("images") or []
+            final_content, images, events = self._build_final_payload(
+                result_holder=result_holder,
+                tool_events=tool_events,
+                streamed_text=streamed_text,
+            )
 
-            on_assistant_done(final_content, images, tool_events)
+            on_assistant_done(final_content, images, events)
 
             yield sse_event(
                 {
                     "type": "done",
                     "content": final_content,
                     "images": images,
-                    "tool_events": tool_events,
+                    "tool_events": events,
                 }
             )
+        except GeneratorExit:
+            # Client disconnected (refresh/navigation) while the agent is still running.
+            already_final = bool((result_holder.get("content") or "").strip()) or (
+                "error" in result_holder
+            )
+            if not sse_closed_early and not already_final:
+                logger.warning(
+                    "SSE client disconnected before agent finished; scheduling late persist"
+                )
+                self._spawn_late_persist(
+                    message_queue=message_queue,
+                    result_holder=result_holder,
+                    tool_events=tool_events,
+                    tool_meta=tool_meta,
+                    streamed_text=streamed_text,
+                    on_assistant_done=on_assistant_done,
+                    on_flush=on_flush,
+                )
+            raise
         finally:
-            on_flush()
+            if not sse_closed_early:
+                on_flush()
