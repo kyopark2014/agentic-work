@@ -17,7 +17,13 @@ logger = logging.getLogger("utils")
 
 workingDir = os.path.dirname(os.path.abspath(__file__))
 config_path = os.path.join(workingDir, "config.json")
-WORKSPACE_DIR = os.path.join(workingDir, "workspace")
+# AgentCore session mount (/mnt/workspace); local fallback is .session_storage.
+SESSION_STORAGE_DIR = os.environ.get(
+    "SESSION_STORAGE_DIR",
+    "/mnt/workspace"
+    if os.path.isdir("/mnt/workspace")
+    else os.path.join(workingDir, ".session_storage"),
+)
 
 
 def sanitize_user_path_segment(user_id: str | None) -> str | None:
@@ -36,13 +42,13 @@ def sanitize_user_path_segment(user_id: str | None) -> str | None:
 
 
 def get_user_artifacts_dir(user_id: str | None) -> str:
-    """Absolute path to workspace/{user_id}/artifacts (does not create the directory)."""
+    """Absolute path to {SESSION_STORAGE_DIR}/{user_id}/artifacts (does not create)."""
     segment = sanitize_user_path_segment(user_id) or "default"
-    return os.path.join(WORKSPACE_DIR, segment, "artifacts")
+    return os.path.join(SESSION_STORAGE_DIR, segment, "artifacts")
 
 
 def ensure_user_artifacts_dir(user_id: str | None) -> str:
-    """Create workspace/{user_id}/artifacts if needed and return its absolute path."""
+    """Create {SESSION_STORAGE_DIR}/{user_id}/artifacts if needed and return it."""
     artifacts_dir = get_user_artifacts_dir(user_id)
     os.makedirs(artifacts_dir, exist_ok=True)
     logger.info("user artifacts dir ready: %s", artifacts_dir)

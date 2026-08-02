@@ -110,7 +110,7 @@ def update(
     if userId != user_id:
         user_id = userId
         logger.info(f"user_id: {user_id}")
-    # Isolate generated files under workspace/{user_id}/artifacts
+    # Isolate generated files under {SESSION_STORAGE_DIR}/{user_id}/artifacts
     langgraph_agent.set_user_artifacts(user_id)
     skill.set_user_artifacts(user_id)
 

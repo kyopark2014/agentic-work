@@ -42,7 +42,7 @@ from urllib.parse import quote
 from langchain_core.tools import tool
 
 WORKING_DIR = os.path.dirname(os.path.abspath(__file__))
-# Per-user artifacts live under workspace/{user_id}/artifacts (set via set_user_artifacts).
+# Per-user artifacts: {SESSION_STORAGE_DIR}/{user_id}/artifacts (set via set_user_artifacts).
 ARTIFACTS_DIR = utils.get_user_artifacts_dir("default")
 
 _py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
@@ -81,12 +81,11 @@ _EXCLUDED_SNAPSHOT_DIRS = frozenset({
     "build",
     ".mypy_cache",
     ".pytest_cache",
-    "workspace",  # scan only the active user's ARTIFACTS_DIR below
 })
 
 
 def set_user_artifacts(user_id: str | None) -> str:
-    """Point ARTIFACTS_DIR at workspace/{user_id}/artifacts and refresh execute_code globals."""
+    """Point ARTIFACTS_DIR at {SESSION_STORAGE_DIR}/{user_id}/artifacts."""
     global ARTIFACTS_DIR
     artifacts_dir = utils.ensure_user_artifacts_dir(user_id)
     ARTIFACTS_DIR = artifacts_dir
@@ -131,7 +130,7 @@ def _working_dir_files_mtime_snapshot() -> dict:
 
     Code often writes under artifacts/ but may also write to the working dir root;
     scanning only artifacts/ missed those files and left download lists empty.
-    Other users' workspace folders are excluded; the active ARTIFACTS_DIR is scanned.
+    The active per-user ARTIFACTS_DIR (under SESSION_STORAGE_DIR) is also scanned.
     """
     snap = {}
     if not os.path.isdir(WORKING_DIR):
@@ -151,7 +150,11 @@ def _working_dir_files_mtime_snapshot() -> dict:
             for fn in filenames:
                 full = os.path.join(dirpath, fn)
                 try:
-                    rel = os.path.relpath(full, WORKING_DIR)
+                    # Prefer path relative to WORKING_DIR; fall back to absolute key.
+                    try:
+                        rel = os.path.relpath(full, WORKING_DIR)
+                    except ValueError:
+                        rel = full
                     snap[rel] = os.path.getmtime(full)
                 except OSError:
                     pass
@@ -350,7 +353,7 @@ def execute_code(code: str) -> str:
 
     Path variables (pre-defined, do NOT redefine):
     - WORKING_DIR: absolute path to application directory
-    - ARTIFACTS_DIR: absolute path to this user's artifacts (workspace/{user_id}/artifacts)
+    - ARTIFACTS_DIR: absolute path to this user's artifacts ({SESSION_STORAGE_DIR}/{user_id}/artifacts)
     - register_korean_font(): registers Nanum TTF or CID fallback for ReportLab; returns font name str
 
     Args:
@@ -504,7 +507,7 @@ def upload_file_to_s3(filepath: str) -> str:
             return f"File not found: {filepath}"
 
         # Align with Runtime IAM: only CF-shared prefixes (not agentcore-sessions/).
-        # Local files may live under workspace/{user}/artifacts; S3 keys stay artifacts/.
+        # Local files may live under SESSION_STORAGE_DIR/{user}/artifacts; S3 keys stay artifacts/.
         key = _s3_key_for_upload(filepath, full_path)
         allowed_prefixes = ("artifacts/", "images/", "docs/")
         if not key.startswith(allowed_prefixes):

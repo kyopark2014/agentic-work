@@ -4,5 +4,5 @@ __pycache__
 config.json
 agentcore.json
 
-# per-user generated files
-workspace/
+# per-user session / artifacts (local fallback for /mnt/workspace)
+.session_storage/
