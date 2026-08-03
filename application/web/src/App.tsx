@@ -26,7 +26,7 @@ import { ChatInput } from "./components/ChatInput";
 import { GoogleLoginModal } from "./components/GoogleLoginModal";
 import { Dashboard } from "./components/Dashboard";
 
-type DrawerKind = "skill" | "mcp" | "model" | null;
+type DrawerKind = "skill" | "mcp" | "model" | "appearance" | null;
 
 type QueuedMessage = {
   id: string;
@@ -172,29 +172,6 @@ export default function App() {
   }, [userId, config, refreshTasks, loadMessages, llmGatewayReady]);
 
   useEffect(() => {
-    if (!llmGatewayReady || !activeTaskId) return;
-    const task = tasks.find((t) => t.id === activeTaskId);
-    if (!task || task.llm_gateway_enabled) return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const updated = await appDataService.patchTask(activeTaskId, {
-          llm_gateway_enabled: true,
-        });
-        if (cancelled) return;
-        setTasks((prev) =>
-          sortTasks(prev.map((t) => (t.id === updated.id ? updated : t))),
-        );
-      } catch (err) {
-        uiError("auto-enable LLM Gateway failed", err);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [llmGatewayReady, activeTaskId, tasks]);
-
-  useEffect(() => {
     if (activeTaskId) {
       loadMessages(activeTaskId).catch((err) => {
         uiError("task:select failed", err);
@@ -319,10 +296,13 @@ export default function App() {
     if (!hasAuthenticatedConfig(config)) return;
     try {
       const defaults = buildNewTaskDefaults(config, activeTask);
+      const canEnableGateway =
+        Boolean(config.llm_gateway_configured) && llmGatewayReady;
       const task = await appDataService.createTask({
         ...defaults,
-        llm_gateway_enabled:
-          activeTask?.llm_gateway_enabled ?? llmGatewayReady,
+        llm_gateway_enabled: canEnableGateway
+          ? (activeTask?.llm_gateway_enabled ?? true)
+          : false,
       });
       setTasks((prev) => [task, ...prev]);
       setActiveTaskId(task.id);
@@ -353,7 +333,14 @@ export default function App() {
       );
     } catch (err) {
       uiError("task:patch failed", err);
-      setBootError(TASK_ERROR_MESSAGE);
+      const message =
+        err instanceof Error && err.message
+          ? err.message
+          : TASK_ERROR_MESSAGE;
+      setBootError(message);
+      if (patch.llm_gateway_enabled === true) {
+        throw err instanceof Error ? err : new Error(message);
+      }
     }
   }
 
@@ -446,7 +433,8 @@ export default function App() {
       if (!config) return;
       const task = await appDataService.createTask({
         ...buildFallbackTaskDefaults(config),
-        llm_gateway_enabled: llmGatewayReady,
+        llm_gateway_enabled:
+          Boolean(config.llm_gateway_configured) && llmGatewayReady,
       });
       setTasks([task]);
       setActiveTaskId(task.id);

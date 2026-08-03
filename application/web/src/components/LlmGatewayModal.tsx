@@ -70,12 +70,13 @@ export function LlmGatewayModal({
     setSuccess(null);
 
     if (!isAdmin) {
-      if (!gatewayConfigured) {
-        setError("관리자가 LLM Gateway를 먼저 설정해야 합니다.");
-        return;
-      }
       setBusy(true);
+      setError(null);
       try {
+        if (!gatewayConfigured) {
+          setError("관리자가 LLM Gateway를 먼저 설정해야 합니다.");
+          return;
+        }
         await onConfirmEnable();
         onClose();
       } catch (err) {
