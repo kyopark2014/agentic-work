@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 
-from application.api.routes_auth import require_user_id
+from application.api.routes_auth import _kick_graph_job, require_user_id
 from application import task_store
 from application.task_store_persistence import flush_persist
 from application.services.chat_stream_service import ChatStreamService
@@ -56,6 +56,8 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
         files=files,
     )
 
+    pending_graph_kick = {"yes": False}
+
     def on_assistant_error(safe_error: str) -> None:
         task_store.add_message(task_id, "assistant", f"Error: {safe_error}")
 
@@ -71,6 +73,13 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
             images=images,
             tool_events=tool_events,
         )
+        pending_graph_kick["yes"] = True
+
+    def on_flush() -> None:
+        flush_persist()
+        if pending_graph_kick["yes"]:
+            pending_graph_kick["yes"] = False
+            _kick_graph_job(user_id)
 
     return StreamingResponse(
         service.iter_sse_events(
@@ -78,7 +87,7 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
             result_holder=result_holder,
             on_assistant_error=on_assistant_error,
             on_assistant_done=on_assistant_done,
-            on_flush=flush_persist,
+            on_flush=on_flush,
         ),
         media_type="text/event-stream",
         headers={

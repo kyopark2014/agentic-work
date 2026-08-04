@@ -45,6 +45,11 @@ class SessionResponse(BaseModel):
     name: str | None = None
     picture: str | None = None
     llm_gateway_ready: bool = False
+    knowledge_graph_enabled: bool = True
+
+
+class SessionSettingsPatch(BaseModel):
+    knowledge_graph_enabled: bool | None = None
 
 
 def _google_client_id() -> str:
@@ -208,6 +213,9 @@ def get_optional_user_id(request: Request) -> str | None:
 
 def _kick_graph_job(user_id: str) -> None:
     """Fire-and-forget background graph extract (respects cooldown / running lock)."""
+    if not utils.is_knowledge_graph_enabled(user_id):
+        logger.info("Knowledge Graph disabled for %s — skip extract", user_id)
+        return
     try:
         from application.graph_jobs import ensure_graph_job
 
@@ -247,6 +255,29 @@ def _ensure_litellm_virtual_key(user_id: str) -> bool:
     except Exception:
         logger.exception("LiteLLM virtual key provisioning failed for %s", user_id)
         return False
+
+
+def _session_response(
+    user_id: str,
+    *,
+    name: str | None = None,
+    picture: str | None = None,
+    llm_gateway_ready: bool | None = None,
+) -> SessionResponse:
+    settings = utils.load_user_settings(user_id)
+    return SessionResponse(
+        user_id=user_id,
+        name=name,
+        picture=picture,
+        llm_gateway_ready=(
+            _has_litellm_virtual_key(user_id)
+            if llm_gateway_ready is None
+            else llm_gateway_ready
+        ),
+        knowledge_graph_enabled=bool(
+            settings.get("knowledge_graph_enabled", True)
+        ),
+    )
 
 
 @router.post("", response_model=SessionResponse)
@@ -289,8 +320,8 @@ def set_session(body: SessionRequest, request: Request, response: Response) -> S
 
         gateway_ready = _ensure_litellm_virtual_key(user_id)
         logger.info("Google login success: %s (llm_gateway_ready=%s)", user_id, gateway_ready)
-        return SessionResponse(
-            user_id=user_id,
+        return _session_response(
+            user_id,
             name=(idinfo.get("name") or None),
             picture=(idinfo.get("picture") or None),
             llm_gateway_ready=gateway_ready,
@@ -323,7 +354,7 @@ def set_session(body: SessionRequest, request: Request, response: Response) -> S
             local_user_id,
             gateway_ready,
         )
-        return SessionResponse(user_id=local_user_id, llm_gateway_ready=gateway_ready)
+        return _session_response(local_user_id, llm_gateway_ready=gateway_ready)
 
     raise HTTPException(
         status_code=400, detail="credential, access_token, or user_id is required"
@@ -343,7 +374,7 @@ def get_session(request: Request, response: Response) -> SessionResponse | None:
         utils.ensure_user_graph_dir(user_id)
     except Exception:
         logger.exception("Failed to ensure graph dir for %s", user_id)
-    _kick_graph_job(user_id)
+    # Do not kick graph on session poll — chat / login / rebuild trigger instead.
     # Refresh CloudFront signed cookies while the session is still valid.
     if not cloudfront_cookies.set_signed_cookies(
         response,
@@ -354,10 +385,23 @@ def get_session(request: Request, response: Response) -> SessionResponse | None:
             "CloudFront signed cookies not attached on session refresh "
             "(signing material missing?)"
         )
-    return SessionResponse(
-        user_id=user_id,
-        llm_gateway_ready=_has_litellm_virtual_key(user_id),
-    )
+    return _session_response(user_id)
+
+
+@router.patch("/settings", response_model=SessionResponse)
+def patch_session_settings(
+    body: SessionSettingsPatch, request: Request
+) -> SessionResponse:
+    """Update per-user feature settings (e.g. Knowledge Graph toggle)."""
+    user_id = require_user_id(request)
+    updates: dict[str, bool] = {}
+    if body.knowledge_graph_enabled is not None:
+        updates["knowledge_graph_enabled"] = body.knowledge_graph_enabled
+    if updates:
+        utils.save_user_settings(user_id, **updates)
+    if updates.get("knowledge_graph_enabled") is True:
+        _kick_graph_job(user_id)
+    return _session_response(user_id)
 
 
 @router.delete("", status_code=204)
