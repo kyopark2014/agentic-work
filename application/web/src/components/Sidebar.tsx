@@ -4,6 +4,7 @@ import { useTheme } from "../hooks/useTheme";
 import type { Theme } from "../theme";
 import type { AppConfig, Task } from "../types";
 import { ConfigDrawer } from "./ConfigDrawer";
+import { KnowledgeGraphModal } from "./KnowledgeGraphModal";
 import { LlmGatewayModal } from "./LlmGatewayModal";
 import { TaskListItem } from "./TaskListItem";
 import {
@@ -81,6 +82,7 @@ export function Sidebar({
   const settingsSectionRef = useRef<HTMLDivElement>(null);
   const [llmGatewayOpen, setLlmGatewayOpen] = useState(false);
   const [settingsExpanded, setSettingsExpanded] = useState(false);
+  const [knowledgeGraphOpen, setKnowledgeGraphOpen] = useState(false);
   const { theme, setTheme } = useTheme();
   const skills = activeTask?.skills ?? config?.default_skills ?? [];
   const mcpServers = activeTask?.mcp_servers ?? config?.default_mcp_servers ?? [];
@@ -168,7 +170,18 @@ export function Sidebar({
       <aside className={`sidebar${open ? " sidebar-panel-open" : ""}`}>
         <div className="sidebar-header">
           <div className="brand-row">
-            <div className="brand">{brandTitle}</div>
+            <button
+              type="button"
+              className="brand brand-graph-btn"
+              title="Knowledge Graph 보기"
+              aria-label={`${brandTitle} Knowledge Graph 보기`}
+              onClick={() => {
+                collapseSettings();
+                setKnowledgeGraphOpen(true);
+              }}
+            >
+              {brandTitle}
+            </button>
             <div className="sidebar-header-actions">
               <button
                 type="button"
@@ -450,6 +463,14 @@ export function Sidebar({
             setSettingsExpanded(false);
             onCloseDrawer();
           }}
+        />
+      )}
+
+      {knowledgeGraphOpen && (
+        <KnowledgeGraphModal
+          userId={userId}
+          title={`${brandTitle} Knowledge Graph`}
+          onClose={() => setKnowledgeGraphOpen(false)}
         />
       )}
     </>

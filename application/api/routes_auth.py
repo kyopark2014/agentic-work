@@ -206,6 +206,16 @@ def get_optional_user_id(request: Request) -> str | None:
     return session_cookie.verify_session(request.cookies.get(SESSION_COOKIE) or "")
 
 
+def _kick_graph_job(user_id: str) -> None:
+    """Fire-and-forget background graph extract (respects cooldown / running lock)."""
+    try:
+        from application.graph_jobs import ensure_graph_job
+
+        ensure_graph_job(user_id)
+    except Exception:
+        logger.exception("Failed to schedule graph job for %s", user_id)
+
+
 def _has_litellm_virtual_key(user_id: str) -> bool:
     try:
         try:
@@ -261,6 +271,11 @@ def set_session(body: SessionRequest, request: Request, response: Response) -> S
         utils.ensure_user_skills_dir(user_id)
         utils.ensure_user_skills_list(user_id)
         try:
+            utils.ensure_user_graph_dir(user_id)
+        except Exception:
+            logger.exception("Failed to ensure graph dir for %s", user_id)
+        _kick_graph_job(user_id)
+        try:
             from application import task_store
 
             task_store.record_login(
@@ -292,6 +307,11 @@ def set_session(body: SessionRequest, request: Request, response: Response) -> S
         utils.ensure_user_skills_dir(local_user_id)
         utils.ensure_user_skills_list(local_user_id)
         try:
+            utils.ensure_user_graph_dir(local_user_id)
+        except Exception:
+            logger.exception("Failed to ensure graph dir for %s", local_user_id)
+        _kick_graph_job(local_user_id)
+        try:
             from application import task_store
 
             task_store.record_login(local_user_id, method="local")
@@ -319,6 +339,11 @@ def get_session(request: Request, response: Response) -> SessionResponse | None:
     utils.ensure_user_artifacts_dir(user_id)
     utils.ensure_user_skills_dir(user_id)
     utils.ensure_user_skills_list(user_id)
+    try:
+        utils.ensure_user_graph_dir(user_id)
+    except Exception:
+        logger.exception("Failed to ensure graph dir for %s", user_id)
+    _kick_graph_job(user_id)
     # Refresh CloudFront signed cookies while the session is still valid.
     if not cloudfront_cookies.set_signed_cookies(
         response,
