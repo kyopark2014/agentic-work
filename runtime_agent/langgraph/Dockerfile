@@ -6,6 +6,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     nodejs \
     npm \
+    # Hangul glyphs for matplotlib / ReportLab in execute_code
+    fonts-nanum \
+    fontconfig \
     # myslide: cairosvg / SVG→PNG (runtime + compile deps for cairocffi on slim)
     build-essential \
     pkg-config \
@@ -17,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgdk-pixbuf-2.0-0 \
     shared-mime-info \
     librsvg2-bin \
+    && fc-cache -f \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --upgrade "setuptools>=83.0.0" \

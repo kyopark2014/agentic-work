@@ -158,6 +158,63 @@ def _public_url_for_key(key: str) -> str:
     return f"{base}/{quoted}"
 
 
+def _upload_file_to_project_s3(filepath: str, full_path: str | None = None) -> str:
+    """Upload a local file to the project S3 bucket; return the object key.
+
+    Raises ValueError/FileNotFoundError/RuntimeError on failure.
+    """
+    import boto3
+
+    s3_bucket = config.get("s3_bucket")
+    if not s3_bucket:
+        raise RuntimeError("S3 bucket is not configured.")
+
+    resolved = full_path or _resolve_workdir_path(filepath)
+    if not os.path.exists(resolved):
+        raise FileNotFoundError(f"File not found: {filepath} (resolved: {resolved})")
+
+    key = _s3_key_for_upload(filepath, resolved)
+    if not key.startswith(_ALLOWED_S3_PREFIXES):
+        raise ValueError(
+            "Upload rejected: S3 key must start with "
+            f"{', '.join(_ALLOWED_S3_PREFIXES)} (got {key!r})"
+        )
+
+    content_type = utils.get_contents_type(key)
+    s3 = boto3.client("s3", region_name=config.get("region", "us-west-2"))
+    with open(resolved, "rb") as f:
+        s3.put_object(
+            Bucket=s3_bucket,
+            Key=key,
+            Body=f.read(),
+            ContentType=content_type,
+        )
+    logger.info("uploaded artifact to s3://%s/%s", s3_bucket, key)
+    return key
+
+
+def _ensure_artifacts_uploaded(relative_paths: list) -> None:
+    """Push newly created artifact files to project S3 when sharing_url is set.
+
+    execute_code / write_file store files on the S3 Files mount
+    (``/mnt/workspace/...``). CloudFront serves the separate project bucket
+    (``artifacts/{user}/...``), so UI URLs 403 unless we also put_object there.
+    """
+    if not sharing_url or not config.get("s3_bucket"):
+        return
+    for rel in relative_paths:
+        try:
+            full = _abs_path_for_snapshot_key(rel)
+            if not os.path.isfile(full):
+                full = _resolve_workdir_path(str(rel))
+            if not os.path.isfile(full):
+                logger.warning("skip S3 upload; local artifact missing: %s", rel)
+                continue
+            _upload_file_to_project_s3(str(rel), full)
+        except Exception as e:
+            logger.warning("auto-upload failed for %s: %s", rel, e)
+
+
 def _expand_user_skills_token(raw: str) -> str:
     """Expand $USER_SKILLS_DIR / ${USER_SKILLS_DIR} using the current workspace path."""
     if not USER_SKILLS_DIR or "$" not in raw:
@@ -360,7 +417,14 @@ def _touched_artifact_paths(before: dict, after: dict) -> list:
 
 
 def _paths_for_ui(relative_paths: list) -> list:
-    """Return public URLs if sharing_url is set, otherwise absolute local paths."""
+    """Return public URLs if sharing_url is set, otherwise absolute local paths.
+
+    When sharing_url is set, local artifacts are uploaded to the project S3
+    bucket first so CloudFront keys actually exist.
+    """
+    if sharing_url:
+        _ensure_artifacts_uploaded(relative_paths)
+
     out = []
     for rel in relative_paths:
         key = _strip_to_allowed_prefix(str(rel).replace("\\", "/").lstrip("./"))
@@ -394,8 +458,21 @@ def _abs_path_for_snapshot_key(rel: str) -> str:
     return os.path.abspath(os.path.join(WORKING_DIR, rel))
 
 
+_KOREAN_TTF_CANDIDATES = (
+    # Bundled / image paths first (AgentCore Linux)
+    "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+    "/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf",
+    "/usr/share/fonts/nanum/NanumGothic.ttf",
+    os.path.join(WORKING_DIR, "assets", "NanumGothic-Regular.ttf"),
+    os.path.join("assets", "NanumGothic-Regular.ttf"),
+    # macOS local / desktop
+    "/Library/Fonts/NanumGothic.ttf",
+    "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+)
+
+
 def _ensure_matplotlib_runtime():
-    """Use non-interactive Agg backend, prefer CJK-capable fonts, silence headless/show noise."""
+    """Use non-interactive Agg backend, register a Hangul TTF, silence headless noise."""
     global _mpl_runtime_ready
     if _mpl_runtime_ready:
         return
@@ -421,17 +498,39 @@ def _ensure_matplotlib_runtime():
         import matplotlib as mpl
 
         mpl.rcParams["axes.unicode_minus"] = False
-        cjk_candidates = (
-            "AppleGothic",
-            "Apple SD Gothic Neo",
-            "Malgun Gothic",
-            "NanumGothic",
-            "NanumBarunGothic",
-            "Noto Sans CJK KR",
-            "Noto Sans KR",
+
+        registered_name = None
+        for path in _KOREAN_TTF_CANDIDATES:
+            if not os.path.isfile(path):
+                continue
+            try:
+                fm.fontManager.addfont(path)
+                registered_name = fm.FontProperties(fname=path).get_name()
+                logger.info(
+                    "matplotlib Korean font registered: %s (%s)",
+                    registered_name,
+                    path,
+                )
+                break
+            except Exception as e:
+                logger.info("matplotlib font add failed for %s: %s", path, e)
+
+        cjk_candidates = []
+        if registered_name:
+            cjk_candidates.append(registered_name)
+        cjk_candidates.extend(
+            [
+                "NanumGothic",
+                "NanumBarunGothic",
+                "AppleGothic",
+                "Apple SD Gothic Neo",
+                "Malgun Gothic",
+                "Noto Sans CJK KR",
+                "Noto Sans KR",
+            ]
         )
         mpl.rcParams["font.family"] = "sans-serif"
-        mpl.rcParams["font.sans-serif"] = list(cjk_candidates) + ["DejaVu Sans", "sans-serif"]
+        mpl.rcParams["font.sans-serif"] = cjk_candidates + ["DejaVu Sans", "sans-serif"]
 
         _mpl_runtime_ready = True
     except Exception as e:
@@ -534,6 +633,10 @@ def execute_code(code: str) -> str:
     - ARTIFACTS_DIR: absolute path to this user's artifacts ({SESSION_STORAGE_DIR}/{user_id}/artifacts)
     - USER_SKILLS_DIR: absolute path to this user's skills ({SESSION_STORAGE_DIR}/{user_id}/skills)
     - register_korean_font(): registers Nanum TTF or CID fallback for ReportLab; returns font name str
+
+    Matplotlib: Korean fonts are configured automatically (NanumGothic). Do NOT set
+    font.family to AppleGothic/Malgun Gothic — those are missing in the AgentCore
+    Linux image and will break Hangul glyphs (□ tofu boxes).
 
     Args:
         code: Python code to execute.
@@ -686,37 +789,14 @@ def upload_file_to_s3(filepath: str) -> str:
     """
     logger.info(f"###### upload_file_to_s3: {filepath} ######")
     try:
-        import boto3
-
-        s3_bucket = config.get("s3_bucket")
-        if not s3_bucket:
-            return "S3 bucket is not configured."
-
-        full_path = _resolve_workdir_path(filepath)
-        if not os.path.exists(full_path):
-            return f"File not found: {filepath} (resolved: {full_path})"
-
-        # Local: SESSION_STORAGE/{user}/artifacts/... → S3: artifacts/{user}/...
-        key = _s3_key_for_upload(filepath, full_path)
-        if not key.startswith(_ALLOWED_S3_PREFIXES):
-            return (
-                "Upload rejected: S3 key must start with "
-                f"{', '.join(_ALLOWED_S3_PREFIXES)} (got {key!r})"
-            )
-
-        content_type = utils.get_contents_type(key)
-        s3 = boto3.client("s3", region_name=config.get("region", "us-west-2"))
-
-        with open(full_path, "rb") as f:
-            s3.put_object(Bucket=s3_bucket, Key=key, Body=f.read(), ContentType=content_type)
-
+        key = _upload_file_to_project_s3(filepath)
         if sharing_url:
             return f"Upload complete: {_public_url_for_key(key)}"
+        s3_bucket = config.get("s3_bucket")
         return (
             "Upload complete: "
             f"{chat.s3_uri_to_console_url(f's3://{s3_bucket}/{key}', config.get('region', 'us-west-2'))}"
         )
-
     except Exception as e:
         return f"Upload failed: {str(e)}"
 

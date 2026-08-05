@@ -486,6 +486,61 @@ def is_lower_than_ma20(company_name: str = "NAVER", period: int = 30) -> bool:
 
     return True if current_close < df['ma20'].values[-1] else False
     
+def _configure_korean_matplotlib_font() -> None:
+    """Register an installed Hangul TTF for stock charts.
+
+    matplotlib's cached ``ttflist`` often omits apt-installed Nanum until rebuilt,
+    and ``font.family = 'AppleGothic'`` never raises when missing (falls back to
+    DejaVu → □). Prefer ``addfont`` on known Nanum paths (fonts-nanum package).
+    """
+    plt.rcParams["axes.unicode_minus"] = False
+
+    ttf_candidates = (
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        "/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf",
+        "/usr/share/fonts/nanum/NanumGothic.ttf",
+        os.path.join(script_dir, "assets", "NanumGothic-Regular.ttf"),
+        "/Library/Fonts/NanumGothic.ttf",
+        "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+    )
+    for path in ttf_candidates:
+        if not os.path.isfile(path):
+            continue
+        try:
+            fm.fontManager.addfont(path)
+            name = fm.FontProperties(fname=path).get_name()
+            plt.rcParams["font.family"] = name
+            plt.rcParams["font.sans-serif"] = [
+                name,
+                "NanumGothic",
+                "Nanum Gothic",
+                "AppleGothic",
+                "DejaVu Sans",
+                "sans-serif",
+            ]
+            logger.info("Korean font set to: %s (%s)", name, path)
+            return
+        except Exception as exc:
+            logger.info("font add failed for %s: %s", path, exc)
+
+    # Fallback: names actually present in the current font manager.
+    korean_fonts = [
+        "NanumGothic",
+        "Nanum Gothic",
+        "NanumBarunGothic",
+        "AppleGothic",
+        "Apple SD Gothic Neo",
+        "Malgun Gothic",
+    ]
+    for font_name in korean_fonts:
+        if any(f.name == font_name for f in fm.fontManager.ttflist):
+            plt.rcParams["font.family"] = font_name
+            logger.info("Korean font set to: %s", font_name)
+            return
+    logger.warning("Could not set Korean font, using default font")
+
+
 def draw_stock_trend(trend: Dict[str, object]) -> Dict[str, List[str]]:
     """
     Draw graphs of the given trend.
@@ -500,25 +555,10 @@ def draw_stock_trend(trend: Dict[str, object]) -> Dict[str, List[str]]:
     # Graph showing stock trend (candlestick chart)
     ###########################################################################################
     try:
-        # Try common Korean fonts on macOS
-        korean_fonts = ['AppleGothic', 'NanumGothic', 'Malgun Gothic', 'Apple SD Gothic Neo']
-        font_found = False
-        for font_name in korean_fonts:
-            try:
-                plt.rcParams['font.family'] = font_name
-                plt.rcParams['axes.unicode_minus'] = False  # Fix minus sign display
-                font_found = True
-                logger.info(f"Korean font set to: {font_name}")
-                break
-            except Exception:
-                continue
-        if not font_found:
-            # Fallback: set to any available font
-            plt.rcParams['axes.unicode_minus'] = False
-            logger.warning("Could not set Korean font, using default font")
+        _configure_korean_matplotlib_font()
     except Exception as exc:
         logger.warning(f"Font setting failed: {exc}, continuing with default font")
-        plt.rcParams['axes.unicode_minus'] = False
+        plt.rcParams["axes.unicode_minus"] = False
 
     points = trend.get("points", [])
     if not points:

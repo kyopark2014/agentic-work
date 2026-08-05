@@ -898,6 +898,76 @@ def create_bedrock_agentcore_storage_policy(config):
             ]
         )
 
+    # businfo skill: Athena query + Glue partitions + data/results S3.
+    businfo_bucket = f"businfo-{account_id}-{region}"
+    athena_results_bucket = f"aws-athena-query-results-{account_id}-{region}"
+    statements.extend(
+        [
+            {
+                "Sid": "BusinfoS3List",
+                "Effect": "Allow",
+                "Action": [
+                    "s3:ListBucket",
+                    "s3:GetBucketLocation",
+                ],
+                "Resource": [f"arn:aws:s3:::{businfo_bucket}"],
+            },
+            {
+                "Sid": "BusinfoS3Objects",
+                "Effect": "Allow",
+                "Action": ["s3:GetObject"],
+                "Resource": [f"arn:aws:s3:::{businfo_bucket}/*"],
+            },
+            {
+                "Sid": "AthenaResultsS3List",
+                "Effect": "Allow",
+                "Action": [
+                    "s3:ListBucket",
+                    "s3:GetBucketLocation",
+                ],
+                "Resource": [f"arn:aws:s3:::{athena_results_bucket}"],
+            },
+            {
+                "Sid": "AthenaResultsS3Objects",
+                "Effect": "Allow",
+                "Action": [
+                    "s3:GetObject",
+                    "s3:PutObject",
+                    "s3:AbortMultipartUpload",
+                ],
+                "Resource": [f"arn:aws:s3:::{athena_results_bucket}/*"],
+            },
+            {
+                "Sid": "BusinfoAthenaAccess",
+                "Effect": "Allow",
+                "Action": [
+                    "athena:StartQueryExecution",
+                    "athena:GetQueryExecution",
+                    "athena:GetQueryResults",
+                    "athena:StopQueryExecution",
+                    "athena:GetWorkGroup",
+                ],
+                "Resource": "*",
+            },
+            {
+                "Sid": "BusinfoGlueAccess",
+                "Effect": "Allow",
+                "Action": [
+                    "glue:GetDatabase",
+                    "glue:GetDatabases",
+                    "glue:GetTable",
+                    "glue:GetTables",
+                    "glue:GetPartition",
+                    "glue:GetPartitions",
+                    "glue:BatchGetPartition",
+                    "glue:CreatePartition",
+                    "glue:BatchCreatePartition",
+                ],
+                "Resource": "*",
+            },
+        ]
+    )
+
     policy_name = f"AmazonBedrockAgentCoreRuntimeStorageFor{project_name}"
     policy_document = {
         "Version": "2012-10-17",
@@ -1622,31 +1692,44 @@ def push_to_ecr():
 
 
 def get_latest_image_tag(config):
-    """Get the latest image tag from ECR."""
+    """Return the image tag to deploy for AgentCore.
+
+    Prefer ``latest_image_tag`` written by the build that just finished. Falling
+    back to an unpaginated ECR ``describe_images`` sort can pick a stale tag
+    (seen: built 20260805172059 but runtime stayed on 20260805165556).
+    """
+    configured = (config.get("latest_image_tag") or "").strip()
+    if configured:
+        print(f"Using configured image tag: {configured}")
+        return configured
+
     try:
-        aws_region = config['region']
+        aws_region = config["region"]
         repository_name = ecr_repository_name(config)
-        
-        ecr_client = boto3.client('ecr', region_name=aws_region)
-        response = ecr_client.describe_images(repositoryName=repository_name)
-        images = response['imageDetails']
-        
-        if not images:
-            print(f"Error: No images found in repository {repository_name}")
+
+        ecr_client = boto3.client("ecr", region_name=aws_region)
+        images: list = []
+        token = None
+        while True:
+            kwargs = {"repositoryName": repository_name, "maxResults": 100}
+            if token:
+                kwargs["nextToken"] = token
+            response = ecr_client.describe_images(**kwargs)
+            images.extend(response.get("imageDetails") or [])
+            token = response.get("nextToken")
+            if not token:
+                break
+
+        tagged = [img for img in images if img.get("imageTags")]
+        if not tagged:
+            print(f"Error: No tagged images found in repository {repository_name}")
             return None
-        
-        # Get latest image
-        images_sorted = sorted(images, key=lambda x: x['imagePushedAt'], reverse=True)
-        latest_image = images_sorted[0]
-        
-        if 'imageTags' not in latest_image or not latest_image['imageTags']:
-            print(f"Error: Latest image has no tags")
-            return None
-        
-        image_tag = latest_image['imageTags'][0]
-        print(f"Latest image tag: {image_tag}")
+
+        images_sorted = sorted(tagged, key=lambda x: x["imagePushedAt"], reverse=True)
+        image_tag = images_sorted[0]["imageTags"][0]
+        print(f"Latest image tag from ECR: {image_tag}")
         return image_tag
-        
+
     except Exception as e:
         print(f"Error getting latest image tag: {e}")
         return None

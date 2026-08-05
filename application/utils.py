@@ -232,40 +232,30 @@ def write_user_skills_list(user_id: str | None, names: list[str] | None = None) 
 
 
 def update_user_skills_list(user_id: str | None) -> str:
-    """Rewrite per-user skills.list from application/skills.list + user skills dir.
-
-    Prefer ``ensure_user_skills_list`` so a runtime-updated list is not wiped.
-    """
+    """Rewrite per-user skills.list from application/skills.list + user skills dir."""
     return write_user_skills_list(user_id)
 
 
 def ensure_user_skills_list(user_id: str | None) -> str:
-    """Use {SESSION_STORAGE_DIR}/{user_id}/skills.list; create it if missing.
+    """Sync {SESSION_STORAGE_DIR}/{user_id}/skills.list to current builtins + user skills.
 
-    When the file already exists (e.g. written by AgentCore runtime on the shared
-    S3 Files mount), keep it and only append newly discovered skill-creator dirs
-    under ``{user_id}/skills/``. Seed from application/skills.list only when absent.
+    ECS app does not ship ``runtime_agent/langgraph/skills``; builtin names come from
+    ``application/skills.list`` (rebuilt at deploy from that directory). User-created
+    skills come from ``{user_id}/skills/`` on the shared S3 Files mount. On login /
+    config load, rewrite the per-user list when it drifts from that merge.
     """
     ensure_user_skills_dir(user_id)
     path = get_user_skills_list_path(user_id)
-    if not os.path.isfile(path):
-        return write_user_skills_list(user_id)
-
-    existing = _load_skills_list_file(path)
-    seen = set(existing)
-    appended = [
-        name
-        for name in _list_skill_dir_names(get_user_skills_dir(user_id))
-        if name not in seen
-    ]
-    if appended:
-        return write_user_skills_list(user_id, existing + appended)
-    logger.info(
-        "using existing user skills.list (%d skills) -> %s",
-        len(existing),
-        path,
-    )
-    return path
+    desired = _seed_skill_names(user_id)
+    existing = _load_skills_list_file(path) if os.path.isfile(path) else []
+    if existing == desired:
+        logger.info(
+            "user skills.list up to date (%d skills) -> %s",
+            len(existing),
+            path,
+        )
+        return path
+    return write_user_skills_list(user_id, desired)
 
 
 def _account_id_from_config(config: dict) -> str | None:

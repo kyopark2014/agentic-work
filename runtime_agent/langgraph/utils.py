@@ -137,26 +137,23 @@ def write_user_skills_list(user_id: str | None, names: list[str] | None = None) 
 
 
 def ensure_user_skills_list(user_id: str | None) -> str:
-    """Use {SESSION_STORAGE_DIR}/{user_id}/skills.list; create it if missing.
+    """Sync {SESSION_STORAGE_DIR}/{user_id}/skills.list to builtin + user skills.
 
-    When creating, seed from builtin ``skills/`` plus ``{user-id}/skills/``.
-    If the file already exists, only newly discovered skill-creator dirs are appended.
+    Builtin names come from scanning ``skills/`` (SKILL.md dirs). User-created
+    skills come from ``{user_id}/skills/``. Rewrite when the list drifts.
     """
     ensure_user_skills_dir(user_id)
     path = get_user_skills_list_path(user_id)
-    if not os.path.isfile(path):
-        return write_user_skills_list(user_id)
-
-    existing = load_skills_list_file(path)
-    seen = set(existing)
-    appended = [
-        name
-        for name in list_skill_dir_names(get_user_skills_dir(user_id))
-        if name not in seen
-    ]
-    if appended:
-        return write_user_skills_list(user_id, existing + appended)
-    return path
+    desired = _merged_skill_names(user_id)
+    existing = load_skills_list_file(path) if os.path.isfile(path) else []
+    if existing == desired:
+        logger.info(
+            "user skills.list up to date (%d skills) -> %s",
+            len(existing),
+            path,
+        )
+        return path
+    return write_user_skills_list(user_id, desired)
 
 
 def update_user_skills_list(user_id: str | None) -> str:
