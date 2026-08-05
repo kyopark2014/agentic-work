@@ -374,7 +374,9 @@ def get_session(request: Request, response: Response) -> SessionResponse | None:
         utils.ensure_user_graph_dir(user_id)
     except Exception:
         logger.exception("Failed to ensure graph dir for %s", user_id)
-    # Do not kick graph on session poll — chat / login / rebuild trigger instead.
+    # Session restore (e.g. after server restart): start extract when fingerprint
+    # is missing/stale. ensure_graph_job no-ops when source is unchanged.
+    _kick_graph_job(user_id)
     # Refresh CloudFront signed cookies while the session is still valid.
     if not cloudfront_cookies.set_signed_cookies(
         response,
