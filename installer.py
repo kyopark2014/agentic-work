@@ -1111,6 +1111,17 @@ def create_knowledge_base_role() -> str:
     
     assume_role_policy = _bedrock_knowledge_base_trust_policy()
     
+    role_existed = False
+    try:
+        iam_client.get_role(RoleName=role_name)
+        role_existed = True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") not in (
+            "NoSuchEntity",
+            "NoSuchEntityException",
+        ):
+            raise
+
     role_arn = create_iam_role(role_name, assume_role_policy)
     bucket_arn, object_arn = _project_s3_bucket_arns()
 
@@ -1168,7 +1179,12 @@ def create_knowledge_base_role() -> str:
     }
     attach_inline_policy(role_name, f"kb-opensearch-policy-for-{project_name}", opensearch_policy)
     
-    wait_for_iam_role_propagation(role_name)
+    if not role_existed:
+        wait_for_iam_role_propagation(role_name)
+    else:
+        logger.info(
+            f"  Skipping IAM wait (KB role already exists: {role_name})"
+        )
     return role_arn
 
 
@@ -4470,6 +4486,17 @@ def create_agentcore_memory_role() -> str:
         ],
     }
 
+    role_existed = False
+    try:
+        iam_client.get_role(RoleName=role_name)
+        role_existed = True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") not in (
+            "NoSuchEntity",
+            "NoSuchEntityException",
+        ):
+            raise
+
     role_arn = create_iam_role(role_name, assume_role_policy)
 
     memory_policy = {
@@ -4495,9 +4522,12 @@ def create_agentcore_memory_role() -> str:
     }
     attach_inline_policy(role_name, f"agentcore-memory-policy-for-{project_name}", memory_policy)
 
-    # IAM eventual consistency: CreateMemory validates trust immediately after role create/update
-    logger.info("  Waiting for IAM role trust policy to propagate...")
-    time.sleep(10)
+    # CreateMemory validates trust immediately after a brand-new role.
+    if not role_existed:
+        logger.info("  Waiting for IAM role trust policy to propagate...")
+        time.sleep(10)
+    else:
+        logger.info("  Skipping IAM wait (memory role already exists)")
 
     return role_arn
 
