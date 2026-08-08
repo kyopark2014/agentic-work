@@ -2094,10 +2094,17 @@ def create_agent_runtime():
         else:
             print("Session storage: managed sessionStorage at /mnt/workspace (PUBLIC mode)")
         
-        # Check if agent runtime already exists
+        # Check if agent runtime already exists (paginate — first page can miss older runtimes)
         client = boto3.client('bedrock-agentcore-control', region_name=aws_region)
-        response = client.list_agent_runtimes()
-        agent_runtimes = response.get('agentRuntimes', [])
+        agent_runtimes = []
+        list_kwargs: dict = {}
+        while True:
+            response = client.list_agent_runtimes(**list_kwargs)
+            agent_runtimes.extend(response.get("agentRuntimes", []))
+            next_token = response.get("nextToken")
+            if not next_token:
+                break
+            list_kwargs["nextToken"] = next_token
         
         is_exist = False
         agent_runtime_id = None
