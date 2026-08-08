@@ -4,11 +4,11 @@
 
 관련 코드:
 
-- 인프라 생성: [installer.py](./installer.py) — `create_s3_files_session_storage()`
+- 인프라 생성: [installer.py](./installer.py) — `create_s3_files_session_storage()` (Runtime) + `create_s3_files_app_data_storage()` (ECS)
 - Runtime 연결: [runtime_agent/langgraph/installer.py](./runtime_agent/langgraph/installer.py)
 - Checkpoint 저장: [runtime_agent/langgraph/chat.py](./runtime_agent/langgraph/chat.py), [runtime_agent/langgraph/agent.py](./runtime_agent/langgraph/agent.py)
 - 세션 ID: [application/agentcore_client.py](./application/agentcore_client.py)
-- 삭제: [uninstaller.py](./uninstaller.py) — `delete_s3_files_session_storage()`
+- 삭제: [uninstaller.py](./uninstaller.py) — `delete_s3_files_session_storage()` (session + app-data FS)
 
 ---
 

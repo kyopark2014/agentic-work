@@ -163,10 +163,10 @@ JSON 예:
 | 환경 | 위치 |
 |------|------|
 | ECS (`/mnt/app-data` 마운트) | `/mnt/app-data/litellm/virtual_key.json` |
-| 로컬 + `config.json`의 `s3_bucket` | **S3만** — `s3://{bucket}/agentcore-sessions/litellm/virtual_key.json` (로컬 파일 생성 안 함, 메모리 캐시) |
+| 로컬 + `config.json`의 `s3_bucket` | **S3만** — `s3://{bucket}/app-data/litellm/virtual_key.json` (로컬 파일 생성 안 함, 메모리 캐시) |
 | 로컬 + 버킷 없음 / `APP_DATA_S3_DISABLE=1` | `application/data/litellm/virtual_key.json` |
 
-S3 prefix는 S3 Files와 동일하게 `agentcore-sessions/` 입니다 (`app_data_backend.S3_FILES_PREFIX`).
+S3 prefix는 ECS app-data FS와 동일하게 `app-data/` 입니다 (`app_data_backend.S3_FILES_PREFIX`).
 
 서버 기동 시 (`application/server.py` lifespan) `restore_virtual_key_store()`로 스토어를 로드합니다.
 
@@ -287,7 +287,7 @@ aws secretsmanager get-secret-value \
 
 # Virtual key store (S3)
 aws s3 cp \
-  "s3://$BUCKET/agentcore-sessions/litellm/virtual_key.json" -
+  "s3://$BUCKET/app-data/litellm/virtual_key.json" -
 
 # Gateway health
 curl -sS "$LITELLM_URL/v1/models" -H "Authorization: Bearer $MASTER_OR_VIRTUAL_KEY"

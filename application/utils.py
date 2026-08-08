@@ -18,20 +18,20 @@ logger = logging.getLogger("utils")
 script_dir = os.path.dirname(os.path.abspath(__file__))
 config_path = os.path.join(script_dir, "config.json")
 favorite_tools_path = os.path.join(script_dir, "favorite_tools.json")
-# Prefer shared S3 Files mount: AgentCore /mnt/workspace or ECS /mnt/app-data.
+# ECS: /mnt/app-data (prefix app-data/) for tasks.db, graph, settings.
+# Runtime: /mnt/workspace (prefix agentcore-sessions/) for skills/artifacts/checkpoints.
 def _default_session_storage_dir() -> str:
-    """Prefer the shared S3 Files mount used by AgentCore or ECS.
-
-    Both mounts point at the same S3 Files root (``agentcore-sessions/``), so the Web UI
-    and runtime see the same ``{user_id}/skills.list`` and ``{user_id}/skills/``.
-    """
-    for candidate in ("/mnt/workspace", "/mnt/app-data"):
+    """Prefer ECS app-data mount, then Runtime workspace, then local fallback."""
+    for candidate in ("/mnt/app-data", "/mnt/workspace"):
         if os.path.isdir(candidate):
             return candidate
     return os.path.join(script_dir, ".session_storage")
 
 
 SESSION_STORAGE_DIR = os.environ.get("SESSION_STORAGE_DIR") or _default_session_storage_dir()
+
+# S3 Files FS prefix for Runtime workspace → s3://{bucket}/agentcore-sessions/
+S3_FILES_SESSION_PREFIX = "agentcore-sessions"
 
 
 def sanitize_user_path_segment(user_id: str | None) -> str | None:
@@ -50,28 +50,39 @@ def sanitize_user_path_segment(user_id: str | None) -> str | None:
 
 
 def get_user_artifacts_dir(user_id: str | None) -> str:
-    """Absolute path to {SESSION_STORAGE_DIR}/{user_id}/artifacts (does not create)."""
+    """Logical path for user artifacts (Runtime /mnt/workspace when present)."""
     segment = sanitize_user_path_segment(user_id) or "default"
-    return os.path.join(SESSION_STORAGE_DIR, segment, "artifacts")
+    root = "/mnt/workspace" if os.path.isdir("/mnt/workspace") else SESSION_STORAGE_DIR
+    return os.path.join(root, segment, "artifacts")
 
 
 def ensure_user_artifacts_dir(user_id: str | None) -> str:
-    """Create {SESSION_STORAGE_DIR}/{user_id}/artifacts if needed and return it."""
+    """Create artifacts dir under Runtime workspace when available; skip on ECS app-data."""
     artifacts_dir = get_user_artifacts_dir(user_id)
+    if not os.path.isdir("/mnt/workspace") and os.path.isdir("/mnt/app-data"):
+        return artifacts_dir
     os.makedirs(artifacts_dir, exist_ok=True)
     logger.info("user artifacts dir ready: %s", artifacts_dir)
     return artifacts_dir
 
 
 def get_user_skills_dir(user_id: str | None) -> str:
-    """Absolute path to {SESSION_STORAGE_DIR}/{user_id}/skills (does not create)."""
+    """Logical path for user skills (Runtime /mnt/workspace only).
+
+    Web UI discovers skill-creator skills via S3
+    (``agentcore-sessions/{user}/skills/``), not under app-data.
+    """
     segment = sanitize_user_path_segment(user_id) or "default"
-    return os.path.join(SESSION_STORAGE_DIR, segment, "skills")
+    root = "/mnt/workspace" if os.path.isdir("/mnt/workspace") else SESSION_STORAGE_DIR
+    return os.path.join(root, segment, "skills")
 
 
 def ensure_user_skills_dir(user_id: str | None) -> str:
-    """Create {SESSION_STORAGE_DIR}/{user_id}/skills if needed and return it."""
+    """Create user skills dir under the Runtime workspace mount when available."""
     skills_dir = get_user_skills_dir(user_id)
+    # ECS mounts app-data only — do not create a misleading skills/ tree there.
+    if not os.path.isdir("/mnt/workspace") and os.path.isdir("/mnt/app-data"):
+        return skills_dir
     os.makedirs(skills_dir, exist_ok=True)
     logger.info("user skills dir ready: %s", skills_dir)
     return skills_dir
@@ -186,6 +197,58 @@ def _list_skill_dir_names(skills_dir: str) -> list[str]:
     return names
 
 
+def _list_user_skill_names_from_s3(user_id: str | None) -> list[str]:
+    """List skill-creator skill dirs under s3://{bucket}/agentcore-sessions/{user}/skills/.
+
+    ECS mounts app-data only; user skills always come from this S3 prefix.
+    Only directories that contain SKILL.md are included.
+    """
+    if not user_id:
+        return []
+    segment = sanitize_user_path_segment(user_id)
+    if not segment:
+        return []
+    try:
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+    bucket = (cfg.get("s3_bucket") if isinstance(cfg, dict) else None) or globals().get(
+        "s3_bucket"
+    )
+    region = (cfg.get("region") if isinstance(cfg, dict) else None) or globals().get(
+        "bedrock_region", "us-west-2"
+    )
+    if not bucket:
+        # Fall back to local workspace mount when present (local/runtime).
+        return _list_skill_dir_names(get_user_skills_dir(user_id))
+
+    prefix = f"{S3_FILES_SESSION_PREFIX}/{segment}/skills/"
+    try:
+        s3 = boto3.client("s3", region_name=region)
+        paginator = s3.get_paginator("list_objects_v2")
+        names: list[str] = []
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter="/"):
+            for entry in page.get("CommonPrefixes") or []:
+                child = (entry.get("Prefix") or "").rstrip("/")
+                name = child.rsplit("/", 1)[-1] if child else ""
+                if name:
+                    names.append(name)
+
+        confirmed: list[str] = []
+        for name in sorted(names):
+            key = f"{prefix}{name}/SKILL.md"
+            try:
+                s3.head_object(Bucket=bucket, Key=key)
+            except Exception:
+                continue
+            confirmed.append(name)
+            logger.info("Skill discovered (s3): %s", name)
+        return confirmed
+    except Exception as e:
+        logger.warning("Failed to list user skills from S3 for %s: %s", user_id, e)
+        return _list_skill_dir_names(get_user_skills_dir(user_id))
+
+
 def _load_skills_list_file(path: str) -> list[str]:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -202,10 +265,10 @@ def _load_skills_list_file(path: str) -> list[str]:
 
 
 def _seed_skill_names(user_id: str | None) -> list[str]:
-    """Builtin application/skills.list + skill-creator dirs under the user skills path."""
+    """Builtin application/skills.list + skill-creator skills from S3 session prefix."""
     default_path = os.path.join(script_dir, "skills.list")
     builtin = _load_skills_list_file(default_path)
-    user_skills = _list_skill_dir_names(get_user_skills_dir(user_id))
+    user_skills = _list_user_skill_names_from_s3(user_id)
     merged: list[str] = []
     seen: set[str] = set()
     for name in builtin + user_skills:
@@ -217,7 +280,6 @@ def _seed_skill_names(user_id: str | None) -> list[str]:
 
 def write_user_skills_list(user_id: str | None, names: list[str] | None = None) -> str:
     """Write {SESSION_STORAGE_DIR}/{user_id}/skills.list and return its path."""
-    ensure_user_skills_dir(user_id)
     path = get_user_skills_list_path(user_id)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     merged = names if names is not None else _seed_skill_names(user_id)
@@ -232,19 +294,16 @@ def write_user_skills_list(user_id: str | None, names: list[str] | None = None) 
 
 
 def update_user_skills_list(user_id: str | None) -> str:
-    """Rewrite per-user skills.list from application/skills.list + user skills dir."""
+    """Rewrite per-user skills.list from application/skills.list + S3 user skills."""
     return write_user_skills_list(user_id)
 
 
 def ensure_user_skills_list(user_id: str | None) -> str:
-    """Sync {SESSION_STORAGE_DIR}/{user_id}/skills.list to current builtins + user skills.
+    """Sync skills.list to builtins + S3 agentcore-sessions/{user}/skills/.
 
-    ECS app does not ship ``runtime_agent/langgraph/skills``; builtin names come from
-    ``application/skills.list`` (rebuilt at deploy from that directory). User-created
-    skills come from ``{user_id}/skills/`` on the shared S3 Files mount. On login /
-    config load, rewrite the per-user list when it drifts from that merge.
+    ECS mounts app-data only; user-created skills are listed via S3 API, not the
+    local mount. Builtin names come from ``application/skills.list``.
     """
-    ensure_user_skills_dir(user_id)
     path = get_user_skills_list_path(user_id)
     desired = _seed_skill_names(user_id)
     existing = _load_skills_list_file(path) if os.path.isfile(path) else []

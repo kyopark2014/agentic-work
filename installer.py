@@ -170,6 +170,9 @@ secrets_client = boto3.client("secretsmanager", region_name=region)
 secretsmanager_client = secrets_client
 
 S3_FILES_SESSION_PREFIX = "agentcore-sessions/"
+S3_FILES_APP_DATA_PREFIX = "app-data/"
+APP_DATA_MOUNT_PATH = "/mnt/app-data"
+SESSION_STORAGE_MOUNT_PATH = "/mnt/workspace"
 
 bucket_name = f"storage-for-{project_name}-{account_id}-{region}"
 
@@ -5900,6 +5903,7 @@ def build_config_from_deployment_state(
     s3_bucket_name: Optional[str] = None,
     cloudfront_info: Optional[Dict[str, str]] = None,
     s3_files_info: Optional[Dict[str, object]] = None,
+    s3_files_app_data_info: Optional[Dict[str, object]] = None,
     agentcore_memory_role_arn: Optional[str] = None,
     memory_id: Optional[str] = None,
 ) -> Dict[str, str]:
@@ -5934,7 +5938,9 @@ def build_config_from_deployment_state(
         config_data["agentcore_memory_role"] = agentcore_memory_role_arn
     if memory_id:
         config_data["memory_id"] = memory_id
-    config_data = apply_s3_files_config(config_data, s3_files_info)
+    config_data = apply_s3_files_config(
+        config_data, s3_files_info, s3_files_app_data_info
+    )
     return _merge_runtime_agent_settings(config_data)
 
 
@@ -7054,14 +7060,16 @@ def _wait_for_ecs_service_ready(
     usable once the PRIMARY deployment reaches the desired task count.
     """
     deadline = time.time() + timeout_seconds
-    attempt = 0
+    last_log = 0.0
 
     while time.time() < deadline:
-        attempt += 1
         service = _describe_ecs_service(cluster_name, service_name)
         deployments = service.get("deployments") or []
         primary = next((d for d in deployments if d.get("status") == "PRIMARY"), None)
         draining = [d for d in deployments if d.get("status") == "DRAINING"]
+        desired = (primary or {}).get("desiredCount", 0)
+        running = (primary or {}).get("runningCount", 0)
+        pending = (primary or {}).get("pendingCount", 0)
 
         healthy_targets = None
         if target_group_arn:
@@ -7081,46 +7089,39 @@ def _wait_for_ecs_service_ready(
             if expected_task_definition_arn:
                 primary_task_def = (primary or {}).get("taskDefinition", "")
                 if primary_task_def != expected_task_definition_arn:
-                    logger.info(
-                        "  ECS wait attempt %s: PRIMARY still on %s, waiting for %s",
-                        attempt,
-                        primary_task_def.rsplit("/", 1)[-1],
-                        expected_task_definition_arn.rsplit("/", 1)[-1],
-                    )
+                    now = time.time()
+                    if now - last_log > 30:
+                        logger.info(
+                            "  ... service status=%s running=%s/%s pending=%s",
+                            service.get("status"),
+                            running,
+                            desired,
+                            pending,
+                        )
+                        last_log = now
                     time.sleep(poll_interval_seconds)
                     continue
             if not target_group_arn or (healthy_targets or 0) > 0:
                 if draining:
                     logger.info(
-                        "  ✓ ECS PRIMARY deployment ready "
-                        f"(running={service.get('runningCount')}/{service.get('desiredCount')}); "
+                        "✓ ECS PRIMARY deployment ready "
+                        f"(running={running}/{desired}); "
                         f"{len(draining)} draining deployment(s) still cleaning up"
                     )
                 else:
-                    logger.info(
-                        "  ✓ ECS service stable "
-                        f"(running={service.get('runningCount')}/{service.get('desiredCount')})"
-                    )
+                    logger.info("✓ ECS service is stable")
                 return
 
-        primary_rollout = primary.get("rolloutState") if primary else "UNKNOWN"
-        primary_task_def = (primary or {}).get("taskDefinition", "")
-        logger.info(
-            "  ECS wait attempt %s: running=%s/%s pending=%s "
-            "primary=%s/%s failed=%s primary_rollout=%s draining=%s healthy_targets=%s "
-            "primary_task_def=%s",
-            attempt,
-            service.get("runningCount"),
-            service.get("desiredCount"),
-            service.get("pendingCount"),
-            (primary or {}).get("runningCount"),
-            (primary or {}).get("desiredCount"),
-            (primary or {}).get("failedTasks"),
-            primary_rollout,
-            len(draining),
-            healthy_targets,
-            primary_task_def.rsplit("/", 1)[-1] if primary_task_def else "none",
-        )
+        now = time.time()
+        if now - last_log > 30:
+            logger.info(
+                "  ... service status=%s running=%s/%s pending=%s",
+                service.get("status"),
+                running,
+                desired,
+                pending,
+            )
+            last_log = now
         time.sleep(poll_interval_seconds)
 
     service = _describe_ecs_service(cluster_name, service_name)
@@ -7260,12 +7261,12 @@ def deploy_ecs_service(
             [
                 {"name": "TASK_DB_MOUNT", "value": app_data_mount},
                 {"name": "TASK_DB_PROJECT", "value": project_name},
-                # Same S3 Files root as AgentCore /mnt/workspace (skills.list, skills/).
+                # graph/settings/tasks.db live on app-data; skills are loaded via S3 API.
                 {"name": "SESSION_STORAGE_DIR", "value": app_data_mount},
             ]
         )
         logger.info(
-            "  ECS task will mount S3 Files at %s for tasks.db + session storage",
+            "  ECS will mount app-data S3 Files at %s (prefix=app-data/)",
             app_data_mount,
         )
 
@@ -8098,15 +8099,38 @@ def _get_or_create_s3files_sync_role(s3_bucket_arn: str) -> str:
     return role_arn
 
 
-def _find_s3files_file_system_for_bucket(s3_bucket_arn: str) -> Optional[Dict[str, str]]:
-    """Return an existing S3 Files file system for the bucket, if any."""
+def _normalize_s3files_prefix(prefix: str) -> str:
+    if not prefix:
+        return ""
+    return prefix if prefix.endswith("/") else f"{prefix}/"
+
+
+def _s3files_file_system_name_tag(item: Dict) -> str:
+    for tag in item.get("tags") or []:
+        if tag.get("key") == "Name" or tag.get("Key") == "Name":
+            return tag.get("value") or tag.get("Value") or ""
+    return item.get("name") or ""
+
+
+def _find_s3files_file_system(
+    s3_bucket_arn: str,
+    prefix: str,
+    name_tag: str,
+) -> Optional[Dict[str, str]]:
+    """Return FS matching bucket+prefix or Name tag (never reuse a different prefix)."""
+    want_prefix = _normalize_s3files_prefix(prefix)
     paginator = s3files_client.get_paginator("list_file_systems")
     for page in paginator.paginate():
         for item in page.get("fileSystems", []):
-            if item.get("bucket") == s3_bucket_arn:
+            if item.get("bucket") != s3_bucket_arn:
+                continue
+            item_prefix = _normalize_s3files_prefix(item.get("prefix") or "")
+            item_name = _s3files_file_system_name_tag(item)
+            if item_prefix == want_prefix or item_name == name_tag:
                 return {
                     "file_system_id": item.get("fileSystemId", ""),
                     "file_system_arn": item.get("fileSystemArn", ""),
+                    "prefix": item_prefix,
                 }
     return None
 
@@ -8126,25 +8150,35 @@ def _ensure_s3_bucket_versioning_enabled(s3_bucket_name: str) -> None:
     )
 
 
-def _get_or_create_s3files_file_system(s3_bucket_arn: str, role_arn: str) -> Dict[str, str]:
-    """Create or reuse an S3 Files file system scoped to the session prefix."""
-    existing = _find_s3files_file_system_for_bucket(s3_bucket_arn)
+def _get_or_create_s3files_file_system(
+    s3_bucket_arn: str,
+    role_arn: str,
+    *,
+    prefix: str,
+    name_tag: str,
+) -> Dict[str, str]:
+    """Create or reuse an S3 Files file system for the given prefix/name."""
+    existing = _find_s3files_file_system(s3_bucket_arn, prefix, name_tag)
     if existing and existing.get("file_system_id"):
-        logger.info(f"  Reusing S3 Files file system: {existing['file_system_id']}")
+        logger.info(
+            f"  Reusing S3 Files file system: {existing['file_system_id']} "
+            f"(prefix={existing.get('prefix') or prefix})"
+        )
         return existing
 
-    bucket_name = s3_bucket_arn.removeprefix("arn:aws:s3:::")
-    _ensure_s3_bucket_versioning_enabled(bucket_name)
+    bucket = s3_bucket_arn.removeprefix("arn:aws:s3:::")
+    _ensure_s3_bucket_versioning_enabled(bucket)
 
+    normalized = _normalize_s3files_prefix(prefix)
     response = s3files_client.create_file_system(
         bucket=s3_bucket_arn,
-        prefix=S3_FILES_SESSION_PREFIX,
+        prefix=normalized,
         roleArn=role_arn,
         acceptBucketWarning=True,
-        tags=[{"key": "Name", "value": f"s3files-for-{project_name}"}],
+        tags=[{"key": "Name", "value": name_tag}],
     )
     file_system_id = response["fileSystemId"]
-    logger.info(f"  Created S3 Files file system: {file_system_id}")
+    logger.info(f"  Created S3 Files file system: {file_system_id} (prefix={normalized})")
     _wait_for_s3files_status(
         s3files_client.get_file_system,
         "fileSystemId",
@@ -8153,6 +8187,7 @@ def _get_or_create_s3files_file_system(s3_bucket_arn: str, role_arn: str) -> Dic
     return {
         "file_system_id": file_system_id,
         "file_system_arn": response.get("fileSystemArn", ""),
+        "prefix": normalized,
     }
 
 
@@ -8236,7 +8271,7 @@ def ensure_ecs_task_s3files_policy(
     file_system_id: str,
     access_point_arn: str,
 ) -> None:
-    """Grant ECS task role permissions to mount the S3 Files volume."""
+    """Grant ECS task role permissions to mount the app-data S3 Files volume only."""
     if not file_system_id or not access_point_arn:
         return
 
@@ -8245,7 +8280,7 @@ def ensure_ecs_task_s3files_policy(
         "Version": "2012-10-17",
         "Statement": [
             {
-                "Sid": "S3FilesClientAccess",
+                "Sid": "S3FilesAppDataClientAccess",
                 "Effect": "Allow",
                 "Action": [
                     "s3files:ClientMount",
@@ -8260,13 +8295,13 @@ def ensure_ecs_task_s3files_policy(
                 },
             },
             {
-                "Sid": "S3FilesGetAccessPoint",
+                "Sid": "S3FilesAppDataGetAccessPoint",
                 "Effect": "Allow",
                 "Action": ["s3files:GetAccessPoint"],
                 "Resource": access_point_arn,
             },
             {
-                "Sid": "S3FilesListMountTargets",
+                "Sid": "S3FilesAppDataListMountTargets",
                 "Effect": "Allow",
                 "Action": ["s3files:ListMountTargets"],
                 "Resource": file_system_arn,
@@ -8278,7 +8313,9 @@ def ensure_ecs_task_s3files_policy(
         f"s3files-ecs-task-policy-for-{project_name}",
         policy,
     )
-    logger.info(f"  ✓ Attached S3 Files ECS task policy to {ecs_task_role_name}")
+    logger.info(
+        f"  ✓ Attached app-data S3 Files policy to {ecs_task_role_name}"
+    )
 
 
 def _ensure_s3files_mount_targets(
@@ -8313,15 +8350,31 @@ def _ensure_s3files_mount_targets(
         )
 
 
-def _get_or_create_s3files_access_point(file_system_id: str) -> str:
-    """Create or reuse an access point for AgentCore session storage."""
+def _s3files_access_point_name_tag(item: Dict) -> str:
+    for tag in item.get("tags") or []:
+        if tag.get("key") == "Name" or tag.get("Key") == "Name":
+            return tag.get("value") or tag.get("Value") or ""
+    return item.get("name") or ""
+
+
+def _get_or_create_s3files_access_point(
+    file_system_id: str,
+    *,
+    name_tag: str,
+) -> str:
+    """Create or reuse an access point for the given file system / Name tag."""
+    aps: List[Dict] = []
     paginator = s3files_client.get_paginator("list_access_points")
     for page in paginator.paginate(fileSystemId=file_system_id):
-        for item in page.get("accessPoints", []):
-            arn = item.get("accessPointArn")
-            if arn:
-                logger.info(f"  Reusing S3 Files access point: {arn}")
-                return arn
+        aps.extend(page.get("accessPoints") or [])
+
+    for item in aps:
+        arn = item.get("accessPointArn")
+        if not arn:
+            continue
+        if _s3files_access_point_name_tag(item) == name_tag or len(aps) == 1:
+            logger.info(f"  Reusing S3 Files access point: {arn}")
+            return arn
 
     response = s3files_client.create_access_point(
         fileSystemId=file_system_id,
@@ -8334,7 +8387,7 @@ def _get_or_create_s3files_access_point(file_system_id: str) -> str:
                 "permissions": "0777",
             },
         },
-        tags=[{"key": "Name", "value": f"s3files-ap-for-{project_name}"}],
+        tags=[{"key": "Name", "value": name_tag}],
     )
     access_point_arn = response["accessPointArn"]
     logger.info(f"  Created S3 Files access point: {access_point_arn}")
@@ -8351,7 +8404,7 @@ def _ensure_s3files_file_system_policy(
     access_point_arn: str,
     client_role_arns: List[str],
 ) -> None:
-    """Allow runtime/ECS roles to mount and write via the access point."""
+    """Allow only the given roles to mount/write via the access point."""
     principals = [arn for arn in client_role_arns if arn]
     if not principals:
         return
@@ -8380,7 +8433,10 @@ def _ensure_s3files_file_system_policy(
             fileSystemId=file_system_id,
             policy=json.dumps(policy),
         )
-        logger.info("  Applied S3 Files file system policy for client roles")
+        logger.info(
+            "  Applied S3 Files file system policy for %d principal(s)",
+            len(principals),
+        )
     except ClientError as e:
         logger.warning(f"  Could not apply S3 Files file system policy: {e}")
 
@@ -8458,12 +8514,12 @@ def _ensure_agent_runtime_vpc_endpoint_access(
 def create_s3_files_session_storage(
     vpc_info: Dict[str, str],
     s3_bucket_name: str,
-    *,
-    ecs_sg_id: str = "",
-    ecs_task_role_name: str = "",
 ) -> Dict[str, object]:
-    """Provision S3 Files resources used as persistent AgentCore session storage."""
-    logger.info("[5.5/10] Creating S3 Files session storage")
+    """Provision S3 Files for AgentCore Runtime only (agentcore-sessions/).
+
+    ECS must not mount this FS — app data lives on a separate app-data/ FS.
+    """
+    logger.info("[5.5/10] Creating S3 Files session storage (Runtime)")
     vpc_id = vpc_info["vpc_id"]
     private_subnets = vpc_info.get("private_subnets") or []
     if len(private_subnets) < 1:
@@ -8471,51 +8527,43 @@ def create_s3_files_session_storage(
 
     s3_bucket_arn = f"arn:aws:s3:::{s3_bucket_name}"
     sync_role_arn = _get_or_create_s3files_sync_role(s3_bucket_arn)
-    file_system = _get_or_create_s3files_file_system(s3_bucket_arn, sync_role_arn)
+    file_system = _get_or_create_s3files_file_system(
+        s3_bucket_arn,
+        sync_role_arn,
+        prefix=S3_FILES_SESSION_PREFIX,
+        name_tag=f"s3files-for-{project_name}",
+    )
     file_system_id = file_system["file_system_id"]
 
-    # Create cross-referenced security groups for NFS between clients and mount targets.
     agent_runtime_sg_id = create_security_group(
         vpc_id=vpc_id,
         group_name=f"agent-runtime-sg-for-{project_name}",
         description=f"Security group for AgentCore Runtime ({project_name})",
     )
-    client_sg_ids = [agent_runtime_sg_id]
-    if ecs_sg_id and ecs_sg_id not in client_sg_ids:
-        client_sg_ids.append(ecs_sg_id)
-
     s3files_mount_sg_id = _get_or_create_s3files_mount_security_group(
         vpc_id,
-        client_sg_ids,
+        [agent_runtime_sg_id],
     )
-    for client_sg_id in client_sg_ids:
-        _ensure_security_group_nfs_access(client_sg_id, s3files_mount_sg_id)
+    _ensure_security_group_nfs_access(agent_runtime_sg_id, s3files_mount_sg_id)
 
     _ensure_s3files_mount_targets(
         file_system_id,
         private_subnets,
         [s3files_mount_sg_id],
     )
-    access_point_arn = _get_or_create_s3files_access_point(file_system_id)
+    access_point_arn = _get_or_create_s3files_access_point(
+        file_system_id,
+        name_tag=f"s3files-ap-for-{project_name}",
+    )
     agent_runtime_role_arn = (
         f"arn:aws:iam::{account_id}:role/AmazonBedrockAgentCoreRuntimeRoleFor{project_name}"
     )
-    ecs_task_role_arn = (
-        f"arn:aws:iam::{account_id}:role/{ecs_task_role_name}"
-        if ecs_task_role_name
-        else ""
-    )
+    # Runtime only — do not grant ECS (tasks.db / litellm live on app-data FS).
     _ensure_s3files_file_system_policy(
         file_system_id,
         access_point_arn,
-        [agent_runtime_role_arn, ecs_task_role_arn],
+        [agent_runtime_role_arn],
     )
-    if ecs_task_role_name:
-        ensure_ecs_task_s3files_policy(
-            ecs_task_role_name,
-            file_system_id,
-            access_point_arn,
-        )
     _ensure_agent_runtime_vpc_endpoint_access(
         vpc_info["vpc_id"],
         agent_runtime_sg_id,
@@ -8524,31 +8572,318 @@ def create_s3_files_session_storage(
     logger.info("✓ S3 Files session storage ready")
     logger.info(f"  File system: {file_system_id}")
     logger.info(f"  Access point: {access_point_arn}")
+    logger.info(f"  Mount path: {SESSION_STORAGE_MOUNT_PATH}")
+    logger.info(f"  Prefix: {S3_FILES_SESSION_PREFIX}")
     logger.info(f"  Runtime subnets: {', '.join(private_subnets)}")
     logger.info(f"  Runtime security group: {agent_runtime_sg_id}")
-    if ecs_sg_id:
-        logger.info(f"  ECS security group (S3 Files NFS): {ecs_sg_id}")
 
     return {
         "file_system_id": file_system_id,
         "file_system_arn": file_system.get("file_system_arn", ""),
         "access_point_arn": access_point_arn,
+        "mount_path": SESSION_STORAGE_MOUNT_PATH,
+        "prefix": S3_FILES_SESSION_PREFIX,
         "subnets": private_subnets,
         "security_groups": [agent_runtime_sg_id],
+        "mount_sg_id": s3files_mount_sg_id,
+        "agent_runtime_sg_id": agent_runtime_sg_id,
     }
+
+
+def _copy_s3_prefix_if_missing(
+    bucket: str, src_prefix: str, dst_prefix: str
+) -> int:
+    """Copy src→dst objects when destination prefix is empty. Returns count."""
+    dst_probe = s3_client.list_objects_v2(
+        Bucket=bucket, Prefix=dst_prefix, MaxKeys=1
+    )
+    if dst_probe.get("KeyCount", 0) > 0:
+        return 0
+    copied = 0
+    paginator = s3_client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=src_prefix):
+        for obj in page.get("Contents") or []:
+            src_key = obj.get("Key") or ""
+            if not src_key.startswith(src_prefix):
+                continue
+            dst_key = dst_prefix + src_key[len(src_prefix) :]
+            s3_client.copy_object(
+                Bucket=bucket,
+                Key=dst_key,
+                CopySource={"Bucket": bucket, "Key": src_key},
+            )
+            copied += 1
+    return copied
+
+
+def _delete_s3_prefix(bucket: str, prefix: str) -> int:
+    """Delete all objects under prefix. Returns deleted count."""
+    deleted = 0
+    paginator = s3_client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        keys = [{"Key": obj["Key"]} for obj in (page.get("Contents") or []) if obj.get("Key")]
+        if not keys:
+            continue
+        s3_client.delete_objects(Bucket=bucket, Delete={"Objects": keys, "Quiet": True})
+        deleted += len(keys)
+    return deleted
+
+
+def _migrate_app_data_from_sessions(s3_bucket_name: str) -> None:
+    """Copy ECS-owned data from agentcore-sessions/ into app-data/ (once).
+
+    Migrates application-database/, litellm/, per-user graph/, settings.json.
+    Skills/artifacts/checkpoints stay under agentcore-sessions.
+    After a successful copy of sensitive prefixes, remove the session originals
+    so Runtime NFS can no longer see tasks.db / virtual keys.
+    """
+    try:
+        n = _copy_s3_prefix_if_missing(
+            s3_bucket_name,
+            f"{S3_FILES_SESSION_PREFIX}application-database/",
+            f"{S3_FILES_APP_DATA_PREFIX}application-database/",
+        )
+        if n:
+            logger.info(f"  Migrated {n} application-database object(s) → app-data/")
+            removed = _delete_s3_prefix(
+                s3_bucket_name, f"{S3_FILES_SESSION_PREFIX}application-database/"
+            )
+            if removed:
+                logger.info(
+                    f"  Removed {removed} application-database object(s) from agentcore-sessions/"
+                )
+
+        litellm_n = _copy_s3_prefix_if_missing(
+            s3_bucket_name,
+            f"{S3_FILES_SESSION_PREFIX}litellm/",
+            f"{S3_FILES_APP_DATA_PREFIX}litellm/",
+        )
+        if litellm_n:
+            logger.info(f"  Migrated {litellm_n} litellm object(s) → app-data/")
+            removed = _delete_s3_prefix(
+                s3_bucket_name, f"{S3_FILES_SESSION_PREFIX}litellm/"
+            )
+            if removed:
+                logger.info(
+                    f"  Removed {removed} litellm object(s) from agentcore-sessions/"
+                )
+        else:
+            # Destination already populated from a prior run — still scrub session copy.
+            dst = s3_client.list_objects_v2(
+                Bucket=s3_bucket_name,
+                Prefix=f"{S3_FILES_APP_DATA_PREFIX}litellm/",
+                MaxKeys=1,
+            )
+            src = s3_client.list_objects_v2(
+                Bucket=s3_bucket_name,
+                Prefix=f"{S3_FILES_SESSION_PREFIX}litellm/",
+                MaxKeys=1,
+            )
+            if dst.get("KeyCount", 0) > 0 and src.get("KeyCount", 0) > 0:
+                removed = _delete_s3_prefix(
+                    s3_bucket_name, f"{S3_FILES_SESSION_PREFIX}litellm/"
+                )
+                if removed:
+                    logger.info(
+                        f"  Removed {removed} leftover litellm object(s) from agentcore-sessions/"
+                    )
+            dst_db = s3_client.list_objects_v2(
+                Bucket=s3_bucket_name,
+                Prefix=f"{S3_FILES_APP_DATA_PREFIX}application-database/",
+                MaxKeys=1,
+            )
+            src_db = s3_client.list_objects_v2(
+                Bucket=s3_bucket_name,
+                Prefix=f"{S3_FILES_SESSION_PREFIX}application-database/",
+                MaxKeys=1,
+            )
+            if dst_db.get("KeyCount", 0) > 0 and src_db.get("KeyCount", 0) > 0:
+                removed = _delete_s3_prefix(
+                    s3_bucket_name,
+                    f"{S3_FILES_SESSION_PREFIX}application-database/",
+                )
+                if removed:
+                    logger.info(
+                        f"  Removed {removed} leftover application-database "
+                        f"object(s) from agentcore-sessions/"
+                    )
+
+        paginator = s3_client.get_paginator("list_objects_v2")
+        users: List[str] = []
+        for page in paginator.paginate(
+            Bucket=s3_bucket_name,
+            Prefix=S3_FILES_SESSION_PREFIX,
+            Delimiter="/",
+        ):
+            for entry in page.get("CommonPrefixes") or []:
+                child = (entry.get("Prefix") or "").rstrip("/")
+                name = child.rsplit("/", 1)[-1] if child else ""
+                if name and name not in ("application-database", "litellm", "checkpoints"):
+                    users.append(name)
+
+        graph_copied = 0
+        settings_copied = 0
+        for user in users:
+            graph_copied += _copy_s3_prefix_if_missing(
+                s3_bucket_name,
+                f"{S3_FILES_SESSION_PREFIX}{user}/graph/",
+                f"{S3_FILES_APP_DATA_PREFIX}{user}/graph/",
+            )
+            src_settings = f"{S3_FILES_SESSION_PREFIX}{user}/settings.json"
+            dst_settings = f"{S3_FILES_APP_DATA_PREFIX}{user}/settings.json"
+            try:
+                s3_client.head_object(Bucket=s3_bucket_name, Key=dst_settings)
+            except ClientError:
+                try:
+                    s3_client.head_object(Bucket=s3_bucket_name, Key=src_settings)
+                except ClientError:
+                    continue
+                s3_client.copy_object(
+                    Bucket=s3_bucket_name,
+                    Key=dst_settings,
+                    CopySource={"Bucket": s3_bucket_name, "Key": src_settings},
+                )
+                settings_copied += 1
+
+        if graph_copied:
+            logger.info(f"  Migrated {graph_copied} graph object(s) → app-data/")
+        if settings_copied:
+            logger.info(f"  Migrated {settings_copied} settings.json → app-data/")
+    except ClientError as e:
+        logger.warning(f"  app-data migration skipped: {e}")
+
+
+def prepare_s3files_for_ecs(
+    vpc_info: Dict[str, str],
+    app_data_info: Dict[str, object],
+    ecs_task_role_name: str,
+) -> None:
+    """Grant ECS mount access to the dedicated app-data S3 Files FS only."""
+    file_system_id = str(app_data_info.get("file_system_id") or "")
+    access_point_arn = str(app_data_info.get("access_point_arn") or "")
+    if not file_system_id or not access_point_arn:
+        logger.warning("  Skipping S3 Files ECS prep: missing app-data FS/AP")
+        return
+
+    ecs_sg_id = vpc_info.get("ecs_sg_id") or ""
+    mount_sg_id = str(app_data_info.get("mount_sg_id") or "")
+    if ecs_sg_id and mount_sg_id:
+        _ensure_security_group_nfs_access(ecs_sg_id, mount_sg_id)
+
+    ecs_task_role_arn = (
+        f"arn:aws:iam::{account_id}:role/{ecs_task_role_name}"
+        if ecs_task_role_name
+        else ""
+    )
+    if ecs_task_role_arn:
+        _ensure_s3files_file_system_policy(
+            file_system_id,
+            access_point_arn,
+            [ecs_task_role_arn],
+        )
+        logger.info("  ✓ Applied S3 Files app-data FS policy for ECS only")
+
+    ensure_ecs_task_s3files_policy(
+        ecs_task_role_name,
+        file_system_id,
+        access_point_arn,
+    )
+
+
+def create_s3_files_app_data_storage(
+    vpc_info: Dict[str, str],
+    s3_bucket_name: str,
+    *,
+    mount_sg_id: str = "",
+    ecs_sg_id: str = "",
+    ecs_task_role_name: str = "",
+) -> Dict[str, object]:
+    """Provision a separate S3 Files FS for ECS (tasks.db / graph / settings / litellm)."""
+    logger.info("[5.6/10] Creating S3 Files app-data storage (ECS)")
+    vpc_id = vpc_info["vpc_id"]
+    private_subnets = vpc_info.get("private_subnets") or []
+    if len(private_subnets) < 1:
+        raise RuntimeError("At least one private subnet is required for S3 Files mount targets")
+
+    s3_bucket_arn = f"arn:aws:s3:::{s3_bucket_name}"
+    sync_role_arn = _get_or_create_s3files_sync_role(s3_bucket_arn)
+    file_system = _get_or_create_s3files_file_system(
+        s3_bucket_arn,
+        sync_role_arn,
+        prefix=S3_FILES_APP_DATA_PREFIX,
+        name_tag=f"s3files-app-data-for-{project_name}",
+    )
+    file_system_id = file_system["file_system_id"]
+
+    if not mount_sg_id:
+        client_sg_ids = [ecs_sg_id] if ecs_sg_id else []
+        mount_sg_id = _get_or_create_s3files_mount_security_group(
+            vpc_id,
+            client_sg_ids,
+        )
+    if ecs_sg_id and mount_sg_id:
+        _ensure_security_group_nfs_access(ecs_sg_id, mount_sg_id)
+
+    _ensure_s3files_mount_targets(
+        file_system_id,
+        private_subnets,
+        [mount_sg_id],
+    )
+    access_point_arn = _get_or_create_s3files_access_point(
+        file_system_id,
+        name_tag=f"s3files-ap-app-data-for-{project_name}",
+    )
+    _migrate_app_data_from_sessions(s3_bucket_name)
+
+    app_data_info: Dict[str, object] = {
+        "file_system_id": file_system_id,
+        "file_system_arn": file_system.get("file_system_arn", ""),
+        "access_point_arn": access_point_arn,
+        "mount_path": APP_DATA_MOUNT_PATH,
+        "prefix": S3_FILES_APP_DATA_PREFIX,
+        "mount_sg_id": mount_sg_id,
+        "subnets": private_subnets,
+    }
+
+    if ecs_task_role_name:
+        prepare_s3files_for_ecs(vpc_info, app_data_info, ecs_task_role_name)
+
+    logger.info("✓ S3 Files app-data storage ready")
+    logger.info(f"  File system: {file_system_id}")
+    logger.info(f"  Access point: {access_point_arn}")
+    logger.info(f"  Mount path: {APP_DATA_MOUNT_PATH}")
+    logger.info(f"  Prefix: {S3_FILES_APP_DATA_PREFIX}")
+    return app_data_info
 
 
 def apply_s3_files_config(
     app_config: Dict[str, object],
     s3_files_info: Optional[Dict[str, object]],
+    s3_files_app_data_info: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
-    """Attach S3 Files session storage settings to application config."""
-    if not s3_files_info:
-        return app_config
-    app_config["s3_files_file_system_id"] = s3_files_info.get("file_system_id", "")
-    app_config["s3_files_access_point_arn"] = s3_files_info.get("access_point_arn", "")
-    app_config["agent_runtime_vpc_subnets"] = s3_files_info.get("subnets", [])
-    app_config["agent_runtime_security_groups"] = s3_files_info.get("security_groups", [])
+    """Attach S3 Files session + app-data settings to application config."""
+    if s3_files_info:
+        app_config["s3_files_file_system_id"] = s3_files_info.get("file_system_id", "")
+        app_config["s3_files_access_point_arn"] = s3_files_info.get(
+            "access_point_arn", ""
+        )
+        app_config["s3_files_mount_path"] = s3_files_info.get(
+            "mount_path", SESSION_STORAGE_MOUNT_PATH
+        )
+        app_config["agent_runtime_vpc_subnets"] = s3_files_info.get("subnets", [])
+        app_config["agent_runtime_security_groups"] = s3_files_info.get(
+            "security_groups", []
+        )
+    if s3_files_app_data_info:
+        app_config["s3_files_app_data_file_system_id"] = s3_files_app_data_info.get(
+            "file_system_id", ""
+        )
+        app_config["s3_files_app_data_access_point_arn"] = s3_files_app_data_info.get(
+            "access_point_arn", ""
+        )
+        app_config["s3_files_app_data_mount_path"] = s3_files_app_data_info.get(
+            "mount_path", APP_DATA_MOUNT_PATH
+        )
     return app_config
 
 
@@ -8740,6 +9075,7 @@ def main():
     agentcore_memory_role_arn = None
     memory_id = None
     s3_files_info = None
+    s3_files_app_data_info = None
     deployment_success = False
     
     try:
@@ -8796,17 +9132,22 @@ def main():
         vpc_info = create_vpc()
         logger.info(f"VPC created...")
 
-        # 5.5. Create S3 Files session storage for AgentCore Runtime + ECS task DB
+        # 5.5. S3 Files session storage (Runtime / agentcore-sessions/)
         ecs_task_role_name = f"role-ecs-task-for-{project_name}-{region}"
-        s3_files_info = create_s3_files_session_storage(
+        s3_files_info = create_s3_files_session_storage(vpc_info, s3_bucket_name)
+        logger.info("S3 Files session storage created...")
+
+        # 5.6. S3 Files app-data storage (ECS / app-data/)
+        s3_files_app_data_info = create_s3_files_app_data_storage(
             vpc_info,
             s3_bucket_name,
+            mount_sg_id=str(s3_files_info.get("mount_sg_id") or ""),
             ecs_sg_id=vpc_info.get("ecs_sg_id", ""),
             ecs_task_role_name=ecs_task_role_name,
         )
-        logger.info("S3 Files session storage created...")
+        logger.info("S3 Files app-data storage created...")
 
-        # 5.6. CloudFront→ALB origin verification header (Secrets Manager)
+        # 5.7. CloudFront→ALB origin verification header (Secrets Manager)
         logger.info("Creating/loading ALB origin header secret...")
         origin_header_value = get_or_create_alb_origin_header()
         
@@ -8833,7 +9174,9 @@ def main():
             agentcore_memory_role_arn,
             memory_id,
         )
-        app_environment = apply_s3_files_config(app_environment, s3_files_info)
+        app_environment = apply_s3_files_config(
+            app_environment, s3_files_info, s3_files_app_data_info
+        )
         if write_application_config(app_environment):
             logger.info("Local testing is available while deployment continues:")
             logger.info("  uvicorn application.server:app --host 0.0.0.0 --port 8501")
@@ -8863,6 +9206,11 @@ def main():
         # (e.g. agentic_work-*), not only root project_name naming.
         ecs_roles = create_ecs_roles()
         logger.info("ECS task AgentCore IAM policy refreshed for installed runtime...")
+        # Re-attach app-data S3 Files IAM after role refresh.
+        if s3_files_app_data_info:
+            prepare_s3files_for_ecs(
+                vpc_info, s3_files_app_data_info, ecs_task_role_name
+            )
 
         repository_uri = create_ecr_repository()
         image_build_tag = None
@@ -8896,7 +9244,7 @@ def main():
             image_uri,
             app_environment,
             log_group_name,
-            s3_files_info=s3_files_info,
+            s3_files_info=s3_files_app_data_info,
             origin_header_value=origin_header_value,
         )
         logger.info("ECS service deployed...")
@@ -8955,9 +9303,22 @@ def main():
                 f"{agentcore_websearch_gateway_info.get('gateway_url')}"
             )
         if s3_files_info:
-            logger.info(f"  S3 Files Access Point: {s3_files_info.get('access_point_arn')}")
+            logger.info(
+                f"  S3 Files (Runtime) AP: {s3_files_info.get('access_point_arn')} "
+                f"(prefix=agentcore-sessions/)"
+            )
             logger.info(
                 f"  Agent Runtime Subnets: {', '.join(s3_files_info.get('subnets', []))}"
+            )
+        if s3_files_app_data_info:
+            logger.info(
+                f"  S3 Files (ECS app-data) AP: "
+                f"{s3_files_app_data_info.get('access_point_arn')}"
+            )
+            logger.info(
+                f"  S3 Files (ECS app-data) Mount: "
+                f"{s3_files_app_data_info.get('mount_path')} "
+                f"(prefix=app-data/)"
             )
         logger.info("")
         logger.info(f"Total deployment time: {elapsed_time/60:.2f} minutes")
@@ -8996,6 +9357,10 @@ def main():
         config_path = _application_config_path()
         if app_environment is not None:
             config_data = app_environment
+            if s3_files_info or s3_files_app_data_info:
+                config_data = apply_s3_files_config(
+                    config_data, s3_files_info, s3_files_app_data_info
+                )
         else:
             config_data = build_config_from_deployment_state(
                 knowledge_base_id=knowledge_base_id,
@@ -9005,6 +9370,7 @@ def main():
                 s3_bucket_name=s3_bucket_name,
                 cloudfront_info=cloudfront_info,
                 s3_files_info=s3_files_info,
+                s3_files_app_data_info=s3_files_app_data_info,
                 agentcore_memory_role_arn=agentcore_memory_role_arn,
                 memory_id=memory_id,
             )

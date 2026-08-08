@@ -12,6 +12,7 @@ import sys
 import os
 import json
 import argparse
+from typing import List
 from botocore.exceptions import ClientError
 
 # Configuration
@@ -1988,21 +1989,34 @@ def _wait_for_s3files_resource_deleted(
     return False
 
 
-def _find_s3files_file_system_id_for_bucket(s3_bucket_arn: str) -> str:
+def _find_s3files_fs_ids_for_bucket(s3_bucket_arn: str) -> List[str]:
+    ids: List[str] = []
     paginator = s3files_client.get_paginator("list_file_systems")
     for page in paginator.paginate():
         for item in page.get("fileSystems", []):
-            if item.get("bucket") == s3_bucket_arn:
-                return item.get("fileSystemId", "") or ""
-    return ""
+            if item.get("bucket") != s3_bucket_arn:
+                continue
+            fs_id = item.get("fileSystemId") or ""
+            if fs_id and fs_id not in ids:
+                ids.append(fs_id)
+    return ids
 
 
-def _resolve_s3files_file_system_id() -> str:
+def _resolve_s3files_file_system_ids() -> List[str]:
+    """Return session + app-data FS ids (config first, then all FS on project bucket)."""
     app_config = _load_application_config()
-    file_system_id = app_config.get("s3_files_file_system_id") or ""
-    if file_system_id:
-        return file_system_id
-    return _find_s3files_file_system_id_for_bucket(f"arn:aws:s3:::{bucket_name}")
+    ids: List[str] = []
+    for key in (
+        "s3_files_file_system_id",
+        "s3_files_app_data_file_system_id",
+    ):
+        fs_id = (app_config.get(key) or "").strip()
+        if fs_id and fs_id not in ids:
+            ids.append(fs_id)
+    for fs_id in _find_s3files_fs_ids_for_bucket(f"arn:aws:s3:::{bucket_name}"):
+        if fs_id not in ids:
+            ids.append(fs_id)
+    return ids
 
 
 def _delete_s3files_sync_role() -> None:
@@ -2018,17 +2032,7 @@ def _delete_s3files_sync_role() -> None:
             logger.warning(f"  Could not delete S3 Files sync role {role_name}: {error}")
 
 
-def delete_s3_files_session_storage() -> None:
-    """Delete S3 Files resources created for AgentCore session storage."""
-    logger.info("[3.6/10] Deleting S3 Files session storage")
-
-    file_system_id = _resolve_s3files_file_system_id()
-    if not file_system_id:
-        logger.info("  No S3 Files file system found for this deployment")
-        _delete_s3files_sync_role()
-        logger.info("✓ S3 Files session storage processed")
-        return
-
+def _delete_one_s3files_filesystem(file_system_id: str) -> None:
     logger.info(f"  File system: {file_system_id}")
 
     try:
@@ -2098,8 +2102,23 @@ def delete_s3_files_session_storage() -> None:
         if not _is_s3files_not_found(error):
             logger.warning(f"  Could not delete S3 Files file system {file_system_id}: {error}")
 
+
+def delete_s3_files_session_storage() -> None:
+    """Delete S3 Files resources (session + app-data)."""
+    logger.info("[3.6/10] Deleting S3 Files storage (session + app-data)")
+
+    fs_ids = _resolve_s3files_file_system_ids()
+    if not fs_ids:
+        logger.info("  No S3 Files file system found for this deployment")
+        _delete_s3files_sync_role()
+        logger.info("✓ S3 Files storage processed")
+        return
+
+    for file_system_id in fs_ids:
+        _delete_one_s3files_filesystem(file_system_id)
+
     _delete_s3files_sync_role()
-    logger.info("✓ S3 Files session storage deleted")
+    logger.info("✓ S3 Files storage deleted")
 
 
 def delete_secrets(skip_confirmation: bool = False) -> bool:

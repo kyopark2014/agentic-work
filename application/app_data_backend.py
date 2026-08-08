@@ -1,6 +1,7 @@
 """Shared application data backend: S3 Files mount, or direct S3 when local.
 
-ECS mounts the S3 Files filesystem at /mnt/app-data (prefix agentcore-sessions/).
+ECS mounts a dedicated S3 Files filesystem at /mnt/app-data (prefix app-data/).
+Runtime mounts agentcore-sessions/ at /mnt/workspace separately.
 Locally that mount is usually absent; when config.json has s3_bucket we talk to
 the same objects via the S3 API so local runs share tasks.db / virtual_key.json
 with production.
@@ -21,7 +22,7 @@ logger = logging.getLogger("app_data_backend")
 _APPLICATION_DIR = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_WORKING_DIR = os.path.join(_APPLICATION_DIR, "data")
 _DEFAULT_MOUNT = "/mnt/app-data"
-S3_FILES_PREFIX = "agentcore-sessions/"
+S3_FILES_PREFIX = "app-data/"
 
 
 def working_dir() -> str:
@@ -101,7 +102,7 @@ def backend_mode() -> str:
 
 
 def s3_key(*parts: str) -> str:
-    """Build an object key under agentcore-sessions/."""
+    """Build an object key under app-data/."""
     cleaned = [p.strip("/").replace("\\", "/") for p in parts if p and str(p).strip()]
     return S3_FILES_PREFIX + "/".join(cleaned)
 

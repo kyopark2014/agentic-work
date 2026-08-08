@@ -1,9 +1,9 @@
 """Resolve per-user LiteLLM virtual keys for email user_ids (application / Web UI).
 
 Called on login. Keys are stored as litellm/virtual_key.json:
-- ECS: /mnt/app-data/litellm/virtual_key.json (S3 Files mount)
+- ECS: /mnt/app-data/litellm/virtual_key.json (S3 Files prefix app-data/)
 - Local with s3_bucket: S3 only
-  (s3://{bucket}/agentcore-sessions/litellm/virtual_key.json) — no local file
+  (s3://{bucket}/app-data/litellm/virtual_key.json) — no local file
 - Local offline (no bucket): application/data/litellm/virtual_key.json
 """
 

@@ -456,11 +456,14 @@ def _upsert_managed_policy(
 
 
 # Runtime tools only touch CF-shared prefixes (upload/read artifacts, images, docs).
-# Do NOT grant agentcore-sessions/* — tasks.db and litellm/virtual_key.json live there.
+# App data (tasks.db, litellm, graph, settings) lives under app-data/ on a
+# separate S3 Files FS that Runtime must never mount or read via S3 API.
 RUNTIME_S3_OBJECT_PREFIXES = ("artifacts/", "images/", "docs/")
 
-# S3 API Deny even if Allow is later widened; checkpoints use s3files: mount, not S3 API.
-RUNTIME_S3_DENY_OBJECT_PREFIXES = ("agentcore-sessions/",)
+# S3 API Deny even if Allow is later widened.
+# - app-data/: ECS tasks.db / litellm / graph / settings (separate FS; never grant)
+# - agentcore-sessions/: checkpoints/skills use s3files: mount, not S3 API
+RUNTIME_S3_DENY_OBJECT_PREFIXES = ("app-data/", "agentcore-sessions/")
 
 
 def _project_s3_resource_arns(config) -> tuple:
@@ -841,8 +844,8 @@ def create_bedrock_agentcore_storage_policy(config):
             "Resource": object_arns,
         },
         {
-            # Block S3 API access to session store (tasks.db, virtual keys).
-            # Checkpoints still work via s3files: ClientMount, not S3 API.
+            # Block S3 API access to app-data (tasks.db, virtual keys) and
+            # session store. Checkpoints still work via s3files: ClientMount.
             "Sid": "DenySensitiveS3Prefixes",
             "Effect": "Deny",
             "Action": [
