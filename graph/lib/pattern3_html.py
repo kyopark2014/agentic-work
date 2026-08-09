@@ -519,7 +519,8 @@ function toggleLegend(force) {{
 }}
 
 const NODE_COUNT = rawNodes.length;
-const STAB_ITERS = NODE_COUNT > 300 ? 140 : NODE_COUNT > 150 ? 180 : 220;
+const SMALL_GRAPH = NODE_COUNT < 120;
+const STAB_ITERS = SMALL_GRAPH ? 220 : NODE_COUNT > 300 ? 140 : 180;
 let network = null;
 
 function stopPhysics() {{
@@ -638,6 +639,30 @@ const visEdges = rawEdges.map((e, i) => ({{
   smooth: {{ type: 'dynamic', roundness: 0.3 }},
   title: e.label + (e.confidence ? ` [${{e.confidence}}]` : '')
 }}));
+if (SMALL_GRAPH) {{
+  // Community seed so the first open has visible settle motion.
+  const groups = {{}};
+  visNodes.forEach((n) => {{
+    const g = n.group == null ? 0 : n.group;
+    if (!groups[g]) groups[g] = [];
+    groups[g].push(n);
+  }});
+  const keys = Object.keys(groups);
+  const R = Math.max(420, Math.sqrt(visNodes.length) * 70);
+  keys.forEach((g, gi) => {{
+    const angle = (2 * Math.PI * gi) / Math.max(keys.length, 1);
+    const cx = Math.cos(angle) * R;
+    const cy = Math.sin(angle) * R;
+    const members = groups[g];
+    const local = Math.max(80, Math.sqrt(members.length) * 28);
+    members.forEach((n, i) => {{
+      const a = (2 * Math.PI * i) / Math.max(members.length, 1);
+      const r = local * (0.25 + 0.75 * ((i % 7) / 7));
+      n.x = cx + Math.cos(a) * r + (Math.random() - 0.5) * 40;
+      n.y = cy + Math.sin(a) * r + (Math.random() - 0.5) * 40;
+    }});
+  }});
+}}
 
 const container = document.getElementById('mynetwork');
 const networkData = {{
@@ -666,8 +691,9 @@ const options = {{
       damping: 0.45,
       avoidOverlap: 0.9
     }},
+    // Small graphs: live physics (batch stabilize / improvedLayout hides first-open motion).
     stabilization: {{
-      enabled: true,
+      enabled: !SMALL_GRAPH,
       iterations: STAB_ITERS,
       updateInterval: 25,
       fit: false
@@ -717,13 +743,24 @@ network.on('click', function(params) {{
 network.on('hoverNode', () => {{ container.style.cursor = 'pointer'; }});
 network.on('blurNode', () => {{ container.style.cursor = 'default'; }});
 
-network.once('stabilizationIterationsDone', function() {{
-  // Freeze after Holistic physics settles, then show the full graph.
-  stopPhysics();
-  whenCanvasReady(() => {{
+if (SMALL_GRAPH) {{
+  try {{ network.startSimulation(); }} catch (e) {{}}
+  let opened = false;
+  const done = () => {{
+    if (opened) return;
+    opened = true;
     network.fit({{ animation: {{ duration: 700, easingFunction: 'easeInOutQuad' }} }});
+  }};
+  network.once('stabilized', done);
+  setTimeout(done, 4500);
+}} else {{
+  network.once('stabilizationIterationsDone', function() {{
+    stopPhysics();
+    whenCanvasReady(() => {{
+      network.fit({{ animation: {{ duration: 700, easingFunction: 'easeInOutQuad' }} }});
+    }});
   }});
-}});
+}}
 
 function filterGroup(group) {{
   activeGroup = group;
@@ -758,8 +795,26 @@ function stabilize() {{
       shadow: {{ enabled: hubish, color: n.color + '55', size: 10, x: 0, y: 0 }}
     }};
   }}));
+  if (SMALL_GRAPH) {{
+    network.setOptions({{
+      groups: {{ useDefaultGroups: false }},
+      layout: {{ improvedLayout: false }},
+      physics: {{ enabled: true, stabilization: {{ enabled: false }} }}
+    }});
+    try {{ network.startSimulation(); }} catch (e) {{}}
+    let finished = false;
+    const finish = () => {{
+      if (finished) return;
+      finished = true;
+      network.fit({{ animation: {{ duration: 600 }} }});
+    }};
+    network.once('stabilized', finish);
+    setTimeout(finish, 4500);
+    return;
+  }}
   network.setOptions({{
     groups: {{ useDefaultGroups: false }},
+    layout: {{ improvedLayout: false }},
     physics: {{
       enabled: true,
       stabilization: {{ enabled: true, iterations: STAB_ITERS, updateInterval: 25, fit: false }}

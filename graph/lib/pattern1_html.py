@@ -522,8 +522,9 @@ function toggleLegend(force) {{
 }}
 
 const NODE_COUNT = rawNodes.length;
-// Cap stabilization only — keep rich Force Atlas visuals (labels, curves, glow).
-const STAB_ITERS = NODE_COUNT >= 200 ? 60 : NODE_COUNT > 80 ? 100 : 180;
+// Cap stabilization for large graphs; small graphs keep the classic visible settle.
+const SMALL_GRAPH = NODE_COUNT < 120;
+const STAB_ITERS = SMALL_GRAPH ? 180 : NODE_COUNT >= 200 ? 60 : 100;
 let network = null;
 
 function stopPhysics() {{
@@ -629,6 +630,14 @@ const visEdges = rawEdges.map((e, i) => ({{
   smooth: {{ type: 'curvedCCW', roundness: 0.18 }},
   title: e.label + (e.confidence ? ` [${{e.confidence}}]` : '')
 }}));
+if (SMALL_GRAPH) {{
+  // Seed so the first open has visible settle motion (same idea as relayout).
+  const spread = Math.max(520, Math.sqrt(visNodes.length) * 95);
+  visNodes.forEach((n) => {{
+    n.x = (Math.random() - 0.5) * spread * 2;
+    n.y = (Math.random() - 0.5) * spread * 2;
+  }});
+}}
 
 const container = document.getElementById('mynetwork');
 const networkData = {{
@@ -651,8 +660,9 @@ const options = {{
       damping: 0.5,
       avoidOverlap: 0.7
     }},
+    // Small graphs: live physics (batch stabilize hides first-open motion).
     stabilization: {{
-      enabled: true,
+      enabled: !SMALL_GRAPH,
       iterations: STAB_ITERS,
       updateInterval: 25,
       fit: false
@@ -665,7 +675,7 @@ const options = {{
     dragView: true,
     keyboard: {{ enabled: true, bindToWindow: false }}
   }},
-  // Always off: Kamada-Kawai blocks the UI on medium/large graphs.
+  // improvedLayout (Kamada-Kawai) is sync and hides the opening animation.
   layout: {{ improvedLayout: false }}
 }};
 
@@ -705,14 +715,34 @@ network.on('click', function(params) {{
 network.on('hoverNode', () => {{ container.style.cursor = 'pointer'; }});
 network.on('blurNode', () => {{ container.style.cursor = 'default'; }});
 
-network.once('stabilizationIterationsDone', function() {{
-  stopPhysics();
+function finishInitialLayout() {{
   if (DATA.hub) {{
     network.focus(DATA.hub, {{ scale: 0.85, animation: {{ duration: 800 }} }});
   }} else {{
-    whenCanvasReady(() => fitView());
+    network.fit({{ animation: {{ duration: 500 }} }});
   }}
-}});
+}}
+
+if (SMALL_GRAPH) {{
+  try {{ network.startSimulation(); }} catch (e) {{}}
+  let opened = false;
+  const done = () => {{
+    if (opened) return;
+    opened = true;
+    finishInitialLayout();
+  }};
+  network.once('stabilized', done);
+  setTimeout(done, 4500);
+}} else {{
+  network.once('stabilizationIterationsDone', function() {{
+    stopPhysics();
+    if (DATA.hub) {{
+      network.focus(DATA.hub, {{ scale: 0.85, animation: {{ duration: 800 }} }});
+    }} else {{
+      whenCanvasReady(() => fitView());
+    }}
+  }});
+}}
 
 function filterGroup(group) {{
   activeGroup = group;
@@ -745,8 +775,27 @@ function stabilize() {{
     }},
     shadow: {{ enabled: true, color: n.color + '66', size: 8, x: 0, y: 0 }}
   }})));
+  if (SMALL_GRAPH) {{
+    // Live physics (like Holistic): batch stabilize/improvedLayout hides the motion.
+    network.setOptions({{
+      groups: {{ useDefaultGroups: false }},
+      layout: {{ improvedLayout: false }},
+      physics: {{ enabled: true, stabilization: {{ enabled: false }} }}
+    }});
+    try {{ network.startSimulation(); }} catch (e) {{}}
+    let finished = false;
+    const finish = () => {{
+      if (finished) return;
+      finished = true;
+      network.fit({{ animation: {{ duration: 600 }} }});
+    }};
+    network.once('stabilized', finish);
+    setTimeout(finish, 4500);
+    return;
+  }}
   network.setOptions({{
     groups: {{ useDefaultGroups: false }},
+    layout: {{ improvedLayout: false }},
     physics: {{
       enabled: true,
       stabilization: {{ enabled: true, iterations: STAB_ITERS, updateInterval: 10, fit: false }}

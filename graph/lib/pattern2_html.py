@@ -508,8 +508,9 @@ function toggleLegend(force) {{
 }}
 
 const NODE_COUNT = rawNodes.length;
-// Always auto-stabilize on open (same UX as Force Atlas / Holistic).
-const STAB_ITERS = NODE_COUNT >= 200 ? 60 : NODE_COUNT > 80 ? 120 : 260;
+// Always auto-stabilize on open; small graphs keep the classic visible settle.
+const SMALL_GRAPH = NODE_COUNT < 120;
+const STAB_ITERS = SMALL_GRAPH ? 260 : NODE_COUNT >= 200 ? 60 : 120;
 let network = null;
 
 function stopPhysics() {{
@@ -655,7 +656,15 @@ const options = {{
   physics: {{
     enabled: true,
     solver: 'barnesHut',
-    barnesHut: {{
+    barnesHut: SMALL_GRAPH ? {{
+      // Softer so the first-open settle is visible (not instantaneous).
+      gravitationalConstant: -3200,
+      centralGravity: 0.05,
+      springLength: 120,
+      springConstant: 0.04,
+      damping: 0.4,
+      avoidOverlap: 0.35
+    }} : {{
       gravitationalConstant: -14000,
       centralGravity: 0.12,
       springLength: 85,
@@ -663,8 +672,9 @@ const options = {{
       damping: 0.45,
       avoidOverlap: 0.12
     }},
+    // Small graphs: live physics so the first open shows settle motion.
     stabilization: {{
-      enabled: true,
+      enabled: !SMALL_GRAPH,
       iterations: STAB_ITERS,
       updateInterval: 25,
       fit: false
@@ -717,14 +727,34 @@ network.on('click', function(params) {{
 network.on('hoverNode', () => {{ container.style.cursor = 'pointer'; }});
 network.on('blurNode', () => {{ container.style.cursor = 'default'; }});
 
-network.once('stabilizationIterationsDone', function() {{
-  stopPhysics();
+function finishInitialLayout() {{
   if (DATA.hub) {{
     network.focus(DATA.hub, {{ scale: 0.9, animation: {{ duration: 700 }} }});
   }} else {{
-    whenCanvasReady(() => fitView());
+    network.fit({{ animation: {{ duration: 500 }} }});
   }}
-}});
+}}
+
+if (SMALL_GRAPH) {{
+  try {{ network.startSimulation(); }} catch (e) {{}}
+  let opened = false;
+  const done = () => {{
+    if (opened) return;
+    opened = true;
+    finishInitialLayout();
+  }};
+  network.once('stabilized', done);
+  setTimeout(done, 4500);
+}} else {{
+  network.once('stabilizationIterationsDone', function() {{
+    stopPhysics();
+    if (DATA.hub) {{
+      network.focus(DATA.hub, {{ scale: 0.9, animation: {{ duration: 700 }} }});
+    }} else {{
+      whenCanvasReady(() => fitView());
+    }}
+  }});
+}}
 
 function filterGroup(group) {{
   activeGroup = group;
@@ -754,8 +784,27 @@ function stabilize() {{
       hover: {{ background: lightenColor(n.color, 0.12), border: lightenColor(n.color, 0.12) }}
     }}
   }})));
+  if (SMALL_GRAPH) {{
+    // Live physics (like Holistic): batch stabilize/improvedLayout hides the motion.
+    network.setOptions({{
+      groups: {{ useDefaultGroups: false }},
+      layout: {{ improvedLayout: false }},
+      physics: {{ enabled: true, stabilization: {{ enabled: false }} }}
+    }});
+    try {{ network.startSimulation(); }} catch (e) {{}}
+    let finished = false;
+    const finish = () => {{
+      if (finished) return;
+      finished = true;
+      network.fit({{ animation: {{ duration: 600 }} }});
+    }};
+    network.once('stabilized', finish);
+    setTimeout(finish, 4500);
+    return;
+  }}
   network.setOptions({{
     groups: {{ useDefaultGroups: false }},
+    layout: {{ improvedLayout: false }},
     physics: {{
       enabled: true,
       stabilization: {{ enabled: true, iterations: STAB_ITERS, updateInterval: 10, fit: false }}
