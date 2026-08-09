@@ -213,15 +213,19 @@ def get_optional_user_id(request: Request) -> str | None:
     return session_cookie.verify_session(request.cookies.get(SESSION_COOKIE) or "")
 
 
-def _kick_graph_job(user_id: str) -> None:
-    """Fire-and-forget background graph extract (respects cooldown / running lock)."""
+def _kick_graph_job(user_id: str, *, force: bool = False) -> None:
+    """Fire-and-forget background graph extract.
+
+    When force=False, respects fingerprint/cooldown/running lock.
+    When force=True (e.g. Knowledge Graph toggled on), bypass those skips.
+    """
     if not utils.is_knowledge_graph_enabled(user_id):
         logger.info("Knowledge Graph disabled for %s — skip extract", user_id)
         return
     try:
         from application.graph_jobs import ensure_graph_job
 
-        ensure_graph_job(user_id)
+        ensure_graph_job(user_id, force=force)
     except Exception:
         logger.exception("Failed to schedule graph job for %s", user_id)
 
@@ -409,8 +413,9 @@ def patch_session_settings(
     prev_pattern = utils.get_graph_pattern(user_id)
     if updates:
         utils.save_user_settings(user_id, **updates)
+    # Turning Knowledge Graph on force-runs extract (bypass unchanged/cooldown skips).
     if updates.get("knowledge_graph_enabled") is True:
-        _kick_graph_job(user_id)
+        _kick_graph_job(user_id, force=True)
     new_pattern = updates.get("graph_pattern")
     if (
         isinstance(new_pattern, str)
