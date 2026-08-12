@@ -1810,6 +1810,7 @@ async def create_agent(
     scoped_user_id = user_id if user_id else "default"
     for server_name in (
         "memory",
+        "graph memory",
         "kb-retriever",
         "knowledge base",
         "imageGeneration",

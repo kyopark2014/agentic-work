@@ -300,6 +300,15 @@ def _run_pipeline(user_id: str, force: bool = False) -> None:
             state.updated_at = now
             _running_users.discard(user_id)
         logger.info("Graph pipeline ready for user=%s", user_id)
+        try:
+            from application import utils
+
+            utils.sync_user_graph_to_runtime_storage(user_id)
+        except Exception:
+            logger.exception(
+                "Graph→runtime mirror failed for user=%s (pipeline still ready)",
+                user_id,
+            )
     except Exception as exc:
         with _lock:
             state = _get_or_create(user_id)
@@ -335,4 +344,11 @@ def republish_graph_html(user_id: str, *, pattern: str | None = None) -> bool:
         logger.info("No graph.json to republish for %s (pattern=%s)", user_id, pid)
         return False
     logger.info("Republished graph HTML for %s pattern=%s → %s", user_id, pid, written)
+    try:
+        utils.sync_user_graph_to_runtime_storage(user_id)
+    except Exception:
+        logger.exception(
+            "Graph→runtime mirror failed for user=%s after republish",
+            user_id,
+        )
     return True

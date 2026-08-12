@@ -76,6 +76,53 @@ def get_user_skills_list_path(user_id: str | None) -> str:
     return os.path.join(SESSION_STORAGE_DIR, segment, "skills.list")
 
 
+def get_user_graph_dir(user_id: str | None) -> str:
+    """Absolute path to {SESSION_STORAGE_DIR}/{user_id}/graph (does not create)."""
+    segment = sanitize_user_path_segment(user_id)
+    if not segment:
+        segment = "default"
+    return os.path.join(SESSION_STORAGE_DIR, segment, "graph")
+
+
+_DEFAULT_USER_SETTINGS: dict[str, object] = {
+    "knowledge_graph_enabled": True,
+}
+
+
+def get_user_settings_path(user_id: str | None) -> str:
+    """Absolute path to {SESSION_STORAGE_DIR}/{user_id}/settings.json (does not create)."""
+    segment = sanitize_user_path_segment(user_id) or "default"
+    return os.path.join(SESSION_STORAGE_DIR, segment, "settings.json")
+
+
+def load_user_settings(user_id: str | None) -> dict[str, object]:
+    """Load per-user UI/feature settings. Missing file → defaults (KG on)."""
+    settings = dict(_DEFAULT_USER_SETTINGS)
+    path = get_user_settings_path(user_id)
+    if not os.path.isfile(path):
+        return settings
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict) and "knowledge_graph_enabled" in raw:
+            settings["knowledge_graph_enabled"] = bool(raw["knowledge_graph_enabled"])
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("Failed to load user settings %s: %s", path, e)
+    return settings
+
+
+def is_knowledge_graph_enabled(user_id: str | None) -> bool:
+    """True when Knowledge Graph feature is on (default)."""
+    return bool(load_user_settings(user_id).get("knowledge_graph_enabled", True))
+
+
+def is_hybrid_graph_search_enabled() -> bool:
+    """True when config.json hybrid_graph_search is enable (embedding vector search)."""
+    cfg = load_config() or {}
+    raw = str(cfg.get("hybrid_graph_search") or "").strip().lower()
+    return raw in {"enable", "enabled", "on", "true", "1", "yes"}
+
+
 def list_skill_dir_names(skills_dir: str) -> list[str]:
     """Return subdirectory names that contain SKILL.md under skills_dir."""
     if not os.path.isdir(skills_dir):

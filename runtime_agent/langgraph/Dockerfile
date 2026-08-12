@@ -32,6 +32,7 @@ RUN pip install "mcp>=1.9.0,<2" langchain-mcp-adapters awslabs.aws-documentation
 RUN pip install "bedrock-agentcore>=1.18.1" uv
 RUN pip install "mcp>=1.9.0,<2"
 RUN pip install Pillow pytz tavily-python langchain-text-splitters
+RUN pip install networkx
 RUN pip install requests beautifulsoup4
 RUN pip install python-docx openpyxl reportlab matplotlib pandas finance-datareader pypdf pdfplumber pyyaml defusedxml lxml
 RUN pip install colorama rich

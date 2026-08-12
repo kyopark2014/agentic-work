@@ -4,6 +4,7 @@ import json
 import traceback
 import boto3
 import os
+from contextlib import contextmanager
 from urllib import parse
 
 logging.basicConfig(
@@ -118,6 +119,133 @@ def user_graph_html_path(user_id: str | None) -> str:
     """Published HTML: {SESSION_STORAGE_DIR}/{user_id}/graph/out/graph.html"""
     segment = sanitize_user_path_segment(user_id) or "default"
     return os.path.join(SESSION_STORAGE_DIR, segment, "graph", "out", "graph.html")
+
+
+# Extract caches are not needed for Runtime recall_graph_memory.
+_GRAPH_MIRROR_SKIP_DIR_NAMES = frozenset({"cache", "graphify-out"})
+_PROXY_ENV_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+)
+
+
+@contextmanager
+def _without_env_proxies():
+    """Drop HTTP(S)_PROXY for the block (Cursor agent proxies break local boto3)."""
+    saved = {key: os.environ.pop(key, None) for key in _PROXY_ENV_KEYS}
+    try:
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is not None:
+                os.environ[key] = value
+
+
+def sync_user_graph_to_runtime_storage(user_id: str | None) -> dict[str, int]:
+    """Mirror ECS/local graph → S3 agentcore-sessions for AgentCore Runtime.
+
+    Knowledge graphs live on app-data (``SESSION_STORAGE_DIR`` / ``app-data/``).
+    AgentCore Runtime only mounts ``agentcore-sessions/`` at ``/mnt/workspace``,
+    so ``recall_graph_memory`` cannot see app-data. After each successful
+    pipeline/publish, upload ``{user}/graph/`` to
+    ``s3://{bucket}/agentcore-sessions/{user}/graph/`` so Runtime can read
+    ``/mnt/workspace/{user}/graph/out/graph.json``.
+
+    Returns counts: ``{"uploaded": N, "deleted": M}``. Missing graph or S3
+    config → empty counts (logged, not raised).
+    """
+    segment = sanitize_user_path_segment(user_id)
+    if not segment:
+        return {"uploaded": 0, "deleted": 0}
+
+    graph_root = get_user_graph_dir(user_id)
+    graph_json = os.path.join(graph_root, "out", "graph.json")
+    if not os.path.isfile(graph_json):
+        logger.info(
+            "skip graph→runtime mirror: no graph.json for %s at %s",
+            segment,
+            graph_json,
+        )
+        return {"uploaded": 0, "deleted": 0}
+
+    try:
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+    bucket = (cfg.get("s3_bucket") if isinstance(cfg, dict) else None) or s3_bucket
+    region = (cfg.get("region") if isinstance(cfg, dict) else None) or bedrock_region
+    if not bucket:
+        logger.warning("skip graph→runtime mirror: s3_bucket not configured")
+        return {"uploaded": 0, "deleted": 0}
+
+    dest_prefix = f"{S3_FILES_SESSION_PREFIX}/{segment}/graph/"
+    local_files: dict[str, str] = {}
+    for dirpath, dirnames, filenames in os.walk(graph_root):
+        dirnames[:] = [d for d in dirnames if d not in _GRAPH_MIRROR_SKIP_DIR_NAMES]
+        for name in filenames:
+            abs_path = os.path.join(dirpath, name)
+            rel = os.path.relpath(abs_path, graph_root).replace(os.sep, "/")
+            local_files[rel] = abs_path
+
+    if not local_files:
+        return {"uploaded": 0, "deleted": 0}
+
+    uploaded = 0
+    failed = 0
+    deleted = 0
+    # Local uvicorn often inherits Cursor's ephemeral HTTP(S)_PROXY
+    # (127.0.0.1:61xxx). That proxy dies with the agent session and breaks
+    # every boto3 upload — clear env proxies for this sync only.
+    with _without_env_proxies():
+        s3 = boto3.client("s3", region_name=region)
+        for rel, abs_path in sorted(local_files.items()):
+            key = f"{dest_prefix}{rel}"
+            try:
+                s3.upload_file(abs_path, bucket, key)
+                uploaded += 1
+            except Exception as e:
+                failed += 1
+                logger.warning("graph mirror upload failed %s: %s", key, e)
+        if failed:
+            logger.warning(
+                "graph→runtime mirror incomplete user=%s uploaded=%s failed=%s",
+                segment,
+                uploaded,
+                failed,
+            )
+
+        try:
+            paginator = s3.get_paginator("list_objects_v2")
+            remote_keys: list[str] = []
+            for page in paginator.paginate(Bucket=bucket, Prefix=dest_prefix):
+                for obj in page.get("Contents") or []:
+                    key = obj.get("Key") or ""
+                    if key and not key.endswith("/"):
+                        remote_keys.append(key)
+            keep = {f"{dest_prefix}{rel}" for rel in local_files}
+            stale = [key for key in remote_keys if key not in keep]
+            for key in stale:
+                try:
+                    s3.delete_object(Bucket=bucket, Key=key)
+                    deleted += 1
+                except Exception as e:
+                    logger.warning("graph mirror delete failed %s: %s", key, e)
+        except Exception as e:
+            logger.warning("graph mirror list/delete skipped for %s: %s", segment, e)
+
+    logger.info(
+        "Mirrored graph → runtime storage user=%s uploaded=%s deleted=%s prefix=s3://%s/%s",
+        segment,
+        uploaded,
+        deleted,
+        bucket,
+        dest_prefix,
+    )
+    return {"uploaded": uploaded, "deleted": deleted}
 
 
 GRAPH_PATTERNS = ("pattern1", "pattern2", "pattern3")
