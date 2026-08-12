@@ -174,15 +174,7 @@ async def agent_langgraph(payload):
     logger.info(f"memory_enabled: {chat.memory_enabled}")
     logger.info(f"llm_gateway_enabled: {chat.llm_gateway_enabled}")
 
-    # Normalize selected MCP names and always attach memory when Memory toggle is on
     mcp_servers = [str(s).strip() for s in (mcp_servers or []) if str(s).strip()]
-    if chat.memory_enabled and "memory" not in mcp_servers:
-        mcp_servers = mcp_servers + ["memory"]
-        logger.info("memory_enabled: appended 'memory' MCP server")
-    elif chat.memory_enabled:
-        logger.info("memory_enabled: 'memory' MCP already selected")
-    elif "memory" in mcp_servers:
-        logger.info("memory MCP selected via MCP picker (memory_enabled=False)")
 
     # Auto-attach graph memory when Knowledge Graph is on (same path as UI doc search).
     effective_user_id = user_id if user_id else chat.user_id
