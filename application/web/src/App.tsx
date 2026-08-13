@@ -26,7 +26,7 @@ import { ChatInput } from "./components/ChatInput";
 import { GoogleLoginModal } from "./components/GoogleLoginModal";
 import { Dashboard } from "./components/Dashboard";
 
-type DrawerKind = "skill" | "mcp" | "model" | "appearance" | null;
+type DrawerKind = "skill" | "mcp" | "model" | "appearance" | "wiki" | "knowledge" | null;
 
 type QueuedMessage = {
   id: string;

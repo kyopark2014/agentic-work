@@ -13,8 +13,8 @@ from __future__ import annotations
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 # Allow Google Identity Services (GSI) while locking down everything else.
-# frame-src includes 'self' so KnowledgeGraphModal can iframe /api/graph
-# (agent-skills has no CSP middleware; without 'self' the graph iframe is blank).
+# frame-src includes 'self' so Knowledge/Wiki Graph modals can iframe HTML
+# (without 'self' the graph iframe is blank).
 _CONTENT_SECURITY_POLICY = (
     "default-src 'self'; "
     "script-src 'self' https://accounts.google.com https://apis.google.com; "
@@ -76,10 +76,10 @@ def _viewer_is_https(scope: Scope) -> bool:
 
 
 def _is_graph_html(scope: Scope) -> bool:
-    """Exact /api/graph document (not /api/graph/status)."""
+    """Exact Knowledge/Wiki graph HTML (not /status|/query|/rebuild)."""
     path = scope.get("path") or "/"
     path = path.rstrip("/") or "/"
-    return path == "/api/graph"
+    return path in {"/api/graph", "/api/wiki/graph"}
 
 
 def _header_names(headers: list[tuple[bytes, bytes]]) -> set[bytes]:

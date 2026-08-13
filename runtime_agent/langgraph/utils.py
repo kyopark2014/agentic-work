@@ -84,6 +84,56 @@ def get_user_graph_dir(user_id: str | None) -> str:
     return os.path.join(SESSION_STORAGE_DIR, segment, "graph")
 
 
+def get_user_wiki_dir(user_id: str | None) -> str:
+    """Absolute path to {SESSION_STORAGE_DIR}/{user_id}/wiki (does not create)."""
+    segment = sanitize_user_path_segment(user_id)
+    if not segment:
+        segment = "default"
+    return os.path.join(SESSION_STORAGE_DIR, segment, "wiki")
+
+
+def wiki_graphify_out_dir(user_id: str | None = None) -> str:
+    return os.path.join(get_user_wiki_dir(user_id), "graphify-out")
+
+
+def wiki_graph_json_path(user_id: str | None = None) -> str:
+    return os.path.join(wiki_graphify_out_dir(user_id), "graph.json")
+
+
+def wiki_sources_path(user_id: str | None = None) -> str:
+    return os.path.join(get_user_wiki_dir(user_id), "wiki_sources.json")
+
+
+def get_wiki_source_folders(user_id: str | None = None) -> list[str]:
+    """Configured Wiki Sync source folders (max 3). Empty → Sync uses raw/wiki root."""
+    path = wiki_sources_path(user_id)
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    folders = raw.get("AGENT_WIKI_SOURCES") if isinstance(raw, dict) else None
+    if not isinstance(folders, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in folders:
+        pth = str(item or "").strip()
+        if not pth:
+            continue
+        abs_path = os.path.abspath(os.path.expanduser(pth))
+        if abs_path in seen:
+            continue
+        seen.add(abs_path)
+        out.append(abs_path)
+        if len(out) >= 3:
+            break
+    return out
+
+
+
 _DEFAULT_USER_SETTINGS: dict[str, object] = {
     "knowledge_graph_enabled": True,
 }

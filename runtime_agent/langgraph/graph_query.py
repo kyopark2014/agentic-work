@@ -19,6 +19,50 @@ _MAX_EXCERPT_CHARS = 1800
 _MAX_TOTAL_EXCERPT_CHARS = 8000
 
 
+# Prefer these for excerpts / body search (never dump PDF binary into the UI).
+_TEXT_SUFFIXES = {
+    ".md",
+    ".markdown",
+    ".txt",
+    ".text",
+    ".rst",
+    ".csv",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".xml",
+    ".html",
+    ".htm",
+    ".py",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".go",
+    ".rs",
+    ".java",
+    ".cpp",
+    ".c",
+    ".h",
+}
+_BINARY_SUFFIXES = {
+    ".pdf",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".gif",
+    ".mp4",
+    ".mp3",
+    ".wav",
+    ".docx",
+    ".pptx",
+    ".xlsx",
+    ".zip",
+}
+
+
+
 def _load_graph(path: Path):
     data = json.loads(path.read_text(encoding="utf-8"))
     try:
@@ -91,17 +135,10 @@ def _find_nodes_by_source_content(
     for src, nids in by_file.items():
         if checked >= 80:
             break
-        allowed = _allowed_source(Path(src), roots)
-        if allowed is None:
+        _path, text, err = _read_readable_source(Path(src), roots)
+        if err or not text:
             continue
         checked += 1
-        try:
-            raw = allowed.read_bytes()
-            if len(raw) > _MAX_FILE_BYTES:
-                raw = raw[:_MAX_FILE_BYTES]
-            text = raw.decode("utf-8", errors="replace")
-        except OSError:
-            continue
         score = _text_term_score(text, terms)
         if score <= 0:
             continue
@@ -128,7 +165,7 @@ def _source_path_candidates(path: Path) -> list[Path]:
     """Absolute extract paths may point at another host/mount; try graph-relative forms."""
     candidates: list[Path] = [path]
     parts = path.parts
-    for marker in ("corpus", "out"):
+    for marker in ("corpus", "out", "raw", "graphify-out", "converted"):
         if marker in parts:
             idx = parts.index(marker)
             candidates.append(Path(*parts[idx:]))
@@ -138,6 +175,11 @@ def _source_path_candidates(path: Path) -> list[Path]:
         candidates.append(Path(name))
         candidates.append(Path("corpus") / name)
         candidates.append(Path("out") / name)
+        candidates.append(Path("raw") / name)
+        candidates.append(Path("graphify-out") / "converted" / name)
+        if Path(name).suffix.lower() == ".pdf":
+            stem = Path(name).stem
+            candidates.append(Path("graphify-out") / "converted" / f"{stem}.md")
     # Deduplicate while preserving order
     seen: set[str] = set()
     out: list[Path] = []
@@ -181,6 +223,145 @@ def _allowed_source(path: Path, roots: list[Path]) -> Path | None:
         except OSError:
             continue
     return None
+
+
+
+def _looks_binary(raw: bytes) -> bool:
+    if not raw:
+        return False
+    if raw.startswith(b"%PDF") or raw[:4] == b"\x89PNG" or raw[:2] == b"\xff\xd8":
+        return True
+    sample = raw[:4096]
+    if b"\x00" in sample:
+        return True
+    textish = sum(1 for b in sample if b in (9, 10, 13) or 32 <= b < 127 or b >= 0xC0)
+    return textish < len(sample) * 0.75
+
+
+def _converted_markdown_for(
+    src: Path, roots: list[Path]
+) -> list[Path]:
+    """Find wiki ``graphify-out/converted/{stem}*.md`` sidecars for a binary source."""
+    stem = src.stem
+    dirs: list[Path] = []
+    seen: set[str] = set()
+
+    def _add_dir(d: Path) -> None:
+        key = str(d)
+        if key in seen:
+            return
+        seen.add(key)
+        dirs.append(d)
+
+    for root in roots:
+        try:
+            r = root.resolve()
+        except OSError:
+            continue
+        _add_dir(r / "converted")
+        _add_dir(r / "graphify-out" / "converted")
+        if r.name == "graphify-out":
+            _add_dir(r / "converted")
+        if (r / "graph.json").is_file():
+            _add_dir(r / "converted")
+
+    found: list[Path] = []
+    found_keys: set[str] = set()
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        exact = d / f"{stem}.md"
+        if exact.is_file():
+            key = str(exact.resolve())
+            if key not in found_keys:
+                found_keys.add(key)
+                found.append(exact)
+        parts = sorted(d.glob(f"{stem}_part*.md"))
+        for p in parts:
+            key = str(p.resolve())
+            if key not in found_keys:
+                found_keys.add(key)
+                found.append(p)
+    return found
+
+
+def _decode_text(raw: bytes) -> str:
+    if len(raw) > _MAX_FILE_BYTES:
+        raw = raw[:_MAX_FILE_BYTES]
+    return raw.decode("utf-8", errors="replace")
+
+
+def _read_readable_source(
+    src: Path, roots: list[Path]
+) -> tuple[Path | None, str, str | None]:
+    """Load excerptable text for ``src``.
+
+    Graph nodes often point at the original PDF (provenance). For reading we
+    prefer Sync's converted markdown under ``graphify-out/converted/``.
+    Returns ``(path_used, text, error)``.
+    """
+    allowed = _allowed_source(src, roots)
+    suffix = src.suffix.lower()
+
+    need_converted = suffix in _BINARY_SUFFIXES or (
+        suffix not in _TEXT_SUFFIXES and suffix != ""
+    )
+    converted = _converted_markdown_for(src, roots)
+
+    if need_converted and converted:
+        chunks: list[str] = []
+        for p in converted:
+            try:
+                chunks.append(_decode_text(p.read_bytes()))
+            except OSError:
+                continue
+        if chunks:
+            return converted[0], "\n\n".join(chunks), None
+
+    if allowed is None:
+        if converted:
+            chunks = []
+            for p in converted:
+                try:
+                    chunks.append(_decode_text(p.read_bytes()))
+                except OSError:
+                    continue
+            if chunks:
+                return converted[0], "\n\n".join(chunks), None
+        return None, "", "source file not readable or outside allowed roots"
+
+    try:
+        raw = allowed.read_bytes()
+    except OSError as exc:
+        if converted:
+            chunks = []
+            for p in converted:
+                try:
+                    chunks.append(_decode_text(p.read_bytes()))
+                except OSError:
+                    continue
+            if chunks:
+                return converted[0], "\n\n".join(chunks), None
+        return None, "", str(exc)
+
+    if _looks_binary(raw) or suffix in _BINARY_SUFFIXES:
+        if converted:
+            chunks = []
+            for p in converted:
+                try:
+                    chunks.append(_decode_text(p.read_bytes()))
+                except OSError:
+                    continue
+            if chunks:
+                return converted[0], "\n\n".join(chunks), None
+        return (
+            allowed,
+            "",
+            "binary source (e.g. PDF); no converted markdown under graphify-out/converted",
+        )
+
+    return allowed, _decode_text(raw), None
+
 
 
 def _paragraphs(text: str) -> list[str]:
@@ -461,33 +642,17 @@ def query_user_graph(
     ):
         if len(sources_out) >= _MAX_SOURCES or total_chars >= _MAX_TOTAL_EXCERPT_CHARS:
             break
-        allowed = _allowed_source(Path(src), roots)
-        if allowed is None:
+        readable_path, text, err = _read_readable_source(Path(src), roots)
+        display_name = Path(src).name
+        if readable_path is None or not text:
             sources_out.append(
                 {
                     "path": src,
-                    "name": Path(src).name,
+                    "name": display_name,
                     "readable": False,
                     "matched_labels": [n["label"] for n in file_nodes[:8]],
                     "excerpts": [],
-                    "error": "source file not readable or outside allowed roots",
-                }
-            )
-            continue
-        try:
-            raw = allowed.read_bytes()
-            if len(raw) > _MAX_FILE_BYTES:
-                raw = raw[:_MAX_FILE_BYTES]
-            text = raw.decode("utf-8", errors="replace")
-        except OSError as exc:
-            sources_out.append(
-                {
-                    "path": str(allowed),
-                    "name": allowed.name,
-                    "readable": False,
-                    "matched_labels": [n["label"] for n in file_nodes[:8]],
-                    "excerpts": [],
-                    "error": str(exc),
+                    "error": err or "source file not readable or outside allowed roots",
                 }
             )
             continue
@@ -520,8 +685,8 @@ def query_user_graph(
 
         sources_out.append(
             {
-                "path": str(allowed),
-                "name": allowed.name,
+                "path": str(readable_path),
+                "name": readable_path.name if readable_path.suffix.lower() in {".md", ".markdown", ".txt"} else display_name,
                 "readable": True,
                 "matched_labels": [n["label"] for n in file_nodes[:8]],
                 "excerpts": kept,

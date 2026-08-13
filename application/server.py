@@ -15,6 +15,7 @@ from application.api.routes_files import router as files_router
 from application.api.routes_rag import router as rag_router
 from application.api.routes_admin import router as admin_router
 from application.api.routes_graph import router as graph_router
+from application.api.routes_wiki import router as wiki_router
 from application.security_headers import SecurityHeadersMiddleware
 from application.task_store import init_db
 from application.task_store_persistence import (
@@ -94,6 +95,7 @@ app.include_router(files_router)
 app.include_router(rag_router)
 app.include_router(admin_router)
 app.include_router(graph_router)
+app.include_router(wiki_router)
 
 
 @app.get("/api/health")

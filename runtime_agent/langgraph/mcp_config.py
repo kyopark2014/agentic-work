@@ -241,6 +241,21 @@ def load_config(mcp_type):
             }
         }
 
+
+    elif mcp_type == "wiki":
+        return {
+            "mcpServers": {
+                "wiki": {
+                    "command": "python",
+                    "args": [f"{workingDir}/mcp_server_wiki.py"],
+                    "env": {
+                        "PYTHONPATH": workingDir,
+                        # AGENTCORE_USER_ID is injected at runtime in chat.create_agent()
+                    },
+                }
+            }
+        }
+
 def load_selected_config(mcp_servers: dict):
     logger.info(f"mcp_servers: {mcp_servers}")
     
