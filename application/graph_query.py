@@ -61,6 +61,20 @@ _BINARY_SUFFIXES = {
     ".zip",
 }
 
+_KNOWN_SUFFIXES = _TEXT_SUFFIXES | _BINARY_SUFFIXES
+
+
+def _document_stem(path: Path) -> str:
+    """Stem used to find ``converted/{stem}_part*.md``.
+
+    Extraction sometimes stores ``source_file`` as a bare document title
+    (e.g. ``WB_Troubleshooting Manual_KOR_4.4`` without ``.pdf``). ``Path.stem``
+    would treat ``.4`` as a suffix and look for the wrong converted files.
+    """
+    suffix = path.suffix.lower()
+    if suffix in _KNOWN_SUFFIXES:
+        return path.stem
+    return path.name
 
 
 def _load_graph(path: Path):
@@ -177,9 +191,12 @@ def _source_path_candidates(path: Path) -> list[Path]:
         candidates.append(Path("out") / name)
         candidates.append(Path("raw") / name)
         candidates.append(Path("graphify-out") / "converted" / name)
-        if Path(name).suffix.lower() == ".pdf":
-            stem = Path(name).stem
+        stem = _document_stem(path)
+        suffix = path.suffix.lower()
+        if suffix == ".pdf" or suffix not in _KNOWN_SUFFIXES:
             candidates.append(Path("graphify-out") / "converted" / f"{stem}.md")
+            candidates.append(Path("raw") / f"{stem}.pdf")
+            candidates.append(Path(f"{stem}.pdf"))
     # Deduplicate while preserving order
     seen: set[str] = set()
     out: list[Path] = []
@@ -242,7 +259,12 @@ def _converted_markdown_for(
     src: Path, roots: list[Path]
 ) -> list[Path]:
     """Find wiki ``graphify-out/converted/{stem}*.md`` sidecars for a binary source."""
-    stem = src.stem
+    stems = [_document_stem(src)]
+    # Also try Path.stem for real extensions (already covered) and bare title edge cases.
+    if src.stem and src.stem not in stems:
+        stems.append(src.stem)
+    if src.name and src.name not in stems:
+        stems.append(src.name)
     dirs: list[Path] = []
     seen: set[str] = set()
 
@@ -270,20 +292,20 @@ def _converted_markdown_for(
     for d in dirs:
         if not d.is_dir():
             continue
-        exact = d / f"{stem}.md"
-        if exact.is_file():
-            key = str(exact.resolve())
-            if key not in found_keys:
-                found_keys.add(key)
-                found.append(exact)
-        parts = sorted(d.glob(f"{stem}_part*.md"))
-        for p in parts:
-            key = str(p.resolve())
-            if key not in found_keys:
-                found_keys.add(key)
-                found.append(p)
+        for stem in stems:
+            exact = d / f"{stem}.md"
+            if exact.is_file():
+                key = str(exact.resolve())
+                if key not in found_keys:
+                    found_keys.add(key)
+                    found.append(exact)
+            parts = sorted(d.glob(f"{stem}_part*.md"))
+            for p in parts:
+                key = str(p.resolve())
+                if key not in found_keys:
+                    found_keys.add(key)
+                    found.append(p)
     return found
-
 
 def _decode_text(raw: bytes) -> str:
     if len(raw) > _MAX_FILE_BYTES:
