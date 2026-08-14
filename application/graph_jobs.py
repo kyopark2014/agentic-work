@@ -342,8 +342,20 @@ def _run_pipeline(user_id: str, force: bool = False) -> None:
         logger.exception("Graph pipeline failed for user=%s", user_id)
 
 
-def republish_graph_html(user_id: str, *, pattern: str | None = None) -> bool:
-    """Re-render out/graph.html from existing graph.json using the given pattern."""
+def republish_graph_html(
+    user_id: str,
+    *,
+    pattern: str | None = None,
+    sync_runtime: bool = False,
+) -> bool:
+    """Re-render out/graph.html from existing graph.json using the given pattern.
+
+    Pattern switches only change the view HTML; ``graph.json`` is unchanged, so
+    full S3 mirroring is skipped by default (it was making UI switches wait on
+    uploading the whole ``graph/`` tree). Pass ``sync_runtime=True`` only when
+    callers need AgentCore Runtime storage updated; the extract pipeline already
+    mirrors after a successful run.
+    """
     user_id = (user_id or "").strip()
     if not user_id:
         return False
@@ -364,11 +376,12 @@ def republish_graph_html(user_id: str, *, pattern: str | None = None) -> bool:
         logger.info("No graph.json to republish for %s (pattern=%s)", user_id, pid)
         return False
     logger.info("Republished graph HTML for %s pattern=%s → %s", user_id, pid, written)
-    try:
-        utils.sync_user_graph_to_runtime_storage(user_id)
-    except Exception:
-        logger.exception(
-            "Graph→runtime mirror failed for user=%s after republish",
-            user_id,
-        )
+    if sync_runtime:
+        try:
+            utils.sync_user_graph_to_runtime_storage(user_id)
+        except Exception:
+            logger.exception(
+                "Graph→runtime mirror failed for user=%s after republish",
+                user_id,
+            )
     return True
