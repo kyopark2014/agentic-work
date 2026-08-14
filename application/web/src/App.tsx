@@ -14,6 +14,7 @@ import {
   buildOptimisticUserMessage,
   buildPendingAssistantMessage,
   buildRagUploadNotice,
+  buildWikiUploadNotice,
   shouldAppendAssistantMessage,
   stabilizeMessageKeys,
 } from "./services/messageService";
@@ -459,6 +460,14 @@ export default function App() {
     ]);
   }
 
+  async function handleWikiUploadComplete(message: string) {
+    if (!activeTaskId) return;
+    setMessages((prev) => [
+      ...prev,
+      buildWikiUploadNotice(activeTaskId, message),
+    ]);
+  }
+
   async function dispatchSend(
     taskId: string,
     prompt: string,
@@ -656,6 +665,7 @@ export default function App() {
                 onStop={handleStop}
                 onSend={handleSend}
                 onRagUploadComplete={handleRagUploadComplete}
+                onWikiUploadComplete={handleWikiUploadComplete}
               />
             }
           />
