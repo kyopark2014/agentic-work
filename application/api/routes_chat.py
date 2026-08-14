@@ -59,7 +59,9 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
     pending_graph_kick = {"yes": False}
 
     def on_assistant_error(safe_error: str) -> None:
-        task_store.add_message(task_id, "assistant", f"Error: {safe_error}")
+        task_store.add_message(
+            task_id, "assistant", f"Error: {safe_error}", user_id=user_id
+        )
 
     def on_assistant_done(
         final_content: str,
@@ -70,13 +72,14 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
             task_id,
             "assistant",
             final_content,
+            user_id=user_id,
             images=images,
             tool_events=tool_events,
         )
         pending_graph_kick["yes"] = True
 
     def on_flush() -> None:
-        flush_persist()
+        flush_persist(user_id)
         if pending_graph_kick["yes"]:
             pending_graph_kick["yes"] = False
             _kick_graph_job(user_id)

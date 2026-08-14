@@ -125,10 +125,27 @@ def persistent_virtual_key_path() -> str:
 
 
 def working_tasks_db_path() -> str:
+    """Global/legacy DB working path (login_events + migrate source)."""
     custom = (os.environ.get("TASK_DB_WORKING_PATH") or "").strip()
     if custom:
         return custom
     return os.path.join(working_dir(), "tasks.db")
+
+
+def working_user_db_path(user_segment: str) -> str:
+    """Per-user tasks/messages working DB under data/users/{segment}.db."""
+    segment = (user_segment or "").strip()
+    if not segment or "/" in segment or "\\" in segment or ".." in segment:
+        raise ValueError(f"Invalid user DB segment: {user_segment!r}")
+    return os.path.join(working_dir(), "users", f"{segment}.db")
+
+
+def user_db_s3_key(user_segment: str) -> str:
+    """S3 object key for durable per-user DB (mirrors session_storage layout)."""
+    segment = (user_segment or "").strip()
+    if not segment or "/" in segment or "\\" in segment or ".." in segment:
+        raise ValueError(f"Invalid user DB segment: {user_segment!r}")
+    return s3_key(segment, f"{segment}.db")
 
 
 def working_virtual_key_path() -> str:

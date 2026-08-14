@@ -299,7 +299,7 @@ class ChatStreamService:
         chat.user_id = user_id
         chat.update(task["model_name"])
 
-        task_store.add_message(task_id, "user", prompt, images=files)
+        task_store.add_message(task_id, "user", prompt, user_id=user_id, images=files)
 
         message_queue: queue.Queue = queue.Queue()
         result_holder: dict[str, Any] = {"content": "", "images": []}
