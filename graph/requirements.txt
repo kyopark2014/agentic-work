@@ -5,4 +5,5 @@ openai>=1.40.0
 boto3>=1.34.0
 # Wiki / Knowledge PDF → markdown staging (sync_wiki.py)
 pypdf>=4.0.0
-pdfplumber>=0.11.0
+pdfplumber
+pymupdf>=1.24.0

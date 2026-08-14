@@ -1998,7 +1998,7 @@ owner 스코프와 함께 쓰려면 `andAll`로 조합합니다.
 
 ## Wiki
 
-**위키 코퍼스**(`raw` / Sources)를 Sync해 만드는 그래프입니다. 채팅 Knowledge Graph(`.session_storage/{user}/graph/`)와 완전히 분리됩니다. Karpathy의 `/raw` inbox 아이디어를 사용자별 폴더로 구현했으며, 오케스트레이터는 [sync_wiki.py](./application/skills/graphify/scripts/sync_wiki.py), 트리거는 Settings → Wiki → **Sync** (`wiki_jobs.py`)입니다.
+**위키 코퍼스**(`raw` / Sources)를 Sync해 만드는 그래프입니다. 채팅 Knowledge Graph(`.session_storage/{user}/graph/`)와 완전히 분리됩니다. Karpathy의 `/raw` inbox 아이디어를 사용자별 폴더로 구현했으며, 오케스트레이터는 [sync_wiki.py](./graph/sync_wiki.py), 트리거는 Settings → Wiki → **Sync** (`wiki_jobs.py`)입니다.
 
 ### Knowledge Graph와의 차이
 
