@@ -251,7 +251,14 @@ def _looks_binary(raw: bytes) -> bool:
     sample = raw[:4096]
     if b"\x00" in sample:
         return True
-    textish = sum(1 for b in sample if b in (9, 10, 13) or 32 <= b < 127 or b >= 0xC0)
+    # Count ASCII controls/printables and UTF-8 multibyte bytes. Lead bytes are
+    # >= 0xC0, but continuation bytes are 0x80-0xBF — omitting those falsely
+    # marks Korean/CJK markdown as binary (ratio often ~0.65 < 0.75).
+    textish = sum(
+        1
+        for b in sample
+        if b in (9, 10, 13) or 32 <= b < 127 or b >= 0x80
+    )
     return textish < len(sample) * 0.75
 
 
@@ -365,6 +372,11 @@ def _read_readable_source(
             if chunks:
                 return converted[0], "\n\n".join(chunks), None
         return None, "", str(exc)
+
+    # Known text extensions (.md, .txt, …) are always decoded — do not let the
+    # binary heuristic discard corpus markdown with heavy CJK UTF-8.
+    if suffix in _TEXT_SUFFIXES:
+        return allowed, _decode_text(raw), None
 
     if _looks_binary(raw) or suffix in _BINARY_SUFFIXES:
         if converted:
