@@ -665,6 +665,19 @@ function physicsForLiveSettle() {{
 }}
 
 
+
+function safeVisLabel(s) {{
+  // vis-network LabelSplitter builds RegExp from label tokens. Unescaped
+  // "(" in labels like "(INVERTER & SYSTEM MENUS)" throws
+  // "Invalid regular expression: Unterminated group" and breaks layout.
+  return String(s == null ? '' : s)
+    .split('\\n').join(' ')
+    .split('(').join('\\uFF08')
+    .split(')').join('\\uFF09')
+    .split('[').join('\\uFF3B')
+    .split(']').join('\\uFF3D');
+}}
+
 function graphDbg(tag, extra) {{
   try {{
     const el = document.getElementById('mynetwork');
@@ -773,7 +786,7 @@ legend.forEach(item => {{
 const maxDeg = Math.max(...rawNodes.map(n => n.degree || 1), 1);
 const visNodes = rawNodes.map(n => ({{
   id: n.id,
-  label: n.label,
+  label: safeVisLabel(n.label),
   group: n.group,
   size: n.size,
   color: {{
@@ -798,7 +811,7 @@ const visEdges = rawEdges.map((e, i) => ({{
   id: i,
   from: e.from,
   to: e.to,
-  label: e.label,
+  label: safeVisLabel(e.label),
   color: {{
     color: e.color + '99',
     highlight: e.color,
