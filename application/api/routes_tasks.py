@@ -1,9 +1,10 @@
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from application.api.routes_auth import require_user_id
 from application.api.routes_config import _llm_gateway_from_config
 from application import task_store
+from application import utils
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
@@ -41,6 +42,20 @@ def _require_gateway_if_enabling(enabled: bool | None) -> None:
         raise HTTPException(status_code=400, detail=_LLM_GATEWAY_NOT_CONFIGURED)
 
 
+def _resolve_tool_defaults(
+    user_id: str,
+    skills: list[str] | None,
+    mcp_servers: list[str] | None,
+) -> tuple[list[str], list[str]]:
+    """Fill missing skill/MCP from settings.json (else favorite_tools)."""
+    default_skills, default_mcp = utils.get_user_tool_defaults(user_id)
+    resolved_skills = list(skills) if skills is not None else list(default_skills)
+    resolved_mcp = (
+        list(mcp_servers) if mcp_servers is not None else list(default_mcp)
+    )
+    return resolved_skills, resolved_mcp
+
+
 @router.get("")
 def list_tasks(request: Request, limit: int = 100):
     user_id = require_user_id(request)
@@ -51,11 +66,18 @@ def list_tasks(request: Request, limit: int = 100):
 def create_task(body: TaskCreate, request: Request):
     user_id = require_user_id(request)
     _require_gateway_if_enabling(body.llm_gateway_enabled)
+    skills, mcp_servers = _resolve_tool_defaults(
+        user_id, body.skills, body.mcp_servers
+    )
+    # Remember the user's last selection for subsequent new tasks.
+    utils.save_user_tool_defaults(
+        user_id, skills=skills, mcp_servers=mcp_servers
+    )
     task = task_store.create_task(
         user_id,
         model_name=body.model_name,
-        skills=body.skills,
-        mcp_servers=body.mcp_servers,
+        skills=skills,
+        mcp_servers=mcp_servers,
         guardrail_enabled=body.guardrail_enabled,
         memory_enabled=body.memory_enabled,
         llm_gateway_enabled=body.llm_gateway_enabled,
@@ -86,6 +108,12 @@ def patch_task(task_id: str, body: TaskPatch, request: Request):
         user_id,
         **patch,
     )
+    if updated and ("skills" in patch or "mcp_servers" in patch):
+        utils.save_user_tool_defaults(
+            user_id,
+            skills=patch.get("skills"),
+            mcp_servers=patch.get("mcp_servers"),
+        )
     return updated
 
 
