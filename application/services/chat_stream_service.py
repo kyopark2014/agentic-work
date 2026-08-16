@@ -18,8 +18,11 @@ from application.runtime_mode import run_agent
 logger = logging.getLogger("chat_stream_service")
 
 SSE_HEARTBEAT_INTERVAL_SECONDS = 15
-# Long skill runs (docx/pptx + debug loops) routinely exceed 5 minutes.
+# Idle timeout: no agent queue output for this long → treat as stuck.
+# (Previously this was a wall-clock limit from stream start.)
 AGENT_STREAM_TIMEOUT_SECONDS = 1200
+# Absolute safety cap for a single chat turn (4 hours).
+AGENT_STREAM_MAX_SECONDS = 14400
 # After SSE times out / client disconnects, wait this long for the agent
 # worker to finish so the final answer can still be persisted for refresh.
 LATE_PERSIST_WAIT_SECONDS = 1800
@@ -57,9 +60,11 @@ class ChatStreamService:
         *,
         heartbeat_interval: int = SSE_HEARTBEAT_INTERVAL_SECONDS,
         stream_timeout: int = AGENT_STREAM_TIMEOUT_SECONDS,
+        stream_max_seconds: int = AGENT_STREAM_MAX_SECONDS,
     ) -> None:
         self.heartbeat_interval = heartbeat_interval
         self.stream_timeout = stream_timeout
+        self.stream_max_seconds = stream_max_seconds
 
     @staticmethod
     def is_segment_reset(previous: str, new: str) -> bool:
@@ -501,13 +506,22 @@ class ChatStreamService:
         sse_closed_early = False
 
         try:
-            deadline = time.monotonic() + self.stream_timeout
+            started_at = time.monotonic()
+            # Idle deadline resets whenever the agent emits something.
+            deadline = started_at + self.stream_timeout
+            max_deadline = started_at + self.stream_max_seconds
             while True:
-                remaining = deadline - time.monotonic()
+                now = time.monotonic()
+                hard_remaining = max_deadline - now
+                idle_remaining = deadline - now
+                remaining = min(hard_remaining, idle_remaining)
                 if remaining <= 0:
+                    timed_out_idle = idle_remaining <= 0
+                    elapsed = int(now - started_at)
                     logger.warning(
-                        "Agent SSE stream timed out after %ss; scheduling late persist",
-                        self.stream_timeout,
+                        "Agent SSE stream timed out after %ss (%s); scheduling late persist",
+                        elapsed,
+                        "idle" if timed_out_idle else "max",
                     )
                     content, events = self.build_partial_error_payload(
                         tool_events=tool_events,
@@ -548,6 +562,9 @@ class ChatStreamService:
 
                 if item is None:
                     break
+
+                # Progress received — extend idle window.
+                deadline = time.monotonic() + self.stream_timeout
 
                 streamed_text, events_to_emit = self._consume_queue_item(
                     item,
