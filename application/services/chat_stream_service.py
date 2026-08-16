@@ -391,6 +391,31 @@ class ChatStreamService:
         images = result_holder.get("images") or []
         return final_content, images, tool_events
 
+    def build_partial_error_payload(
+        self,
+        *,
+        tool_events: list[dict[str, Any]],
+        streamed_text: str,
+        error_text: str,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Keep streamed progress on timeout/error; append an error notice."""
+        events = list(tool_events)
+        partial = (streamed_text or "").strip()
+        if partial:
+            self.flush_text_segment(events, partial)
+        notice = (
+            error_text if error_text.startswith("Error:") else f"Error: {error_text}"
+        )
+        text_parts = [
+            str(e.get("data") or "").strip()
+            for e in events
+            if e.get("type") == "text" and str(e.get("data") or "").strip()
+        ]
+        body = text_parts[-1] if text_parts else partial
+        content = f"{body}\n\n{notice}".strip() if body else notice
+        events.append({"type": "info", "data": notice})
+        return content, events
+
     def _spawn_late_persist(
         self,
         *,
@@ -484,13 +509,21 @@ class ChatStreamService:
                         "Agent SSE stream timed out after %ss; scheduling late persist",
                         self.stream_timeout,
                     )
-                    on_assistant_error(CLIENT_SAFE_AGENT_TIMEOUT)
-                    yield sse_event({"type": "error", "data": CLIENT_SAFE_AGENT_TIMEOUT})
+                    content, events = self.build_partial_error_payload(
+                        tool_events=tool_events,
+                        streamed_text=streamed_text,
+                        error_text=CLIENT_SAFE_AGENT_TIMEOUT,
+                    )
+                    on_assistant_done(content, [], events)
+                    yield sse_event(
+                        {"type": "error", "data": CLIENT_SAFE_AGENT_TIMEOUT}
+                    )
                     yield sse_event(
                         {
                             "type": "done",
-                            "content": f"Error: {CLIENT_SAFE_AGENT_TIMEOUT}",
+                            "content": content,
                             "images": [],
+                            "tool_events": events,
                         }
                     )
                     sse_closed_early = True
@@ -527,10 +560,21 @@ class ChatStreamService:
 
             if "error" in result_holder:
                 safe_error = result_holder.get("error") or CLIENT_SAFE_AGENT_ERROR
-                error_text = f"Error: {safe_error}"
-                on_assistant_error(safe_error)
+                content, events = self.build_partial_error_payload(
+                    tool_events=tool_events,
+                    streamed_text=streamed_text,
+                    error_text=safe_error,
+                )
+                on_assistant_done(content, [], events)
                 yield sse_event({"type": "error", "data": safe_error})
-                yield sse_event({"type": "done", "content": error_text, "images": []})
+                yield sse_event(
+                    {
+                        "type": "done",
+                        "content": content,
+                        "images": [],
+                        "tool_events": events,
+                    }
+                )
                 return
 
             final_content, images, events = self._build_final_payload(

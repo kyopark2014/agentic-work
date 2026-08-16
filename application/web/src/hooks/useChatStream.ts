@@ -192,11 +192,23 @@ export function useChatStream() {
           } else if (event.type === "error") {
             const msg = event.data ?? "Unknown error";
             uiError("chat:send stream error", msg);
+            flushTextSegment();
+            const notice = msg.startsWith("Error:") ? msg : `Error: ${msg}`;
+            const partial = localEvents
+              .filter((e) => e.type === "text" && e.data)
+              .map((e) => e.data!)
+              .join("\n\n")
+              .trim();
+            const livePartial = (streamTextRefs.current[taskId] ?? "").trim();
+            const body = [partial, livePartial].filter(Boolean).join("\n\n").trim();
+            // Keep streamed timeline; do not wipe prior tool/info events.
             finalMessage = {
-              content:
-                "An error occurred while processing your request. Please try again.",
+              content: body ? `${body}\n\n${notice}` : notice,
               images: [],
-              tool_events: [],
+              tool_events: [
+                ...localEvents,
+                { type: "info", data: notice },
+              ],
             };
           } else if (event.type === "done") {
             uiLog("chat:send done event", {
@@ -204,10 +216,12 @@ export function useChatStream() {
               images: event.images?.length ?? 0,
               toolEvents: event.tool_events?.length ?? 0,
             });
+            const doneEvents = event.tool_events ?? [];
             finalMessage = {
               content: event.content ?? "",
               images: event.images ?? [],
-              tool_events: event.tool_events ?? [],
+              // Prefer server timeline; fall back to local if server sent empty.
+              tool_events: doneEvents.length > 0 ? doneEvents : localEvents,
             };
           }
         }
