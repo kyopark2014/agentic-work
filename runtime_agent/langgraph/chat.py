@@ -2171,7 +2171,7 @@ def append_tool_guidance_to_prompt(system_prompt: str, mcp_servers: list) -> str
         parallel_tools.append("retrieve")
     if len(parallel_tools) >= 2:
         extras.append(
-            f"{', '.join(parallel_tools)}을 이용해 병렬로 조회하세요."
+            f"검색이 필요한 경우에 {', '.join(parallel_tools)}을 이용해 병렬로 조회하세요."
         )
 
     if "aws documentation" in selected:
