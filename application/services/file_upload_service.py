@@ -1,4 +1,4 @@
-"""Chat image upload orchestration: validate filename and upload to S3."""
+"""Chat image / Load-files upload orchestration."""
 
 from __future__ import annotations
 
@@ -13,9 +13,44 @@ logger = logging.getLogger("file_upload_service")
 
 IMAGE_ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 
+# Documents attached via "Load files" (agent reads under /mnt/workspace/.../upload/).
+LOAD_FILE_ALLOWED_EXTENSIONS = {
+    ".pdf",
+    ".txt",
+    ".md",
+    ".markdown",
+    ".csv",
+    ".doc",
+    ".docx",
+    ".ppt",
+    ".pptx",
+    ".xls",
+    ".xlsx",
+    ".html",
+    ".htm",
+    ".json",
+    ".py",
+    ".js",
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".yml",
+    ".yaml",
+    ".xml",
+    ".rst",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".gif",
+}
+
+WORKSPACE_MOUNT_PATH = "/mnt/workspace"
+UPLOAD_SUBDIR = "upload"
+
 
 class FileUploadServiceError(Exception):
-    """Business failure while validating or uploading a chat image."""
+    """Business failure while validating or uploading a chat file."""
 
     def __init__(self, status_code: int, detail: str) -> None:
         self.status_code = status_code
@@ -38,6 +73,27 @@ def sanitize_image_filename(filename: str) -> str:
     stem = os.path.splitext(name)[0] or "pasted"
     unique = uuid.uuid4().hex[:10]
     return f"{stem}_{unique}{ext}"
+
+
+def sanitize_load_filename(filename: str) -> str:
+    """Validate Load-files extension and return a safe basename (overwrite-safe)."""
+    name = os.path.basename(filename or "").strip() or "upload.bin"
+    if name in {".", ".."} or "/" in name or "\\" in name:
+        name = "upload.bin"
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in LOAD_FILE_ALLOWED_EXTENSIONS:
+        raise FileUploadServiceError(
+            400,
+            f"Unsupported file type: {ext or '(none)'}",
+        )
+    return name
+
+
+def workspace_upload_path(user_id: str | None, file_name: str) -> str:
+    """Runtime path mapped from agentcore-sessions/{user}/upload/{file}."""
+    segment = utils.sanitize_user_path_segment(user_id) or "default"
+    safe_name = os.path.basename(file_name)
+    return f"{WORKSPACE_MOUNT_PATH}/{segment}/{UPLOAD_SUBDIR}/{safe_name}"
 
 
 def upload_chat_image(
@@ -81,4 +137,59 @@ def upload_chat_image(
         "s3_key": upload_result["s3_key"],
         "url": upload_result["url"],
         "content_type": upload_result.get("content_type"),
+    }
+
+
+def upload_load_file(
+    file_bytes: bytes,
+    file_name: str,
+    user_id: str | None = None,
+) -> dict[str, Any]:
+    """Upload a Load-files attachment under agentcore-sessions/{user}/upload/.
+
+    AgentCore Runtime mounts that prefix at /mnt/workspace, so the agent receives
+    ``/mnt/workspace/{user}/upload/{file_name}``.
+
+    When ``/mnt/workspace`` is mounted in this process, waits until the object is
+    visible there before returning (S3 Files eventual consistency).
+    """
+    if not file_bytes:
+        raise FileUploadServiceError(400, "Empty file")
+
+    try:
+        upload_result = utils.upload_to_session_upload(
+            file_bytes, file_name, user_id=user_id
+        )
+    except Exception:
+        logger.exception(
+            "Session upload failed for file=%s user=%s", file_name, user_id
+        )
+        raise FileUploadServiceError(500, "Failed to upload file to S3") from None
+    if not upload_result:
+        raise FileUploadServiceError(500, "Failed to upload file to S3")
+
+    workspace_path = workspace_upload_path(user_id, upload_result["file_name"])
+    mount_ready = utils.wait_for_workspace_file(
+        workspace_path,
+        expected_size=len(file_bytes),
+        timeout_sec=90.0,
+        interval_sec=0.5,
+    )
+
+    logger.info(
+        "Load-file upload complete: user=%s file=%s s3_key=%s workspace=%s mount_ready=%s",
+        user_id,
+        file_name,
+        upload_result.get("s3_key"),
+        workspace_path,
+        mount_ready,
+    )
+
+    return {
+        "ok": True,
+        "file_name": upload_result["file_name"],
+        "s3_key": upload_result["s3_key"],
+        "workspace_path": workspace_path,
+        "content_type": upload_result.get("content_type"),
+        "mount_ready": mount_ready,
     }

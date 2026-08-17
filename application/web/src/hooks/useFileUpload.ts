@@ -7,6 +7,12 @@ export interface AttachedImage {
   previewUrl: string;
 }
 
+export interface LoadedFile {
+  path: string;
+  name: string;
+  size: number;
+}
+
 const ERROR_MESSAGE_DISPLAY_DURATION_MS = 5000;
 
 function extensionFromMime(mime: string): string {
@@ -76,6 +82,7 @@ export function useFileUpload({ disabled = false }: UseFileUploadOptions = {}) {
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<AttachedImage[]>([]);
+  const [loadedFiles, setLoadedFiles] = useState<LoadedFile[]>([]);
   const attachmentsRef = useRef<AttachedImage[]>([]);
   const uploadingRef = useRef(false);
 
@@ -136,6 +143,36 @@ export function useFileUpload({ disabled = false }: UseFileUploadOptions = {}) {
     [disabled, uploadImageFile],
   );
 
+  const loadWorkspaceFiles = useCallback(
+    async (files: File[]) => {
+      if (files.length === 0 || disabled || uploadingRef.current) return;
+      setUploading(true);
+      setUploadError(null);
+      try {
+        for (const file of files) {
+          const result = await fileUploadService.loadFile(file);
+          setLoadedFiles((prev) => {
+            const next = prev.filter((item) => item.path !== result.workspace_path);
+            return [
+              ...next,
+              {
+                path: result.workspace_path,
+                name: result.file_name,
+                size: file.size,
+              },
+            ];
+          });
+        }
+      } catch (err) {
+        console.error("Load file failed", err);
+        setUploadError("파일 로드에 실패했습니다. 다시 시도해 주세요.");
+      } finally {
+        setUploading(false);
+      }
+    },
+    [disabled],
+  );
+
   const uploadRagFile = useCallback(
     async (file: File, onComplete?: (message: string) => void) => {
       if (disabled || uploadingRef.current) return;
@@ -188,6 +225,10 @@ export function useFileUpload({ disabled = false }: UseFileUploadOptions = {}) {
     });
   }, []);
 
+  const removeLoadedFile = useCallback((path: string) => {
+    setLoadedFiles((prev) => prev.filter((item) => item.path !== path));
+  }, []);
+
   const clearAttachments = useCallback(() => {
     setAttachments((prev) => {
       for (const item of prev) {
@@ -197,6 +238,7 @@ export function useFileUpload({ disabled = false }: UseFileUploadOptions = {}) {
       }
       return [];
     });
+    setLoadedFiles([]);
   }, []);
 
   const [dragOver, setDragOver] = useState(false);
@@ -248,13 +290,16 @@ export function useFileUpload({ disabled = false }: UseFileUploadOptions = {}) {
     uploading,
     uploadError,
     attachments,
+    loadedFiles,
     dragOver,
     isUploading: () => uploadingRef.current,
     clearUploadError,
     uploadImageFiles,
+    loadWorkspaceFiles,
     uploadRagFile,
     uploadWikiFiles,
     removeAttachment,
+    removeLoadedFile,
     clearAttachments,
     onDragEnter,
     onDragOver,

@@ -67,7 +67,7 @@ __all__ = [
     "normalize_bedrock_message_content",
 ]
 
-AGENTCORE_READ_TIMEOUT_SECONDS = 300
+AGENTCORE_READ_TIMEOUT_SECONDS = 1200  # SSE gaps while agent runs tools / long LLM turns
 AGENTCORE_CONNECT_TIMEOUT_SECONDS = 60
 AGENTCORE_MAX_ATTEMPTS = 3
 DEFAULT_AGENT_TYPE = "langgraph"
@@ -249,7 +249,19 @@ class AgentCoreService:
             logger.info("result: %s", result)
             return result, image_url
 
-        except Exception:
+        except Exception as exc:
+            from botocore.exceptions import ReadTimeoutError
+
+            if isinstance(exc, ReadTimeoutError):
+                logger.exception(
+                    "AgentCore SSE read timed out after %ss (idle gap between stream chunks)",
+                    AGENTCORE_READ_TIMEOUT_SECONDS,
+                )
+                return (
+                    "AgentCore 응답 스트림이 시간 초과되었습니다. "
+                    "작업이 길면 잠시 후 다시 시도하거나, 질문을 나눠 보내 주세요.",
+                    [],
+                )
             logger.exception("Unexpected error while running agent")
             return "An error occurred processing your request", []
 

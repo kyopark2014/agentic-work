@@ -64,3 +64,4 @@ graphifyy
 pypdf
 pdfplumber
 pymupdf
+python-docx

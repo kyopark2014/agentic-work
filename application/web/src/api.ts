@@ -21,6 +21,14 @@ export interface FileUploadResult {
   content_type?: string;
 }
 
+export interface LoadFileResult {
+  ok: boolean;
+  file_name: string;
+  s3_key: string;
+  workspace_path: string;
+  content_type?: string;
+}
+
 export interface LlmGatewayConfig {
   url: string;
   configured: boolean;
@@ -305,6 +313,27 @@ export const api = {
       throw new Error("Upload succeeded but no URL was returned");
     }
     uiLog("file:upload complete", data);
+    return data;
+  },
+  loadFile: async (file: File): Promise<LoadFileResult> => {
+    uiLog("file:load start", { name: file.name, size: file.size, type: file.type });
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch("/api/files/load", {
+      method: "POST",
+      credentials: "include",
+      body: form,
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      uiError("file:load failed", { status: res.status, body: text });
+      throw new Error(text || res.statusText);
+    }
+    const data = (await res.json()) as LoadFileResult;
+    if (!data.workspace_path) {
+      throw new Error("Load succeeded but no workspace path was returned");
+    }
+    uiLog("file:load complete", data);
     return data;
   },
   streamChat: async function* (

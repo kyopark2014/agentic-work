@@ -20,7 +20,12 @@ export function stabilizeMessageKeys(prev: Message[], next: Message[]): Message[
 }
 
 export function buildDisplayPrompt(prompt: string, files: string[]): string {
-  return prompt.trim() || (files.length > 0 ? "첨부한 이미지를 분석해주세요." : "");
+  if (prompt.trim()) return prompt.trim();
+  if (files.length === 0) return "";
+  const onlyWorkspace = files.every((f) => f.startsWith("/mnt/workspace/"));
+  return onlyWorkspace
+    ? "첨부한 파일을 분석해주세요."
+    : "첨부한 이미지를 분석해주세요.";
 }
 
 export function buildOptimisticUserMessage(

@@ -15,6 +15,7 @@ logger = logging.getLogger("routes_chat")
 router = APIRouter(prefix="/api/tasks", tags=["chat"])
 
 DEFAULT_IMAGE_PROMPT = "첨부한 이미지를 분석해주세요."
+DEFAULT_FILE_PROMPT = "첨부한 파일을 분석해주세요."
 
 
 class ChatRequest(BaseModel):
@@ -45,7 +46,12 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
     files = [url.strip() for url in (body.files or []) if url and url.strip()]
     prompt = body.prompt.strip()
     if not prompt and files:
-        prompt = DEFAULT_IMAGE_PROMPT
+        has_workspace = any(f.startswith("/mnt/workspace/") for f in files)
+        has_image_url = any(not f.startswith("/mnt/workspace/") for f in files)
+        if has_workspace and not has_image_url:
+            prompt = DEFAULT_FILE_PROMPT
+        else:
+            prompt = DEFAULT_IMAGE_PROMPT
 
     service = ChatStreamService()
     message_queue, result_holder = service.start_chat_stream(

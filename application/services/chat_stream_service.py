@@ -306,6 +306,13 @@ class ChatStreamService:
 
         task_store.add_message(task_id, "user", prompt, user_id=user_id, images=files)
 
+        logger.info(
+            "chat stream files user=%s files=%s prompt_chars=%s",
+            user_id,
+            len(files),
+            len(prompt),
+        )
+
         message_queue: queue.Queue = queue.Queue()
         result_holder: dict[str, Any] = {"content": "", "images": []}
 

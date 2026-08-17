@@ -22,6 +22,58 @@ function normalizeText(value: string): string {
   return value.trim().replace(/\s+/g, " ");
 }
 
+function isHttpImageRef(ref: string): boolean {
+  return /^https?:\/\//i.test(ref) || ref.startsWith("blob:");
+}
+
+function fileNameFromRef(ref: string): string {
+  const raw = ref.split("?")[0].split("#")[0];
+  const name = raw.split("/").pop();
+  try {
+    return decodeURIComponent(name || ref);
+  } catch {
+    return name || ref;
+  }
+}
+
+function splitAttachmentRefs(refs: string[]): {
+  imageUrls: string[];
+  filePaths: string[];
+} {
+  const imageUrls: string[] = [];
+  const filePaths: string[] = [];
+  for (const ref of refs) {
+    if (isHttpImageRef(ref)) imageUrls.push(ref);
+    else filePaths.push(ref);
+  }
+  return { imageUrls, filePaths };
+}
+
+function AttachmentMedia({ refs }: { refs: string[] }) {
+  const { imageUrls, filePaths } = splitAttachmentRefs(refs);
+  if (imageUrls.length === 0 && filePaths.length === 0) return null;
+  return (
+    <>
+      {filePaths.length > 0 && (
+        <div className="message-loaded-files" aria-label="첨부 파일">
+          {filePaths.map((path) => (
+            <div key={path} className="message-loaded-file" title={path}>
+              <span className="message-loaded-file-name">{fileNameFromRef(path)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      {imageUrls.length > 0 && (
+        <div className="message-images">
+          {imageUrls.map((url) => (
+            <img key={url} src={url} alt="" />
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
 function isStreamingPrefixOfFinal(partial: string, finalText: string): boolean {
   if (!partial || !finalText) return false;
   if (finalText.startsWith(partial) || partial.startsWith(finalText)) return true;
@@ -270,13 +322,7 @@ export function MessageBubble({ role, content, images = [], toolEvents = [] }: P
           ) : (
             <div className="message-bubble">{content}</div>
           ))}
-        {images.length > 0 && (
-          <div className="message-images">
-            {images.map((url) => (
-              <img key={url} src={url} alt="" />
-            ))}
-          </div>
-        )}
+        {images.length > 0 && <AttachmentMedia refs={images} />}
       </div>
     );
   }
@@ -290,26 +336,14 @@ export function MessageBubble({ role, content, images = [], toolEvents = [] }: P
           ))}
         </div>
       )}
-      {role === "user" && images.length > 0 && (
-        <div className="message-images">
-          {images.map((url) => (
-            <img key={url} src={url} alt="" />
-          ))}
-        </div>
-      )}
+      {role === "user" && images.length > 0 && <AttachmentMedia refs={images} />}
       {content.trim() &&
         (role === "assistant" ? (
           <MarkdownBubble content={content} />
         ) : (
           <div className="message-bubble">{content}</div>
         ))}
-      {role !== "user" && images.length > 0 && (
-        <div className="message-images">
-          {images.map((url) => (
-            <img key={url} src={url} alt="" />
-          ))}
-        </div>
-      )}
+      {role !== "user" && images.length > 0 && <AttachmentMedia refs={images} />}
     </div>
   );
 }

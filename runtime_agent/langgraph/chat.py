@@ -1093,10 +1093,336 @@ def _s3_key_from_file_ref(file_ref: str, *, default_prefix: str = s3_image_prefi
     return f"{default_prefix}/{file_name}"
 
 
+def _workspace_ref_to_s3_key(file_ref: str) -> str | None:
+    """Map /mnt/workspace/{user}/upload/x → agentcore-sessions/{user}/upload/x."""
+    path = (file_ref or "").strip()
+    marker = "/mnt/workspace/"
+    if not path.startswith(marker):
+        return None
+    rel = path[len(marker) :].lstrip("/")
+    if not rel or ".." in rel.split("/"):
+        return None
+    return f"agentcore-sessions/{rel}"
+
+
+def _wait_for_workspace_mount_file(
+    path: str,
+    *,
+    timeout_sec: float = 90.0,
+    interval_sec: float = 1.0,
+) -> bool:
+    """Poll until ``path`` appears under /mnt/workspace (S3 Files lag)."""
+    import time
+
+    if not path.startswith("/mnt/workspace/"):
+        return False
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    while True:
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+            logger.info(f"workspace mount file ready: {path}")
+            return True
+        if time.monotonic() >= deadline:
+            logger.warning(
+                f"workspace mount file not visible after {timeout_sec:.0f}s: {path}"
+            )
+            return False
+        time.sleep(max(0.1, interval_sec))
+
+
+def _load_workspace_file_bytes(file_ref: str) -> tuple[bytes | None, str]:
+    """Load Load-files bytes from /mnt/workspace, waiting for mount if needed.
+
+    Falls back to S3 API only if the mount never shows the file.
+    """
+    path = (file_ref or "").strip()
+    if path.startswith("/mnt/workspace/") and os.path.isfile(path):
+        with open(path, "rb") as f:
+            data = f.read()
+        logger.info(f"loaded workspace file from mount ({len(data)} bytes): {path}")
+        return data, path
+
+    if path.startswith("/mnt/workspace/"):
+        logger.info(f"waiting for workspace mount file: {path}")
+        if _wait_for_workspace_mount_file(path, timeout_sec=90.0, interval_sec=1.0):
+            with open(path, "rb") as f:
+                data = f.read()
+            logger.info(
+                f"loaded workspace file after wait ({len(data)} bytes): {path}"
+            )
+            return data, path
+
+    s3_key = _workspace_ref_to_s3_key(path)
+    if not s3_key or not s3_bucket:
+        logger.warning(
+            "workspace file unavailable on mount and no S3 key/bucket: path=%s key=%s",
+            path,
+            s3_key,
+        )
+        return None, path
+
+    try:
+        s3_client = boto3.client(service_name="s3", region_name=bedrock_region)
+        logger.info(f"loading workspace file from s3://{s3_bucket}/{s3_key}")
+        obj = s3_client.get_object(Bucket=s3_bucket, Key=s3_key)
+        data = obj["Body"].read()
+        logger.info(f"loaded workspace file from S3 ({len(data)} bytes): {s3_key}")
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(data)
+        except Exception as cache_err:
+            logger.warning(f"could not cache S3 file onto mount {path}: {cache_err}")
+        return data, f"s3://{s3_bucket}/{s3_key}"
+    except Exception:
+        logger.error(
+            "Failed to load workspace file from S3 key=%s: %s",
+            s3_key,
+            traceback.format_exc(),
+        )
+        return None, path
+
+
+def _extract_text_from_docx_bytes(data: bytes) -> str:
+    try:
+        import docx
+
+        document = docx.Document(BytesIO(data))
+        parts: list[str] = []
+        for p in document.paragraphs:
+            if p.text and p.text.strip():
+                parts.append(p.text)
+        for table in document.tables:
+            for row in table.rows:
+                cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
+                if cells:
+                    parts.append(" | ".join(cells))
+        text = "\n".join(parts).strip()
+        if text:
+            return text
+    except Exception as e:
+        logger.warning(f"python-docx extract failed, trying zip/xml: {e}")
+
+    import zipfile
+    from xml.etree import ElementTree as ET
+
+    with zipfile.ZipFile(BytesIO(data)) as zf:
+        xml_bytes = zf.read("word/document.xml")
+    root = ET.fromstring(xml_bytes)
+    paragraphs: list[str] = []
+    for node in root.iter():
+        if node.tag.endswith("}p") or node.tag == "p":
+            runs = [
+                (t.text or "")
+                for t in node.iter()
+                if (t.tag.endswith("}t") or t.tag == "t") and t.text
+            ]
+            line = "".join(runs).strip()
+            if line:
+                paragraphs.append(line)
+    if paragraphs:
+        return "\n".join(paragraphs)
+    texts = [
+        (node.text or "")
+        for node in root.iter()
+        if node.tag.endswith("}t") or node.tag == "t"
+    ]
+    return "\n".join(t for t in texts if t).strip()
+
+
+def _extract_text_from_legacy_doc_bytes(data: bytes) -> str:
+    """Best-effort extraction for Word 97-2003 (.doc)."""
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        doc_path = os.path.join(tmp, "input.doc")
+        with open(doc_path, "wb") as f:
+            f.write(data)
+
+        for cmd in (
+            ["antiword", doc_path],
+            ["catdoc", "-w", doc_path],
+        ):
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
+                text = (result.stdout or "").strip()
+                if result.returncode == 0 and text:
+                    return text
+            except FileNotFoundError:
+                continue
+            except Exception as e:
+                logger.warning("legacy .doc extractor %s failed: %s", cmd[0], e)
+
+        # LibreOffice → txt
+        try:
+            result = subprocess.run(
+                [
+                    "soffice",
+                    "--headless",
+                    "--convert-to",
+                    "txt:Text",
+                    "--outdir",
+                    tmp,
+                    doc_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            txt_path = os.path.join(tmp, "input.txt")
+            if os.path.isfile(txt_path):
+                with open(txt_path, "r", encoding="utf-8", errors="replace") as f:
+                    text = f.read().strip()
+                if text:
+                    return text
+            if result.returncode != 0:
+                logger.warning(
+                    "soffice .doc convert failed: %s",
+                    (result.stderr or result.stdout or "")[:500],
+                )
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning("soffice .doc convert failed: %s", e)
+
+    # Last resort: pull printable / UTF-16LE runs from the OLE binary.
+    try:
+        import re
+
+        texts: list[str] = []
+        for offset in (0, 1):
+            for match in re.finditer(rb"(?:[\x20-\x7e]\x00){6,}", data[offset:]):
+                try:
+                    chunk = match.group().decode("utf-16le", errors="ignore").strip()
+                except Exception:
+                    continue
+                if len(chunk) >= 6 and chunk not in texts:
+                    texts.append(chunk)
+        ascii_runs = re.findall(rb"[\x20-\x7e]{8,}", data)
+        for raw in ascii_runs:
+            chunk = raw.decode("ascii", errors="ignore").strip()
+            if len(chunk) >= 8 and chunk not in texts:
+                texts.append(chunk)
+        joined = "\n".join(texts).strip()
+        if len(joined) >= 40:
+            return joined
+    except Exception as e:
+        logger.warning("legacy .doc binary string extract failed: %s", e)
+
+    return ""
+
+
+def _extract_text_from_pdf_bytes(data: bytes) -> str:
+    try:
+        import pdfplumber
+
+        parts: list[str] = []
+        with pdfplumber.open(BytesIO(data)) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text() or ""
+                if text.strip():
+                    parts.append(text)
+        text = "\n\n".join(parts).strip()
+        if text:
+            return text
+    except Exception as e:
+        logger.warning("pdfplumber bytes extract failed (%s); trying pypdf", e)
+
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(BytesIO(data))
+        parts = [(page.extract_text() or "") for page in reader.pages]
+        return "\n\n".join(parts).strip()
+    except Exception as e:
+        raise RuntimeError(f"PDF 텍스트 추출 실패: {e}") from e
+
+
+def _extract_text_from_document_bytes(data: bytes, file_type: str) -> str:
+    """Best-effort text extraction for Load-files (bytes from mount or S3)."""
+    if file_type in (
+        "txt",
+        "md",
+        "markdown",
+        "csv",
+        "json",
+        "py",
+        "js",
+        "ts",
+        "tsx",
+        "jsx",
+        "html",
+        "htm",
+        "yml",
+        "yaml",
+        "xml",
+        "rst",
+    ):
+        return data.decode("utf-8", errors="replace")
+
+    if file_type == "pdf":
+        return _extract_text_from_pdf_bytes(data)
+
+    if file_type == "docx":
+        return _extract_text_from_docx_bytes(data)
+
+    if file_type == "doc":
+        return _extract_text_from_legacy_doc_bytes(data)
+
+    if file_type == "pptx":
+        try:
+            from pptx import Presentation
+
+            prs = Presentation(BytesIO(data))
+            parts: list[str] = []
+            for slide in prs.slides:
+                for shape in slide.shapes:
+                    text = getattr(shape, "text", None)
+                    if text and str(text).strip():
+                        parts.append(str(text).strip())
+            return "\n".join(parts).strip()
+        except Exception as e:
+            raise RuntimeError(f"PPTX 텍스트 추출 실패: {e}") from e
+
+    if file_type in ("xlsx", "xls"):
+        try:
+            import openpyxl
+
+            wb = openpyxl.load_workbook(BytesIO(data), read_only=True, data_only=True)
+            rows: list[str] = []
+            for sheet in wb.worksheets:
+                rows.append(f"# Sheet: {sheet.title}")
+                for row in sheet.iter_rows(values_only=True):
+                    vals = ["" if v is None else str(v) for v in row]
+                    if any(v.strip() for v in vals):
+                        rows.append("\t".join(vals))
+            return "\n".join(rows).strip()
+        except Exception as e:
+            raise RuntimeError(f"Excel 텍스트 추출 실패: {e}") from e
+
+    return ""
+
+
+def _extract_text_from_local_document(file_path: str, file_type: str) -> str:
+    """Best-effort text extraction for Load-files under /mnt/workspace."""
+    with open(file_path, "rb") as f:
+        data = f.read()
+    return _extract_text_from_document_bytes(data, file_type)
+
+
 def get_summary_of_uploaded_file(file_ref: str, prompt: str = "") -> str:
-    """Analyze an uploaded file (by URL or name) and return a text summary.
+    """Analyze an uploaded file (by URL, workspace path, or name) and return a text summary.
 
     Images are loaded from S3 under images/{user_id}/ and summarized with vision.
+    Load-files paths under /mnt/workspace/{user}/upload/ are read from the
+    session-storage mount, with an S3 API fallback when the mount lags.
     """
     file_name = _file_name_from_ref(file_ref)
     if not file_name:
@@ -1104,6 +1430,44 @@ def get_summary_of_uploaded_file(file_ref: str, prompt: str = "") -> str:
 
     file_type = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
     logger.info(f"get_summary_of_uploaded_file: file_name={file_name}, file_type={file_type}")
+
+    # Load-files: agentcore-sessions → /mnt/workspace/{user}/upload/{name}
+    local_path = (file_ref or "").strip()
+    if local_path.startswith("/mnt/workspace/"):
+        data, source = _load_workspace_file_bytes(local_path)
+        if data is None:
+            return (
+                f"파일 경로: {local_path}\n"
+                "파일을 마운트/S3에서 읽지 못했습니다. "
+                f"read_file 또는 bash로 `{local_path}` 를 직접 읽어 분석하세요."
+            )
+
+        if file_type in ("png", "jpeg", "jpg", "webp", "gif"):
+            image_summary_prompt = (
+                "사용자의 요청을 참조하여 이미지의 내용을 분석한 후에 markdown 포맷으로 자세히 설명해주세요. "
+                f"사용자 요청: <user_request>{prompt}</user_request>"
+            )
+            return summarize_image(data, image_summary_prompt)
+
+        try:
+            extracted = _extract_text_from_document_bytes(data, file_type)
+        except Exception as e:
+            logger.error(f"Failed to extract text from {local_path} ({source}): {e}")
+            return (
+                f"파일 경로: {local_path}\n"
+                f"텍스트 추출에 실패했습니다 ({e}). "
+                f"read_file / bash로 `{local_path}` 를 직접 읽어 분석하세요."
+            )
+        if not extracted:
+            return (
+                f"파일 경로: {local_path}\n"
+                f"파일 형식(.{file_type})에서 텍스트를 추출하지 못했습니다. "
+                f"read_file / bash로 `{local_path}` 를 직접 읽어 분석하세요."
+            )
+        max_chars = 100000
+        if len(extracted) > max_chars:
+            extracted = extracted[:max_chars] + "\n\n…(이하 생략)"
+        return f"파일 경로: {local_path}\n\n{extracted}"
 
     if file_type in ("png", "jpeg", "jpg", "webp", "gif"):
         s3_client = boto3.client(

@@ -1406,6 +1406,112 @@ def upload_to_s3(
         return None
 
 
+def upload_to_session_upload(
+    file_bytes: bytes,
+    file_name: str,
+    user_id: str | None = None,
+) -> dict | None:
+    """Upload a chat Load-files attachment under agentcore-sessions/{user}/upload/.
+
+    AgentCore Runtime mounts ``agentcore-sessions/`` at ``/mnt/workspace``, so the
+    object is visible to the agent as
+    ``/mnt/workspace/{user}/upload/{file_name}``.
+    """
+    if not s3_bucket:
+        logger.error("s3_bucket is not configured")
+        return None
+
+    segment = _sanitize_s3_user_segment(user_id) or "default"
+    safe_name = os.path.basename(file_name or "").strip() or "upload.bin"
+    s3_key = f"{S3_FILES_SESSION_PREFIX}/{segment}/upload/{safe_name}"
+    content_type = get_contents_type(safe_name)
+
+    try:
+        with _without_env_proxies():
+            s3_client = boto3.client(service_name="s3", region_name=bedrock_region)
+            put_params: dict = {
+                "Bucket": s3_bucket,
+                "Key": s3_key,
+                "Body": file_bytes,
+                "Metadata": {"content_type": content_type},
+            }
+            if content_type != "no info":
+                put_params["ContentType"] = content_type
+            if content_type == "application/pdf":
+                put_params["ContentDisposition"] = "inline"
+            response = s3_client.put_object(**put_params)
+            logger.info(
+                "session upload response user=%s key=%s: %s",
+                segment,
+                s3_key,
+                response,
+            )
+
+        return {
+            "file_name": safe_name,
+            "s3_key": s3_key,
+            "content_type": content_type,
+        }
+    except Exception:
+        logger.error("Error uploading to session storage: %s", traceback.format_exc())
+        return None
+
+
+def wait_for_workspace_file(
+    workspace_path: str,
+    *,
+    expected_size: int | None = None,
+    timeout_sec: float = 90.0,
+    interval_sec: float = 0.5,
+) -> bool:
+    """Poll until ``workspace_path`` is visible on the S3 Files mount.
+
+    Returns True when the file exists (and optionally matches ``expected_size``).
+    If ``/mnt/workspace`` is not mounted in this process, returns False immediately
+    after a debug log — the AgentCore Runtime mount will still catch up later.
+    """
+    import time
+
+    path = (workspace_path or "").strip()
+    if not path:
+        return False
+
+    if not os.path.isdir("/mnt/workspace"):
+        logger.info(
+            "skip workspace wait: /mnt/workspace not mounted here (path=%s)",
+            path,
+        )
+        return False
+
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    last_size: int | None = None
+    while True:
+        try:
+            if os.path.isfile(path):
+                size = os.path.getsize(path)
+                last_size = size
+                if expected_size is None or size == expected_size:
+                    logger.info(
+                        "workspace file ready: %s (%s bytes)",
+                        path,
+                        size,
+                    )
+                    return True
+        except OSError:
+            pass
+
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "workspace file not visible after %.1fs: %s (last_size=%s expected=%s)",
+                timeout_sec,
+                path,
+                last_size,
+                expected_size,
+            )
+            return False
+        time.sleep(max(0.05, interval_sec))
+
+
 ACTIVE_INGESTION_STATUSES = ("STARTING", "IN_PROGRESS")
 
 
