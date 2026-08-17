@@ -4070,8 +4070,58 @@ def ensure_data_source(
     return data_source_id
 
 
-def create_vector_index_in_opensearch(collection_endpoint: str, index_name: str) -> bool:
-    """Create vector index in OpenSearch Serverless collection."""
+def _bedrock_kb_opensearch_index_body() -> Dict[str, Any]:
+    """Index body for Bedrock KB on OpenSearch Serverless.
+
+    Filterable sidecar metadata must be mapped explicitly. Otherwise AOSS may
+    infer ``created_time`` as ``date`` from an earlier ISO-string ingest, and
+    later Unix-epoch NUMBER values fail ingestion.
+    """
+    return {
+        "settings": {
+            "index": {
+                "knn": True,
+                "knn.algo_param.ef_search": 512,
+            }
+        },
+        "mappings": {
+            "properties": {
+                "vector_field": {
+                    "type": "knn_vector",
+                    "dimension": embedding_dimensions,
+                    "method": {
+                        "name": "hnsw",
+                        "space_type": "cosinesimil",
+                        "engine": "faiss",
+                        "parameters": {
+                            "ef_construction": 512,
+                            "m": 16,
+                        },
+                    },
+                },
+                "AMAZON_BEDROCK_TEXT": {"type": "text"},
+                "AMAZON_BEDROCK_METADATA": {"type": "text"},
+                # RAG sidecar metadata (rag_service.build_kb_metadata_document)
+                "owner": {"type": "keyword"},
+                "team": {"type": "keyword"},
+                "created_time": {"type": "long"},
+                "is_confidential": {"type": "boolean"},
+            }
+        },
+    }
+
+
+def create_vector_index_in_opensearch(
+    collection_endpoint: str,
+    index_name: str,
+    *,
+    force_recreate: bool = False,
+) -> bool:
+    """Create vector index in OpenSearch Serverless collection.
+
+    When ``force_recreate`` is True, delete an existing index first so mapping
+    changes (e.g. ``created_time`` date → long) can take effect.
+    """
     try:
         if not collection_endpoint or not collection_endpoint.strip():
             logger.error(
@@ -4108,12 +4158,13 @@ def create_vector_index_in_opensearch(collection_endpoint: str, index_name: str)
             session_token=credentials.token,
         )
 
-        url = f"{collection_endpoint}/{index_name}"
+        url = f"{collection_endpoint.rstrip('/')}/{index_name}"
+        index_exists = False
         for attempt in range(6):
             response = requests.get(url, auth=awsauth, timeout=30)
             if response.status_code == 200:
-                logger.debug(f"Vector index '{index_name}' already exists")
-                return True
+                index_exists = True
+                break
             if response.status_code in (401, 403) and attempt < 5:
                 wait_seconds = 10 * (attempt + 1)
                 logger.info(
@@ -4135,34 +4186,26 @@ def create_vector_index_in_opensearch(collection_endpoint: str, index_name: str)
                 return False
             break
 
-        index_mapping = {
-            "settings": {
-                "index": {
-                    "knn": True,
-                    "knn.algo_param.ef_search": 512,
-                }
-            },
-            "mappings": {
-                "properties": {
-                    "vector_field": {
-                        "type": "knn_vector",
-                        "dimension": embedding_dimensions,
-                        "method": {
-                            "name": "hnsw",
-                            "space_type": "cosinesimil",
-                            "engine": "faiss",
-                            "parameters": {
-                                "ef_construction": 512,
-                                "m": 16,
-                            },
-                        },
-                    },
-                    "AMAZON_BEDROCK_TEXT": {"type": "text"},
-                    "AMAZON_BEDROCK_METADATA": {"type": "text"},
-                }
-            },
-        }
+        if index_exists and not force_recreate:
+            logger.debug(f"Vector index '{index_name}' already exists")
+            return True
 
+        if index_exists and force_recreate:
+            logger.warning(
+                f"  Deleting existing OpenSearch index '{index_name}' for remapping..."
+            )
+            delete_response = requests.delete(url, auth=awsauth, timeout=60)
+            if delete_response.status_code not in (200, 404):
+                logger.error(
+                    f"  Failed to delete index '{index_name}': "
+                    f"{delete_response.status_code} - {delete_response.text}"
+                )
+                return False
+            logger.info(f"  ✓ Deleted OpenSearch index '{index_name}'")
+            # AOSS needs a short pause before the same index name can be recreated.
+            time.sleep(15)
+
+        index_mapping = _bedrock_kb_opensearch_index_body()
         headers = {"Content-Type": "application/json"}
         response = requests.put(
             url,
