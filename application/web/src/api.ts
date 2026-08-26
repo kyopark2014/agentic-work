@@ -27,6 +27,18 @@ export interface LoadFileResult {
   s3_key: string;
   workspace_path: string;
   content_type?: string;
+  mount_ready?: boolean;
+}
+
+export interface LoadFilePresignResult {
+  ok: boolean;
+  file_name: string;
+  s3_key: string;
+  workspace_path: string;
+  content_type?: string;
+  upload_url: string;
+  headers: Record<string, string>;
+  expires_in?: number;
 }
 
 export interface LlmGatewayConfig {
@@ -316,20 +328,49 @@ export const api = {
     return data;
   },
   loadFile: async (file: File): Promise<LoadFileResult> => {
+    // Presigned PUT: browser → S3 directly (avoids ECS/ALB ~80MB body limits).
     uiLog("file:load start", { name: file.name, size: file.size, type: file.type });
-    const form = new FormData();
-    form.append("file", file);
-    const res = await fetch("/api/files/load", {
+
+    const presign = await request<LoadFilePresignResult>("/api/files/load/presign", {
       method: "POST",
-      credentials: "include",
-      body: form,
+      body: JSON.stringify({
+        file_name: file.name,
+        size: file.size,
+        content_type: file.type || undefined,
+      }),
     });
-    if (!res.ok) {
-      const text = await res.text();
-      uiError("file:load failed", { status: res.status, body: text });
-      throw new Error(text || res.statusText);
+    if (!presign.upload_url || !presign.s3_key) {
+      throw new Error("Presign succeeded but no upload URL was returned");
     }
-    const data = (await res.json()) as LoadFileResult;
+
+    uiLog("file:load put start", {
+      name: presign.file_name,
+      s3_key: presign.s3_key,
+      size: file.size,
+    });
+    const putHeaders = new Headers(presign.headers || {});
+    if (!putHeaders.has("Content-Type")) {
+      putHeaders.set("Content-Type", presign.content_type || "application/octet-stream");
+    }
+    const putRes = await fetch(presign.upload_url, {
+      method: "PUT",
+      body: file,
+      headers: putHeaders,
+    });
+    if (!putRes.ok) {
+      const text = await putRes.text();
+      uiError("file:load put failed", { status: putRes.status, body: text });
+      throw new Error(text || putRes.statusText || "Direct S3 upload failed");
+    }
+
+    const data = await request<LoadFileResult>("/api/files/load/complete", {
+      method: "POST",
+      body: JSON.stringify({
+        file_name: presign.file_name,
+        s3_key: presign.s3_key,
+        size: file.size,
+      }),
+    });
     if (!data.workspace_path) {
       throw new Error("Load succeeded but no workspace path was returned");
     }

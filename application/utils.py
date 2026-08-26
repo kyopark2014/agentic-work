@@ -1406,6 +1406,21 @@ def upload_to_s3(
         return None
 
 
+def session_upload_s3_key(file_name: str, user_id: str | None = None) -> str:
+    """Build ``agentcore-sessions/{user}/upload/{file}`` object key."""
+    segment = _sanitize_s3_user_segment(user_id) or "default"
+    safe_name = os.path.basename(file_name or "").strip() or "upload.bin"
+    return f"{S3_FILES_SESSION_PREFIX}/{segment}/upload/{safe_name}"
+
+
+def _session_upload_content_type(file_name: str) -> str:
+    """Content-Type for session uploads; never returns ``no info``."""
+    content_type = get_contents_type(file_name)
+    if content_type == "no info":
+        return "application/octet-stream"
+    return content_type
+
+
 def upload_to_session_upload(
     file_bytes: bytes,
     file_name: str,
@@ -1421,10 +1436,9 @@ def upload_to_session_upload(
         logger.error("s3_bucket is not configured")
         return None
 
-    segment = _sanitize_s3_user_segment(user_id) or "default"
     safe_name = os.path.basename(file_name or "").strip() or "upload.bin"
-    s3_key = f"{S3_FILES_SESSION_PREFIX}/{segment}/upload/{safe_name}"
-    content_type = get_contents_type(safe_name)
+    s3_key = session_upload_s3_key(safe_name, user_id=user_id)
+    content_type = _session_upload_content_type(safe_name)
 
     try:
         with _without_env_proxies():
@@ -1434,15 +1448,14 @@ def upload_to_session_upload(
                 "Key": s3_key,
                 "Body": file_bytes,
                 "Metadata": {"content_type": content_type},
+                "ContentType": content_type,
             }
-            if content_type != "no info":
-                put_params["ContentType"] = content_type
             if content_type == "application/pdf":
                 put_params["ContentDisposition"] = "inline"
             response = s3_client.put_object(**put_params)
             logger.info(
                 "session upload response user=%s key=%s: %s",
-                segment,
+                _sanitize_s3_user_segment(user_id) or "default",
                 s3_key,
                 response,
             )
@@ -1454,6 +1467,75 @@ def upload_to_session_upload(
         }
     except Exception:
         logger.error("Error uploading to session storage: %s", traceback.format_exc())
+        return None
+
+
+def generate_session_upload_presigned_put(
+    file_name: str,
+    user_id: str | None = None,
+    *,
+    expires_in: int = 900,
+) -> dict | None:
+    """Return a browser-usable presigned PUT URL for Load-files uploads.
+
+    The client must PUT the raw body with the returned ``headers`` (especially
+    ``Content-Type``) so the signature matches.
+    """
+    if not s3_bucket:
+        logger.error("s3_bucket is not configured")
+        return None
+
+    safe_name = os.path.basename(file_name or "").strip() or "upload.bin"
+    s3_key = session_upload_s3_key(safe_name, user_id=user_id)
+    content_type = _session_upload_content_type(safe_name)
+    headers = {"Content-Type": content_type}
+    params: dict = {
+        "Bucket": s3_bucket,
+        "Key": s3_key,
+        "ContentType": content_type,
+    }
+    if content_type == "application/pdf":
+        params["ContentDisposition"] = "inline"
+        headers["Content-Disposition"] = "inline"
+
+    try:
+        with _without_env_proxies():
+            s3_client = boto3.client(service_name="s3", region_name=bedrock_region)
+            upload_url = s3_client.generate_presigned_url(
+                ClientMethod="put_object",
+                Params=params,
+                ExpiresIn=max(60, int(expires_in)),
+                HttpMethod="PUT",
+            )
+        return {
+            "file_name": safe_name,
+            "s3_key": s3_key,
+            "content_type": content_type,
+            "upload_url": upload_url,
+            "headers": headers,
+            "expires_in": max(60, int(expires_in)),
+        }
+    except Exception:
+        logger.error(
+            "Error generating session upload presign: %s", traceback.format_exc()
+        )
+        return None
+
+
+def head_session_upload_object(s3_key: str) -> dict | None:
+    """HEAD an object; return ``{content_length, content_type}`` or None."""
+    if not s3_bucket or not s3_key:
+        return None
+    try:
+        with _without_env_proxies():
+            s3_client = boto3.client(service_name="s3", region_name=bedrock_region)
+            response = s3_client.head_object(Bucket=s3_bucket, Key=s3_key)
+        return {
+            "content_length": int(response.get("ContentLength") or 0),
+            "content_type": response.get("ContentType"),
+        }
+    except Exception:
+        logger.error("Error head_object key=%s: %s", s3_key, traceback.format_exc())
         return None
 
 

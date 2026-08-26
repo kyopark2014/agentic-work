@@ -140,6 +140,125 @@ def upload_chat_image(
     }
 
 
+# Single PUT max object size on S3 is 5 GiB; keep a hard cap for safety.
+MAX_LOAD_FILE_BYTES = 5 * 1024 * 1024 * 1024
+
+
+def _assert_load_file_size(size: int | None) -> None:
+    if size is None:
+        return
+    if size < 0:
+        raise FileUploadServiceError(400, "Invalid file size")
+    if size == 0:
+        raise FileUploadServiceError(400, "Empty file")
+    if size > MAX_LOAD_FILE_BYTES:
+        raise FileUploadServiceError(400, "File exceeds the 5 GiB upload limit")
+
+
+def _expected_session_upload_key(user_id: str | None, file_name: str) -> str:
+    return utils.session_upload_s3_key(file_name, user_id=user_id)
+
+
+def create_load_file_presign(
+    file_name: str,
+    user_id: str | None = None,
+    *,
+    size: int | None = None,
+) -> dict[str, Any]:
+    """Issue a short-lived S3 PUT URL for a Load-files attachment.
+
+    The browser uploads directly to S3 (bypassing ECS/ALB body limits).
+    """
+    safe_name = sanitize_load_filename(file_name)
+    _assert_load_file_size(size)
+
+    try:
+        presign = utils.generate_session_upload_presigned_put(
+            safe_name, user_id=user_id
+        )
+    except Exception:
+        logger.exception(
+            "Presign failed for file=%s user=%s", safe_name, user_id
+        )
+        raise FileUploadServiceError(500, "Failed to create upload URL") from None
+    if not presign or not presign.get("upload_url"):
+        raise FileUploadServiceError(500, "Failed to create upload URL")
+
+    workspace_path = workspace_upload_path(user_id, safe_name)
+    logger.info(
+        "Load-file presign: user=%s file=%s s3_key=%s size=%s",
+        user_id,
+        safe_name,
+        presign.get("s3_key"),
+        size,
+    )
+    return {
+        "ok": True,
+        "file_name": safe_name,
+        "s3_key": presign["s3_key"],
+        "workspace_path": workspace_path,
+        "content_type": presign.get("content_type"),
+        "upload_url": presign["upload_url"],
+        "headers": presign.get("headers") or {},
+        "expires_in": presign.get("expires_in"),
+    }
+
+
+def complete_load_file_upload(
+    file_name: str,
+    s3_key: str,
+    user_id: str | None = None,
+    *,
+    size: int | None = None,
+) -> dict[str, Any]:
+    """Verify a browser PUT landed in the user's upload prefix and wait for mount."""
+    safe_name = sanitize_load_filename(file_name)
+    _assert_load_file_size(size)
+
+    expected_key = _expected_session_upload_key(user_id, safe_name)
+    key = (s3_key or "").strip()
+    if key != expected_key:
+        raise FileUploadServiceError(400, "Invalid upload target")
+
+    head = utils.head_session_upload_object(key)
+    if not head:
+        raise FileUploadServiceError(404, "Uploaded object not found")
+    content_length = int(head.get("content_length") or 0)
+    if content_length <= 0:
+        raise FileUploadServiceError(400, "Empty file")
+    if size is not None and content_length != size:
+        raise FileUploadServiceError(
+            400,
+            f"Uploaded size mismatch (expected {size}, got {content_length})",
+        )
+
+    workspace_path = workspace_upload_path(user_id, safe_name)
+    mount_ready = utils.wait_for_workspace_file(
+        workspace_path,
+        expected_size=content_length,
+        timeout_sec=90.0,
+        interval_sec=0.5,
+    )
+
+    logger.info(
+        "Load-file upload complete: user=%s file=%s s3_key=%s workspace=%s mount_ready=%s",
+        user_id,
+        safe_name,
+        key,
+        workspace_path,
+        mount_ready,
+    )
+
+    return {
+        "ok": True,
+        "file_name": safe_name,
+        "s3_key": key,
+        "workspace_path": workspace_path,
+        "content_type": head.get("content_type"),
+        "mount_ready": mount_ready,
+    }
+
+
 def upload_load_file(
     file_bytes: bytes,
     file_name: str,
@@ -152,9 +271,13 @@ def upload_load_file(
 
     When ``/mnt/workspace`` is mounted in this process, waits until the object is
     visible there before returning (S3 Files eventual consistency).
+
+    Prefer :func:`create_load_file_presign` + browser PUT for large files so the
+    request body does not traverse ECS/ALB.
     """
     if not file_bytes:
         raise FileUploadServiceError(400, "Empty file")
+    _assert_load_file_size(len(file_bytes))
 
     try:
         upload_result = utils.upload_to_session_upload(
