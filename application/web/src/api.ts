@@ -279,11 +279,16 @@ export const api = {
     request<{ ok: boolean }>(`/api/tasks/${id}`, { method: "DELETE" }),
   getMessages: (id: string) =>
     request<{ messages: Message[] }>(`/api/tasks/${id}/messages`),
-  uploadToRag: async (file: File): Promise<RagUploadResult> => {
-    uiLog("rag:upload start", { name: file.name, size: file.size });
+  uploadToRag: async (
+    file: File,
+    options?: { sync?: boolean },
+  ): Promise<RagUploadResult> => {
+    const sync = options?.sync !== false;
+    uiLog("rag:upload start", { name: file.name, size: file.size, sync });
     const form = new FormData();
     form.append("file", file);
-    const res = await fetch("/api/rag/upload", {
+    const qs = sync ? "" : "?sync=false";
+    const res = await fetch(`/api/rag/upload${qs}`, {
       method: "POST",
       credentials: "include",
       body: form,
@@ -347,20 +352,45 @@ export const api = {
       name: presign.file_name,
       s3_key: presign.s3_key,
       size: file.size,
+      host: (() => {
+        try {
+          return new URL(presign.upload_url).host;
+        } catch {
+          return "";
+        }
+      })(),
     });
     const putHeaders = new Headers(presign.headers || {});
     if (!putHeaders.has("Content-Type")) {
       putHeaders.set("Content-Type", presign.content_type || "application/octet-stream");
     }
-    const putRes = await fetch(presign.upload_url, {
-      method: "PUT",
-      body: file,
-      headers: putHeaders,
-    });
+    let putRes: Response;
+    try {
+      putRes = await fetch(presign.upload_url, {
+        method: "PUT",
+        body: file,
+        headers: putHeaders,
+      });
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      uiError("file:load put network error", { detail });
+      throw new Error(`S3 직접 업로드 네트워크 오류: ${detail}`);
+    }
     if (!putRes.ok) {
       const text = await putRes.text();
       uiError("file:load put failed", { status: putRes.status, body: text });
-      throw new Error(text || putRes.statusText || "Direct S3 upload failed");
+      const codeMatch = text.match(/<Code>([^<]+)<\/Code>/i);
+      const msgMatch = text.match(/<Message>([^<]+)<\/Message>/i);
+      const s3Detail =
+        codeMatch || msgMatch
+          ? [codeMatch?.[1], msgMatch?.[1]].filter(Boolean).join(": ")
+          : "";
+      throw new Error(
+        s3Detail ||
+          text.slice(0, 200) ||
+          putRes.statusText ||
+          `Direct S3 upload failed (HTTP ${putRes.status})`,
+      );
     }
 
     const data = await request<LoadFileResult>("/api/files/load/complete", {

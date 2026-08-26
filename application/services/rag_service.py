@@ -114,11 +114,15 @@ def ingest_rag_upload(
     owners: Sequence[str] | None = None,
     team: str = DEFAULT_TEAM,
     is_confidential: bool = DEFAULT_IS_CONFIDENTIAL,
+    sync: bool = True,
 ) -> dict[str, Any]:
-    """Upload ``file_bytes`` to S3 under the user's folder and start a KB sync.
+    """Upload ``file_bytes`` to S3 under the user's folder and optionally KB-sync.
 
     Objects are stored at ``docs/{user_id}/{file_name}`` with a sidecar
     ``{file_name}.metadata.json`` for Knowledge Base metadata filtering.
+
+    Set ``sync=False`` for intermediate files in a multi-upload batch so only
+    the last file starts ingestion (avoids 409 while a job is already running).
 
     Raises:
         RagServiceError: when sync status cannot be checked, an ingest is
@@ -184,27 +188,37 @@ def ingest_rag_upload(
             "Failed to upload Knowledge Base metadata file to S3",
         )
 
-    try:
-        sync_result = utils.sync_data_source()
-    except Exception:
-        logger.exception("Knowledge Base sync failed for file=%s", file_name)
-        raise RagServiceError(
-            500,
-            "File uploaded but Knowledge Base sync failed",
-        ) from None
-    if not sync_result:
-        raise RagServiceError(
-            500,
-            "File uploaded but Knowledge Base sync failed",
+    sync_result: dict[str, Any] | None = None
+    if sync:
+        try:
+            sync_result = utils.sync_data_source()
+        except Exception:
+            logger.exception("Knowledge Base sync failed for file=%s", file_name)
+            raise RagServiceError(
+                500,
+                "File uploaded but Knowledge Base sync failed",
+            ) from None
+        if not sync_result:
+            raise RagServiceError(
+                500,
+                "File uploaded but Knowledge Base sync failed",
+            )
+        message = (
+            f'"{file_name}"가 S3에 업로드 되었고 Knowledge Base와 동기화를 시작합니다.'
+        )
+    else:
+        message = (
+            f'"{file_name}"가 S3에 업로드 되었습니다. Knowledge Base 동기화는 대기 중입니다.'
         )
 
     logger.info(
-        "RAG upload complete: user=%s file=%s s3_key=%s metadata_key=%s job=%s",
+        "RAG upload complete: user=%s file=%s s3_key=%s metadata_key=%s sync=%s job=%s",
         user_id,
         file_name,
         upload_result.get("s3_key"),
         metadata_result.get("s3_key"),
-        sync_result.get("ingestion_job_id"),
+        sync,
+        (sync_result or {}).get("ingestion_job_id"),
     )
 
     return {
@@ -217,7 +231,5 @@ def ingest_rag_upload(
         "user_id": user_id,
         "url": upload_result.get("url"),
         "sync": sync_result,
-        "message": (
-            f'"{file_name}"가 S3에 업로드 되었고 Knowledge Base와 동기화를 시작합니다.'
-        ),
+        "message": message,
     }

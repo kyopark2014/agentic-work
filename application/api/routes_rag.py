@@ -1,7 +1,7 @@
 import logging
 import os
 
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 
 from application.api.routes_auth import require_user_id
 from application.services.rag_service import RagServiceError, ingest_rag_upload
@@ -43,7 +43,14 @@ def _validate_filename(filename: str) -> str:
 
 
 @router.post("/upload")
-async def upload_to_rag(request: Request, file: UploadFile = File(...)):
+async def upload_to_rag(
+    request: Request,
+    file: UploadFile = File(...),
+    sync: bool = Query(
+        True,
+        description="Start KB ingestion after upload. Use false for batch intermediates.",
+    ),
+):
     user_id = require_user_id(request)
 
     file_name = _validate_filename(file.filename or "")
@@ -52,6 +59,8 @@ async def upload_to_rag(request: Request, file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Empty file")
 
     try:
-        return ingest_rag_upload(file_bytes, file_name, user_id=user_id)
+        return ingest_rag_upload(
+            file_bytes, file_name, user_id=user_id, sync=sync
+        )
     except RagServiceError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc

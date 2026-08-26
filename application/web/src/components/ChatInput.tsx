@@ -96,7 +96,7 @@ export function ChatInput({
     clearUploadError,
     uploadImageFiles,
     loadWorkspaceFiles,
-    uploadRagFile,
+    uploadRagFiles,
     uploadWikiFiles,
     removeAttachment,
     removeLoadedFile,
@@ -260,10 +260,10 @@ export function ChatInput({
   }
 
   async function onRagFileSelected(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
+    const files = Array.from(e.target.files ?? []);
     e.target.value = "";
-    if (!file) return;
-    await uploadRagFile(file, onRagUploadComplete);
+    if (files.length === 0) return;
+    await uploadRagFiles(files, onRagUploadComplete);
   }
 
   async function onWikiFileSelected(e: React.ChangeEvent<HTMLInputElement>) {
@@ -562,6 +562,7 @@ export function ChatInput({
           type="file"
           className="chat-file-input"
           accept={RAG_ACCEPT}
+          multiple
           onChange={onRagFileSelected}
           tabIndex={-1}
           aria-hidden="true"

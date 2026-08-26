@@ -165,7 +165,12 @@ export function useFileUpload({ disabled = false }: UseFileUploadOptions = {}) {
         }
       } catch (err) {
         console.error("Load file failed", err);
-        setUploadError("파일 로드에 실패했습니다. 다시 시도해 주세요.");
+        const detail = err instanceof Error ? err.message : "";
+        setUploadError(
+          detail
+            ? detail.replace(/^Load file failed:\s*/i, "")
+            : "파일 로드에 실패했습니다. 다시 시도해 주세요.",
+        );
       } finally {
         setUploading(false);
       }
@@ -173,17 +178,40 @@ export function useFileUpload({ disabled = false }: UseFileUploadOptions = {}) {
     [disabled],
   );
 
-  const uploadRagFile = useCallback(
-    async (file: File, onComplete?: (message: string) => void) => {
-      if (disabled || uploadingRef.current) return;
+  const uploadRagFiles = useCallback(
+    async (files: File[], onComplete?: (message: string) => void) => {
+      if (files.length === 0 || disabled || uploadingRef.current) return;
       setUploading(true);
       setUploadError(null);
       try {
-        const result = await fileUploadService.uploadToRag(file);
-        onComplete?.(result.message);
+        const names: string[] = [];
+        let lastMessage = "";
+        for (let i = 0; i < files.length; i += 1) {
+          const file = files[i];
+          const isLast = i === files.length - 1;
+          // Sync only on the last file so multi-select does not 409 mid-batch.
+          const result = await fileUploadService.uploadToRag(file, {
+            sync: isLast,
+          });
+          names.push(result.file_name || file.name);
+          lastMessage = result.message;
+        }
+        if (files.length === 1) {
+          onComplete?.(lastMessage);
+        } else {
+          const listed = names.map((n) => `"${n}"`).join(", ");
+          onComplete?.(
+            `${listed} ${names.length}개가 S3에 업로드 되었고 Knowledge Base와 동기화를 시작합니다.`,
+          );
+        }
       } catch (err) {
         console.error("Document upload failed", err);
-        setUploadError("파일 업로드에 실패했습니다. 다시 시도해 주세요.");
+        const detail = err instanceof Error ? err.message : "";
+        setUploadError(
+          detail
+            ? detail.replace(/^RAG upload failed:\s*/i, "")
+            : "파일 업로드에 실패했습니다. 다시 시도해 주세요.",
+        );
       } finally {
         setUploading(false);
       }
@@ -296,7 +324,7 @@ export function useFileUpload({ disabled = false }: UseFileUploadOptions = {}) {
     clearUploadError,
     uploadImageFiles,
     loadWorkspaceFiles,
-    uploadRagFile,
+    uploadRagFiles,
     uploadWikiFiles,
     removeAttachment,
     removeLoadedFile,

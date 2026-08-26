@@ -10,11 +10,49 @@ here so Google Sign-In and same-origin APIs keep working.
 
 from __future__ import annotations
 
+import json
+import logging
+import os
+
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+logger = logging.getLogger(__name__)
+
+
+def _s3_connect_src_hosts() -> str:
+    """Allow browser→S3 presigned PUT/GET used by Load-files / uploads.
+
+    Without these, CSP blocks ``fetch(presignedUrl)`` as ``Failed to fetch``.
+    Host wildcards only match one DNS label, so regional path-style and
+    virtual-hosted forms are listed explicitly from config.json.
+    """
+    region = "us-west-2"
+    bucket = ""
+    try:
+        cfg_path = os.path.join(os.path.dirname(__file__), "config.json")
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = json.load(f)
+        region = (cfg.get("region") or region).strip() or region
+        bucket = (cfg.get("s3_bucket") or "").strip()
+    except Exception:
+        logger.debug("CSP S3 hosts: using defaults (config.json unread)", exc_info=True)
+
+    hosts = [
+        f"https://s3.{region}.amazonaws.com",
+        f"https://*.s3.{region}.amazonaws.com",
+        "https://*.s3.amazonaws.com",
+        "https://s3.amazonaws.com",
+    ]
+    if bucket:
+        hosts.append(f"https://{bucket}.s3.{region}.amazonaws.com")
+        hosts.append(f"https://{bucket}.s3.amazonaws.com")
+    return " ".join(hosts)
+
 
 # Allow Google Identity Services (GSI) while locking down everything else.
 # frame-src includes 'self' so Knowledge/Wiki Graph modals can iframe HTML
 # (without 'self' the graph iframe is blank).
+# connect-src includes S3 so Load-files can PUT directly to presigned URLs.
 _CONTENT_SECURITY_POLICY = (
     "default-src 'self'; "
     "script-src 'self' https://accounts.google.com https://apis.google.com; "
@@ -22,7 +60,7 @@ _CONTENT_SECURITY_POLICY = (
     "img-src 'self' data: blob: https:; "
     "font-src 'self' data:; "
     "connect-src 'self' https://accounts.google.com https://oauth2.googleapis.com "
-    "https://www.googleapis.com; "
+    f"https://www.googleapis.com {_s3_connect_src_hosts()}; "
     "frame-src 'self' https://accounts.google.com; "
     "frame-ancestors 'none'; "
     "base-uri 'self'; "

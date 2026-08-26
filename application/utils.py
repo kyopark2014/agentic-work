@@ -1406,6 +1406,27 @@ def upload_to_s3(
         return None
 
 
+def _s3_client_for_presign():
+    """S3 client for browser-safe regional, virtual-hostedpresigned URLs.
+
+    Global ``*.s3.amazonaws.com`` hosts often 307-redirect to the region
+    endpoint; browsers then fail the signed PUT (403/CORS) and our API never
+    sees ``/load/complete``. Prefer virtual-hosted
+    ``https://{bucket}.s3.{region}.amazonaws.com/...``.
+    """
+    from botocore.config import Config
+
+    region = bedrock_region or "us-west-2"
+    return boto3.client(
+        service_name="s3",
+        region_name=region,
+        config=Config(
+            signature_version="s3v4",
+            s3={"addressing_style": "virtual"},
+        ),
+    )
+
+
 def session_upload_s3_key(file_name: str, user_id: str | None = None) -> str:
     """Build ``agentcore-sessions/{user}/upload/{file}`` object key."""
     segment = _sanitize_s3_user_segment(user_id) or "default"
@@ -1480,6 +1501,9 @@ def generate_session_upload_presigned_put(
 
     The client must PUT the raw body with the returned ``headers`` (especially
     ``Content-Type``) so the signature matches.
+
+    Only ``Content-Type`` is signed — extra headers (e.g. Content-Disposition)
+    often break browser CORS/signature for direct PUT.
     """
     if not s3_bucket:
         logger.error("s3_bucket is not configured")
@@ -1494,19 +1518,21 @@ def generate_session_upload_presigned_put(
         "Key": s3_key,
         "ContentType": content_type,
     }
-    if content_type == "application/pdf":
-        params["ContentDisposition"] = "inline"
-        headers["Content-Disposition"] = "inline"
 
     try:
         with _without_env_proxies():
-            s3_client = boto3.client(service_name="s3", region_name=bedrock_region)
+            s3_client = _s3_client_for_presign()
             upload_url = s3_client.generate_presigned_url(
                 ClientMethod="put_object",
                 Params=params,
                 ExpiresIn=max(60, int(expires_in)),
                 HttpMethod="PUT",
             )
+        logger.info(
+            "session upload presign key=%s host=%s",
+            s3_key,
+            parse.urlparse(upload_url).netloc,
+        )
         return {
             "file_name": safe_name,
             "s3_key": s3_key,
@@ -1528,7 +1554,7 @@ def head_session_upload_object(s3_key: str) -> dict | None:
         return None
     try:
         with _without_env_proxies():
-            s3_client = boto3.client(service_name="s3", region_name=bedrock_region)
+            s3_client = _s3_client_for_presign()
             response = s3_client.head_object(Bucket=s3_bucket, Key=s3_key)
         return {
             "content_length": int(response.get("ContentLength") or 0),
