@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 def _s3_connect_src_hosts() -> str:
-    """Allow browser→S3 presigned PUT/GET used by Load-files / uploads.
+    """Allow browser→S3 presigned PUT/GET used by Load-files / Wiki / RAG uploads.
 
     Without these, CSP blocks ``fetch(presignedUrl)`` as ``Failed to fetch``.
     Host wildcards only match one DNS label, so regional path-style and
@@ -52,7 +52,7 @@ def _s3_connect_src_hosts() -> str:
 # Allow Google Identity Services (GSI) while locking down everything else.
 # frame-src includes 'self' so Knowledge/Wiki Graph modals can iframe HTML
 # (without 'self' the graph iframe is blank).
-# connect-src includes S3 so Load-files can PUT directly to presigned URLs.
+# connect-src includes S3 so Load-files / Wiki / RAG can PUT directly to presigned URLs.
 _CONTENT_SECURITY_POLICY = (
     "default-src 'self'; "
     "script-src 'self' https://accounts.google.com https://apis.google.com; "
