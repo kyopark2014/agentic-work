@@ -56,8 +56,15 @@ def _extract_contents(result: dict[str, Any]) -> List[Any]:
         return contents
 
     excerpt_count = 0
+    unreadable = 0
     for source in result.get("sources") or []:
         if not source.get("readable", True):
+            unreadable += 1
+            logger.info(
+                "wiki source unreadable: %s (%s)",
+                source.get("name") or source.get("path"),
+                source.get("error"),
+            )
             continue
         name = source.get("name") or Path(str(source.get("path") or "")).name or "unknown"
         labels = [str(lb) for lb in (source.get("matched_labels") or []) if lb][:8]
@@ -79,7 +86,11 @@ def _extract_contents(result: dict[str, Any]) -> List[Any]:
         if excerpt_count >= _MAX_EXCERPTS:
             break
 
-    logger.info("extracted contents: excerpts=%s", excerpt_count)
+    logger.info(
+        "extracted contents: excerpts=%s unreadable_sources=%s",
+        excerpt_count,
+        unreadable,
+    )
     return contents
 
 
@@ -125,7 +136,13 @@ def recall_wiki(
         )
 
     wiki_root = Path(utils.get_user_wiki_dir(user_id))
-    allowed = [wiki_root, wiki_root / "raw", wiki_root / "graphify-out"]
+    # Match POST /api/wiki/query allowed_roots (include converted/).
+    allowed = [
+        wiki_root,
+        wiki_root / "raw",
+        wiki_root / "graphify-out",
+        wiki_root / "graphify-out" / "converted",
+    ]
     for src in utils.get_wiki_source_folders(user_id):
         allowed.append(Path(src))
 
@@ -147,4 +164,27 @@ def recall_wiki(
         return _error(f"query failed: {e}")
 
     contents = _extract_contents(result)
-    return {"text": contents}
+    if contents:
+        return {"text": contents}
+
+    # Distinguish "no match" from "graph hit but corpus missing on Runtime".
+    if result.get("message"):
+        return _error(str(result["message"]))
+
+    unreadable = [
+        s
+        for s in (result.get("sources") or [])
+        if not s.get("readable", True)
+    ]
+    if unreadable or (result.get("nodes") and not contents):
+        names = [
+            str(s.get("name") or s.get("path") or "?") for s in unreadable[:3]
+        ]
+        detail = f" ({', '.join(names)})" if names else ""
+        return _error(
+            "Wiki 그래프 노드는 찾았지만 소스 본문을 읽을 수 없습니다"
+            f"{detail}. Settings → Wiki → Sync를 다시 실행해 "
+            "Runtime 저장소로 미러링된 뒤 재시도하세요."
+        )
+
+    return {"text": []}

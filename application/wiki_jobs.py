@@ -456,6 +456,17 @@ def _run_sync(user_id: str, full: bool, model: str | None = None) -> None:
             _active_procs.pop(user_id, None)
             _persist_state(user_id, state)
         logger.info("Wiki sync finished user=%s status=%s", user_id, state.status)
+        # Mirror wiki → agentcore-sessions so AgentCore Runtime recall_wiki
+        # can read graph.json + converted/*.md (same pattern as graph_jobs).
+        try:
+            from application import utils
+
+            utils.sync_user_wiki_to_runtime_storage(user_id)
+        except Exception:
+            logger.exception(
+                "Wiki→runtime mirror failed for user=%s (sync still ready)",
+                user_id,
+            )
     except Exception as exc:
         if proc is not None and proc.poll() is None:
             try:
