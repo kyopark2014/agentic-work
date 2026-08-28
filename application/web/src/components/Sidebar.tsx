@@ -101,6 +101,15 @@ export function Sidebar({
   const [wikiConfigureOpen, setWikiConfigureOpen] = useState(false);
   const [wikiSyncBusy, setWikiSyncBusy] = useState(false);
   const [wikiSyncMessage, setWikiSyncMessage] = useState<string | null>(null);
+  const [wikiSyncProgress, setWikiSyncProgress] = useState<{
+    file?: string | null;
+    file_i?: number | null;
+    file_n?: number | null;
+    page?: number | null;
+    page_n?: number | null;
+    pct?: number | null;
+    aggregated?: boolean | null;
+  } | null>(null);
   const [wikiSyncPopupOpen, setWikiSyncPopupOpen] = useState(false);
   const [knowledgeSyncBusy, setKnowledgeSyncBusy] = useState(false);
   const [knowledgeSyncMessage, setKnowledgeSyncMessage] = useState<string | null>(null);
@@ -172,7 +181,7 @@ export function Sidebar({
     setWikiSyncBusy(true);
     setWikiSyncMessage("Wiki 동기화를 시작합니다…");
     try {
-      const result = await api.syncWiki(false);
+      const result = await api.syncWiki(false, modelName || undefined);
       const status = result.status;
       if (status === "error") {
         setWikiSyncBusy(false);
@@ -259,15 +268,18 @@ export function Sidebar({
         if (cancelled) return;
         const busy = next.status === "queued" || next.status === "running";
         setWikiSyncBusy(busy);
+        if (next.progress) {
+          setWikiSyncProgress(next.progress);
+        }
         if (busy) {
           setWikiSyncMessage(
             next.message || "Wiki 동기화를 백그라운드에서 실행 중입니다.",
           );
-          timer = setTimeout(pollWikiSync, 2500);
+          timer = setTimeout(pollWikiSync, 1500);
           return;
         }
         if (next.status === "ready") {
-          setWikiSyncMessage("Wiki 동기화가 완료되었습니다.");
+          setWikiSyncMessage(next.message || "Wiki 동기화가 완료되었습니다.");
         } else if (next.status === "unchanged") {
           setWikiSyncMessage("변경된 파일이 없습니다.");
         } else if (next.status === "error") {
@@ -742,6 +754,7 @@ export function Sidebar({
           title="Wiki Sync"
           busy={wikiSyncBusy}
           message={wikiSyncMessage}
+          progress={wikiSyncProgress}
           onClose={() => setWikiSyncPopupOpen(false)}
         />
       )}

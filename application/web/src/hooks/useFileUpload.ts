@@ -76,9 +76,14 @@ export function collectClipboardImages(clipboardData: DataTransfer | null): File
 
 interface UseFileUploadOptions {
   disabled?: boolean;
+  /** UI model name passed to Wiki Sync after raw upload. */
+  syncModel?: string;
 }
 
-export function useFileUpload({ disabled = false }: UseFileUploadOptions = {}) {
+export function useFileUpload({
+  disabled = false,
+  syncModel,
+}: UseFileUploadOptions = {}) {
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<AttachedImage[]>([]);
@@ -225,7 +230,7 @@ export function useFileUpload({ disabled = false }: UseFileUploadOptions = {}) {
       setUploading(true);
       setUploadError(null);
       try {
-        const result = await fileUploadService.uploadToWiki(files);
+        const result = await fileUploadService.uploadToWiki(files, syncModel);
         onComplete?.(result.message);
       } catch (err) {
         console.error("Wiki document upload failed", err);
@@ -239,7 +244,7 @@ export function useFileUpload({ disabled = false }: UseFileUploadOptions = {}) {
         setUploading(false);
       }
     },
-    [disabled],
+    [disabled, syncModel],
   );
 
   const removeAttachment = useCallback((url: string) => {
