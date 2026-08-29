@@ -472,24 +472,69 @@ def build_ecs_runtime_secret_refs(
 
 
 def _generate_cloudfront_rsa_keypair() -> Tuple[str, str]:
-    """Return (private_pem, public_pem) for CloudFront signed cookies."""
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
+    """Return (private_pem, public_pem) for CloudFront signed cookies.
 
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    private_pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.TraditionalOpenSSL,
-        encryption_algorithm=serialization.NoEncryption(),
-    ).decode("utf-8")
-    public_pem = (
-        private_key.public_key()
-        .public_bytes(
+    Prefers the ``cryptography`` package; falls back to OpenSSL CLI so the
+    installer host need not have app ``requirements.txt`` installed.
+    """
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        private_pem = private_key.private_bytes(
             encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        ).decode("utf-8")
+        public_pem = (
+            private_key.public_key()
+            .public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+            .decode("utf-8")
         )
-        .decode("utf-8")
-    )
+        return private_pem, public_pem
+    except ImportError:
+        pass
+
+    openssl = shutil.which("openssl")
+    if not openssl:
+        raise RuntimeError(
+            "CloudFront signing key generation requires the 'cryptography' package "
+            "or the 'openssl' CLI. Install with: pip install cryptography"
+        )
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="cf-signing-") as tmp:
+        key_path = os.path.join(tmp, "private.pem")
+        pub_path = os.path.join(tmp, "public.pem")
+        gen = subprocess.run(
+            [openssl, "genrsa", "-out", key_path, "2048"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if gen.returncode != 0:
+            raise RuntimeError(
+                f"openssl genrsa failed (exit {gen.returncode}): {gen.stderr.strip()}"
+            )
+        pub = subprocess.run(
+            [openssl, "rsa", "-in", key_path, "-pubout", "-out", pub_path],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if pub.returncode != 0:
+            raise RuntimeError(
+                f"openssl rsa -pubout failed (exit {pub.returncode}): {pub.stderr.strip()}"
+            )
+        with open(key_path, "r", encoding="utf-8") as f:
+            private_pem = f.read()
+        with open(pub_path, "r", encoding="utf-8") as f:
+            public_pem = f.read()
     return private_pem, public_pem
 
 
