@@ -8487,6 +8487,45 @@ def _get_or_create_s3files_access_point(
     return access_point_arn
 
 
+def _iam_role_name_from_arn(role_arn: str) -> str:
+    """Extract the IAM role name from a role ARN (last path segment)."""
+    if ":role/" in role_arn:
+        return role_arn.rsplit("/", 1)[-1]
+    return role_arn
+
+
+def _iam_role_exists(role_arn: str) -> bool:
+    """Return True if the IAM role ARN resolves to an existing role."""
+    if not role_arn:
+        return False
+    role_name = _iam_role_name_from_arn(role_arn)
+    try:
+        iam_client.get_role(RoleName=role_name)
+        return True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "NoSuchEntity":
+            return False
+        logger.warning(f"  Could not verify IAM role {role_name}: {e}")
+        return False
+
+
+def _resolve_agent_runtime_role_arn() -> str:
+    """Resolve AgentCore Runtime execution role ARN (config first, then naming)."""
+    runtime_config = _load_runtime_agent_config("langgraph")
+    configured = (runtime_config.get("agent_runtime_role") or "").strip()
+    if configured:
+        return configured
+
+    runtime_project = (
+        (runtime_config.get("projectName") or "").strip()
+        or project_name
+    )
+    return (
+        f"arn:aws:iam::{account_id}:role/"
+        f"AmazonBedrockAgentCoreRuntimeRoleFor{runtime_project}"
+    )
+
+
 def _ensure_s3files_file_system_policy(
     file_system_id: str,
     access_point_arn: str,
@@ -8495,6 +8534,17 @@ def _ensure_s3files_file_system_policy(
     """Allow only the given roles to mount/write via the access point."""
     principals = [arn for arn in client_role_arns if arn]
     if not principals:
+        return
+
+    # PutFileSystemPolicy rejects Principal ARNs for roles that do not exist yet
+    # (same validation as S3 bucket policies).
+    missing = [arn for arn in principals if not _iam_role_exists(arn)]
+    if missing:
+        for arn in missing:
+            logger.info(
+                "  Deferring S3 Files file system policy: IAM role not found yet (%s)",
+                _iam_role_name_from_arn(arn),
+            )
         return
 
     policy = {
@@ -8643,14 +8693,14 @@ def create_s3_files_session_storage(
         file_system_id,
         name_tag=f"s3files-ap-for-{project_name}",
     )
-    agent_runtime_role_arn = (
-        f"arn:aws:iam::{account_id}:role/AmazonBedrockAgentCoreRuntimeRoleFor{project_name}"
-    )
-    # Runtime only — do not grant ECS (tasks.db / litellm live on app-data FS).
-    _ensure_s3files_file_system_policy(
-        file_system_id,
-        access_point_arn,
-        [agent_runtime_role_arn],
+    # Runtime IAM role is created later by runtime_agent/*/installer.py.
+    # Apply FS policy now only on reinstall (role already exists); otherwise
+    # prepare_s3files_for_runtime() runs after install_agent_runtime().
+    prepare_s3files_for_runtime(
+        {
+            "file_system_id": file_system_id,
+            "access_point_arn": access_point_arn,
+        }
     )
     _ensure_agent_runtime_vpc_endpoint_access(
         vpc_info["vpc_id"],
@@ -8839,6 +8889,57 @@ def _migrate_app_data_from_sessions(s3_bucket_name: str) -> None:
             logger.info(f"  Migrated {settings_copied} settings.json → app-data/")
     except ClientError as e:
         logger.warning(f"  app-data migration skipped: {e}")
+
+
+def prepare_s3files_for_runtime(
+    s3_files_info: Optional[Dict[str, object]] = None,
+) -> bool:
+    """Apply session S3 Files FS policy for the AgentCore Runtime role.
+
+    Safe to call before the role exists (no-op + log) or after Runtime install.
+    Returns True when the policy was applied (or already applicable principals).
+    """
+    info = dict(s3_files_info or {})
+    file_system_id = str(info.get("file_system_id") or "").strip()
+    access_point_arn = str(info.get("access_point_arn") or "").strip()
+
+    if not file_system_id or not access_point_arn:
+        app_config = _read_local_json_config(
+            os.path.join(_project_root(), "application", "config.json")
+        )
+        runtime_config = _load_runtime_agent_config("langgraph")
+        file_system_id = (
+            file_system_id
+            or str(app_config.get("s3_files_file_system_id") or "").strip()
+            or str(runtime_config.get("s3_files_file_system_id") or "").strip()
+        )
+        access_point_arn = (
+            access_point_arn
+            or str(app_config.get("s3_files_access_point_arn") or "").strip()
+            or str(runtime_config.get("s3_files_access_point_arn") or "").strip()
+        )
+
+    if not file_system_id or not access_point_arn:
+        logger.warning(
+            "  Skipping S3 Files session FS policy: missing file system / access point"
+        )
+        return False
+
+    role_arn = _resolve_agent_runtime_role_arn()
+    if not _iam_role_exists(role_arn):
+        logger.info(
+            "  S3 Files session FS policy deferred until AgentCore Runtime role exists "
+            f"({_iam_role_name_from_arn(role_arn)})"
+        )
+        return False
+
+    _ensure_s3files_file_system_policy(
+        file_system_id,
+        access_point_arn,
+        [role_arn],
+    )
+    logger.info("  ✓ Applied S3 Files session FS policy for AgentCore Runtime")
+    return True
 
 
 def prepare_s3files_for_ecs(
@@ -9134,6 +9235,9 @@ def main():
     if args.install_agent_runtime is not None:
         runtime_type = args.install_agent_runtime if args.install_agent_runtime else "langgraph"
         success = install_agent_runtime(runtime_type)
+        if success:
+            # Runtime role now exists — attach session S3 Files FS policy if FS is ready.
+            prepare_s3files_for_runtime()
         sys.exit(0 if success else 1)
     
     ensure_boto3_supports_agentcore_connector()
@@ -9279,6 +9383,9 @@ def main():
                     "✓ Kept existing agent_runtime_arn in application config for ECS: "
                     f"{app_environment.get('agent_runtime_arn', '')}"
                 )
+            # Role may already exist from a prior install — apply session FS policy.
+            if s3_files_info:
+                prepare_s3files_for_runtime(s3_files_info)
         elif install_agent_runtime("langgraph"):
             logger.info("Langgraph agent runtime installed...")
             app_environment = _merge_runtime_agent_settings(app_environment)
@@ -9287,8 +9394,17 @@ def main():
                     "✓ Merged agent_runtime_arn into application config for ECS: "
                     f"{app_environment.get('agent_runtime_arn', '')}"
                 )
+            # Runtime IAM role now exists — apply session S3 Files FS policy.
+            if s3_files_info:
+                prepare_s3files_for_runtime(s3_files_info)
         else:
             logger.warning("Langgraph agent runtime installation failed or was skipped.")
+            if s3_files_info:
+                logger.warning(
+                    "  S3 Files session FS policy was not applied "
+                    "(AgentCore Runtime role missing). Re-run with "
+                    "--install-agent-runtime after fixing Runtime install."
+                )
 
         # Refresh ECS task role so AgentCore Resource ARNs include the real runtime
         # (e.g. agentic_work-*), not only root project_name naming.
