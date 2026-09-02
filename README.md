@@ -1529,129 +1529,19 @@ Human(Q2) → AI(A2) → Human(Q3) → AI(tool_calls) → ToolMessage → AI(A3)
 
 ### Prompt Caching
 
-LangGraph 에이전트는 tool loop마다 동일한 **system prompt + tool schema**를 Bedrock에 다시 보냅니다. Claude/Nova 경로에서는 [Amazon Bedrock prompt caching](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html)을 켜서 이 정적 prefix를 재사용합니다. 구현은 [runtime_agent/langgraph/langgraph_agent.py](./runtime_agent/langgraph/langgraph_agent.py)의 `call_model`에 있습니다.
+LangGraph tool loop마다 반복되는 **system prompt + tool schema**에 [Amazon Bedrock prompt caching](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html)을 적용합니다.
 
-**대상 모델:** `claude`, `nova` (`openai`/Mantle 경로는 제외)
+- **Claude / Nova**: `cache_control` (5m TTL)
+- **GPT 5.6+ (Mantle)**: `prompt_cache_breakpoint` explicit mode (30m TTL)
+- **GPT 5.5 이하**: AWS implicit caching (자동, 코드 미적용)
 
-**적용 방식 (커스텀 StateGraph)**
-
-공식 `BedrockPromptCachingMiddleware`는 LangChain Agents middleware 전용이라, 이 프로젝트의 커스텀 `StateGraph` + `call_model`에는 그대로 붙일 수 없습니다. 동일 효과를 `call_model`에서 직접 재현합니다.
-
-1. **SystemMessage cache breakpoint** — system 텍스트를 Anthropic content block으로 보내고 `cache_control: ephemeral`을 붙입니다.
-2. **`model.bind(cache_control=...)`** — last message에 cache marker를 추가합니다. `ChatBedrockConverse`(Guardrail 경로)는 system + tools + last message에 `cachePoint`를 자동 삽입합니다.
-3. **관측** — 응답 `usage_metadata.input_token_details`의 `cache_read` / `cache_creation`을 로그합니다. 스트리밍 usage 파싱은 [bedrock_stream_usage_patch.py](./runtime_agent/langgraph/bedrock_stream_usage_patch.py)가 담당합니다.
-
-```python
-# runtime_agent/langgraph/langgraph_agent.py
-PROMPT_CACHE_CONTROL = {"type": "ephemeral", "ttl": "5m"}
-
-
-def _supports_prompt_caching(model_type: str | None) -> bool:
-    return model_type in ("claude", "nova")
-
-
-def _system_message_with_cache(system: str) -> SystemMessage:
-    return SystemMessage(
-        content=[
-            {
-                "type": "text",
-                "text": system,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ]
-    )
-```
-
-`call_model`에서의 사용:
-
-```python
-# runtime_agent/langgraph/langgraph_agent.py — call_model()
-    model = chatModel.bind_tools(tools) if tools else chatModel
-    use_prompt_cache = _supports_prompt_caching(active_model_type)
-    if use_prompt_cache:
-        # ChatBedrock: last message에 cache_control
-        # ChatBedrockConverse: system + tools + last message에 cachePoint
-        model = model.bind(cache_control=PROMPT_CACHE_CONTROL)
-
-    if use_prompt_cache:
-        system_msg = _system_message_with_cache(system)
-    else:
-        system_msg = SystemMessage(content=system)
-    model_messages = [system_msg, *messages]
-
-    async for chunk in model.astream(model_messages):
-        ...
-
-    _log_prompt_cache_usage(response)
-```
-
-| Wrapper | cache 동작 |
-|---------|------------|
-| `ChatBedrock` (기본 Claude, Guardrail 없음) | system content block + last message `cache_control` → prefix(system/tools 포함) 캐시 |
-| `ChatBedrockConverse` (Guardrail 활성) | `cache_control` bind 시 system / tools / last message에 `cachePoint` 삽입 |
-
-**효과**
-
-- 동일 skill/MCP 구성이면 system prompt와 tool schema가 세션 내 고정이라, **agent tool-loop 2번째 LLM 호출부터** `cache_read`가 발생하기 쉽습니다.
-- TTL은 **5분(`ephemeral`)** 입니다.
-- 모델별 최소 캐시 토큰(대략 1K+) 미만이면 `cache_creation`/`cache_read`가 0일 수 있습니다. 실제 skill XML + tool schema는 보통 임계치를 넘습니다.
-
-**측정 결과 (`test_prompt_caching.py`)**
-
-실제 skill system prompt + builtin/skill tools로 **2-step tool loop**를 재현한 측정값입니다.
+상세 구현·측정·확인 방법은 **[prompt-caching.md](./prompt-caching.md)** 를 참고하세요.
 
 ```bash
 cd runtime_agent/langgraph
-python test_prompt_caching.py
+python test_prompt_caching.py                                          # Claude
+python test_prompt_caching.py --model-id openai.gpt-5.6-sol --region us-east-2  # GPT
 ```
-
-| 항목 | 값 |
-|------|-----|
-| 모델 | `us.anthropic.claude-sonnet-5` (`us-west-2`) |
-| Skills | skill-creator, pptx, xlsx, myslide, docx, pdf, frontend-design |
-| System prompt | 5,513 chars (~1.4K tokens 추정) |
-| Tools | 8 (`execute_code`, `write_file`, `read_file`, `bash`, `upload_file_to_s3`, `get_current_time`, `get_skill_instructions`, `echo_cache_probe`) |
-
-| 호출 | input | cache_creation | cache_read | output | 해당 호출 hit ratio |
-|------|------:|---------------:|-----------:|-------:|-------------------:|
-| Call 1 (tool 요청) | 2 | **4,293** | 0 | 56 | 0% |
-| Call 2 (tool 결과 반영) | 2 | 66 | **4,293** | 32 | **98.4%** |
-
-**전체 input token 절감률 (2-call tool loop)**
-
-| 지표 | 값 |
-|------|-----|
-| 캐시 없을 때 총 input footprint | **8,656** (= Call1 4,295 + Call2 4,361) |
-| 캐시로 재사용한 토큰 (`cache_read`) | **4,293** |
-| 새로 처리/기록한 토큰 (`input` + `cache_creation`) | 4,363 |
-| **전체 input token 절감률** | **49.6%** |
-
-```text
-reduction_% = sum(cache_read) / sum(input + cache_creation + cache_read)
-            = 4293 / 8656
-            ≈ 49.6%
-```
-
-해석:
-
-- Call 1에서 system + tools + user prefix **4,293 tokens**를 캐시에 기록(`cache_creation`)
-- Call 2에서 동일 prefix **4,293 tokens**를 재사용 → **해당 호출 기준 98.4% hit**
-- **루프 전체(2회 합산)** 로는 입력 토큰의 **약 절반(49.6%)** 을 재사용 (첫 호출은 반드시 write, 두 번째부터 read)
-- tool loop가 N회면 정적 prefix 재사용 비율은 대략 `(N-1)/N`에 가까워집니다 (예: 3회 ≈ 67%, 5회 ≈ 80%)
-- Call 2의 작은 `cache_creation`(66)은 tool result 등 **새로 추가된 suffix**에 대한 추가 캐시 write
-- Anthropic Messages usage에서 uncached `input_tokens`는 작게 보고되고, 실제 prefix 토큰은 `cache_creation`/`cache_read`에 잡힙니다
-
-**확인 방법**
-
-1. 위 스크립트 실행, 또는 Claude로 tool을 2회 이상 쓰는 질의 실행
-2. stdout의 `input token reduction: XX.X%` 또는 로그의 `cache_read` / `cache_creation` 확인
-3. cold start 기준: 첫 호출 `cache_creation > 0`, 이후 호출 `cache_read > 0` (스크립트는 `run_id`로 매 실행 cold write를 강제)
-
-**의도적으로 하지 않은 것**
-
-- LangChain Agents + `BedrockPromptCachingMiddleware`로 전체 이전
-- 기본 LLM 경로를 `ChatBedrockConverse`로 강제 전환
-- skill 본문(`SKILL.md`)을 system에 넣는 구조 변경 (이미 `get_skill_instructions` tool로 로드)
 
 ### Memory
 

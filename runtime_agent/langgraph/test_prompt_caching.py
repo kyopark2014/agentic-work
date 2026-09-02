@@ -1,15 +1,17 @@
 """Measure Bedrock prompt caching for the LangGraph call_model path.
 
-Simulates a 2-step tool loop with the same SystemMessage cache_control +
-model.bind(cache_control) helpers used in langgraph_agent.call_model.
+Simulates a 2-step tool loop with the same cache helpers used in
+langgraph_agent.call_model (Claude/Nova cache_control or GPT explicit).
 
 Usage:
   cd runtime_agent/langgraph
   python test_prompt_caching.py
+  python test_prompt_caching.py --model-id openai.gpt-5.6-sol --region us-east-2
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -22,12 +24,16 @@ from botocore.config import Config
 from langchain_aws import ChatBedrock
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
 
+import bedrock_data_retention
 import langgraph_agent as lg
 import skill
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_CLAUDE_MODEL = "us.anthropic.claude-sonnet-5"
+DEFAULT_GPT_MODEL = "openai.gpt-5.6-sol"
 DEFAULT_SKILLS = [
     "skill-creator",
     "pptx",
@@ -61,18 +67,11 @@ class CacheStats:
 
 
 def summarize_token_savings(stats_list: list[CacheStats]) -> dict[str, Any]:
-    """Compare total input tokens with vs without prompt caching.
-
-    Without caching, every call would process the full input footprint again.
-    With caching, ``cache_read`` tokens are reused instead of re-sent as new input.
-
-    reduction_% = total_cache_read / total_input_footprint
-    """
+    """Compare total input tokens with vs without prompt caching."""
     total_input = sum(s.billed_input_like for s in stats_list)
     total_cache_read = sum(s.cache_read for s in stats_list)
     total_cache_creation = sum(s.cache_creation for s in stats_list)
     total_uncached = sum(s.input_tokens for s in stats_list)
-    # Tokens that still need a full (non-read) pass: uncached + first-time writes.
     tokens_without_reuse = total_uncached + total_cache_creation
     reduction_ratio = (total_cache_read / total_input) if total_input else 0.0
     return {
@@ -90,7 +89,6 @@ def summarize_token_savings(stats_list: list[CacheStats]) -> dict[str, Any]:
 def _load_region() -> str:
     config_path = os.path.join(SCRIPT_DIR, "config.json")
     if not os.path.isfile(config_path):
-        # Fallback to application config when runtime config is absent.
         config_path = os.path.join(
             os.path.dirname(os.path.dirname(SCRIPT_DIR)),
             "application",
@@ -108,12 +106,14 @@ def _extract_cache_stats(label: str, message: AIMessage) -> CacheStats:
 
     cache_creation = int(
         details.get("cache_creation")
+        or details.get("cache_write_tokens")
         or rm.get("cache_write_input_tokens")
         or rm.get("cacheWriteInputTokens")
         or 0
     )
     cache_read = int(
         details.get("cache_read")
+        or details.get("cached_tokens")
         or rm.get("cache_read_input_tokens")
         or rm.get("cacheReadInputTokens")
         or 0
@@ -152,7 +152,6 @@ def _build_tools() -> list:
         if t.name not in {x.name for x in tools}:
             tools.append(t)
 
-    # Ensure at least one tiny tool for a deterministic 2-step loop.
     @tool
     def echo_cache_probe(text: str) -> str:
         """Echo text. Used only by the prompt-caching probe."""
@@ -164,7 +163,6 @@ def _build_tools() -> list:
 
 
 def _build_chatbedrock(model_id: str, region: str) -> ChatBedrock:
-    """ChatBedrock Anthropic path (no temperature) — matches default Claude call_model."""
     client = boto3.client(
         "bedrock-runtime",
         region_name=region,
@@ -179,6 +177,19 @@ def _build_chatbedrock(model_id: str, region: str) -> ChatBedrock:
     )
 
 
+def _build_mantle_chat(model_id: str, region: str) -> ChatOpenAI:
+    def bearer_token_provider() -> str:
+        return bedrock_data_retention.get_bedrock_bearer_token(region)
+
+    return ChatOpenAI(
+        model=model_id,
+        api_key=bearer_token_provider,
+        base_url=f"https://bedrock-mantle.{region}.api.aws/openai/v1",
+        use_responses_api=True,
+        max_tokens=256,
+    )
+
+
 def _print_stats(stats: CacheStats) -> None:
     print(
         f"  [{stats.label}] "
@@ -190,12 +201,41 @@ def _print_stats(stats: CacheStats) -> None:
     )
 
 
+def _prepare_cached_model(
+    *,
+    model_id: str,
+    region: str,
+    tools: list,
+    run_nonce: str,
+):
+    use_gpt = lg._supports_gpt_explicit_caching("openai", model_id)
+    if use_gpt:
+        chat_model = _build_mantle_chat(model_id, region)
+        model = chat_model.bind_tools(tools).bind(
+            prompt_cache_key=f"probe:{run_nonce}",
+            prompt_cache_options=lg.GPT_PROMPT_CACHE_OPTIONS,
+        )
+        cache_mode = "gpt-explicit"
+    else:
+        chat_model = _build_chatbedrock(model_id, region)
+        model = chat_model.bind_tools(tools).bind(cache_control=lg.PROMPT_CACHE_CONTROL)
+        cache_mode = "bedrock-converse"
+    return model, cache_mode
+
+
+def _prepare_system_message(system_for_run: str, model_id: str) -> Any:
+    if lg._supports_gpt_explicit_caching("openai", model_id):
+        return lg._system_message_with_gpt_cache(system_for_run)
+    return lg._system_message_with_bedrock_cache(system_for_run)
+
+
 def run_tool_loop_probe(
     *,
-    model_id: str = "us.anthropic.claude-sonnet-5",
+    model_id: str = DEFAULT_CLAUDE_MODEL,
+    region: str | None = None,
     skill_list: list[str] | None = None,
 ) -> dict[str, Any]:
-    region = _load_region()
+    region = region or _load_region()
     skill_list = skill_list or DEFAULT_SKILLS
     system = _build_system_prompt(skill_list)
     tools = _build_tools()
@@ -205,18 +245,21 @@ def run_tool_loop_probe(
     print(f"model_id={model_id}")
     print(f"skills={skill_list}")
     print(f"system_chars={len(system)} (~{len(system) // 4} tokens)")
-    print(f"tools={len(tools)} names={ [t.name for t in tools] }")
+    print(f"tools={len(tools)} names={[t.name for t in tools]}")
 
-    chat_model = _build_chatbedrock(model_id, region)
-    model = chat_model.bind_tools(tools).bind(cache_control=lg.PROMPT_CACHE_CONTROL)
-    # Unique nonce so this run's call1 is a cold cache write (not a hit from a prior run).
     run_nonce = uuid.uuid4().hex[:8]
     system_for_run = (
         f"{system}\n\n## Cache probe run id\n"
         f"- run_id: {run_nonce}\n"
     )
-    system_msg = lg._system_message_with_cache(system_for_run)
-    print(f"run_id={run_nonce} (forces cold cache on call1)")
+    model, cache_mode = _prepare_cached_model(
+        model_id=model_id,
+        region=region,
+        tools=tools,
+        run_nonce=run_nonce,
+    )
+    system_msg = _prepare_system_message(system_for_run, model_id)
+    print(f"run_id={run_nonce} cache_mode={cache_mode} (forces cold cache on call1)")
 
     user = HumanMessage(
         content=(
@@ -236,7 +279,6 @@ def run_tool_loop_probe(
         tool_msg = ToolMessage(content="hello-cache", tool_call_id=tc["id"])
         history = [system_msg, user, r1, tool_msg]
     else:
-        # Fallback: still exercise a 2nd request with the same system/tools prefix.
         synthetic = AIMessage(
             content="",
             tool_calls=[
@@ -259,11 +301,10 @@ def run_tool_loop_probe(
     print(f"  content={str(r2.content)[:160]!r}")
 
     savings = summarize_token_savings([s1, s2])
-
-    # Summary for README / CI-friendly stdout
     summary = {
         "model_id": model_id,
         "region": region,
+        "cache_mode": cache_mode,
         "skills": skill_list,
         "system_chars": len(system),
         "tool_count": len(tools),
@@ -329,7 +370,20 @@ def run_tool_loop_probe(
 
 
 def main() -> int:
-    summary = run_tool_loop_probe()
+    parser = argparse.ArgumentParser(description="Probe LangGraph prompt caching")
+    parser.add_argument(
+        "--model-id",
+        default=DEFAULT_CLAUDE_MODEL,
+        help=f"Bedrock model id (default: {DEFAULT_CLAUDE_MODEL})",
+    )
+    parser.add_argument(
+        "--region",
+        default=None,
+        help="AWS region (default: config.json region)",
+    )
+    args = parser.parse_args()
+
+    summary = run_tool_loop_probe(model_id=args.model_id, region=args.region)
     ok = (
         summary["call1"]["cache_creation"] > 0
         and summary["call2"]["cache_read"] > 0
