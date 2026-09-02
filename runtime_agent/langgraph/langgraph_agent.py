@@ -955,7 +955,7 @@ def _gpt_prompt_cache_key(config: dict, tools: list | None) -> str:
     thread_id = cfg.get("thread_id") or "default"
     tool_names = sorted(getattr(t, "name", str(t)) for t in (tools or []))
     tools_digest = hashlib.sha256(",".join(tool_names).encode()).hexdigest()[:12]
-    project = config.get("projectName") or "agentic-work"
+    project = config.get("projectName") or "default"
     return f"{project}:{thread_id}:{tools_digest}"
 
 
