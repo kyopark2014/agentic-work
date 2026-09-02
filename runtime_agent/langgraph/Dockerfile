@@ -38,6 +38,11 @@ RUN pip install python-docx openpyxl reportlab matplotlib pandas finance-datarea
 RUN pip install colorama rich
 # myslide / pptx QA: PPTX edit + SVG→PNG (avoid runtime pip install delays)
 RUN pip install python-pptx cairosvg
+RUN pip install python-dotenv
+
+# LangGraph runtime + graph embedding lib (hybrid wiki search on AgentCore)
+COPY runtime_agent/langgraph/ .
+COPY graph/lib/ graph/lib/
 
 # Skills that use docx-js / pptxgenjs / sharp via bash/node (local install for require())
 RUN npm install docx pptxgenjs sharp
@@ -47,8 +52,6 @@ ENV NODE_PATH=/app/node_modules
 RUN pip install aws-opentelemetry-distro>=0.10.0
 RUN pip install opentelemetry-instrumentation-langchain
 
-COPY . .
-
 # architecture-drawer: local draw.io CLI (vendored drawio-jsapi)
 RUN cd skills/architecture-drawer/scripts && npm install --omit=dev
 
@@ -57,8 +60,9 @@ RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser \
 
 USER appuser
 
-# Add the current directory to Python path
-ENV PYTHONPATH=/app
+# Add runtime + graph/lib to Python path (graph_embeddings → lib.embeddings)
+ENV PYTHONPATH=/app:/app/graph
+ENV APP_CONFIG_PATH=/app/config.json
 # Minimal config (MCP/LangGraph agent without full RAG keys in config.json)
 ENV ALLOW_MISSING_RAG_CONFIG=1
 ENV SESSION_STORAGE_DIR=/mnt/workspace

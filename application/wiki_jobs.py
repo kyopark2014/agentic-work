@@ -228,6 +228,13 @@ def ensure_wiki_sync(
         _running_users.add(user_id)
         _persist_state(user_id, state)
 
+    try:
+        from application import utils
+
+        utils.mirror_wiki_sync_status_to_runtime(user_id)
+    except Exception:
+        logger.exception("Wiki sync status mirror failed user=%s (queued)", user_id)
+
     thread = threading.Thread(
         target=_run_sync,
         args=(user_id, full, model_name),
@@ -236,6 +243,36 @@ def ensure_wiki_sync(
     )
     thread.start()
     return get_wiki_job_status(user_id)
+
+
+def _build_wiki_embeddings_and_mirror(user_id: str) -> None:
+    """Build node embeddings after sync, then mirror wiki (incl. embeddings) to Runtime."""
+    from application import utils
+    from application.graph_embeddings import maybe_build_node_embeddings
+
+    graph_json = Path(utils.wiki_graph_json_path(user_id))
+    if graph_json.is_file():
+        try:
+            emb_path = maybe_build_node_embeddings(graph_json)
+            if emb_path:
+                logger.info(
+                    "Wiki node embeddings built user=%s path=%s", user_id, emb_path
+                )
+        except Exception:
+            logger.exception("Wiki node embeddings build failed user=%s", user_id)
+
+    try:
+        result = utils.sync_user_wiki_to_runtime_storage(user_id)
+        logger.info(
+            "Wiki→runtime mirror user=%s uploaded=%s deleted=%s",
+            user_id,
+            result.get("uploaded", 0),
+            result.get("deleted", 0),
+        )
+    except Exception:
+        logger.exception(
+            "Wiki→runtime mirror failed for user=%s (sync still ready)", user_id
+        )
 
 
 def _is_sync_progress_line(text: str) -> bool:
@@ -395,6 +432,14 @@ def _run_sync(user_id: str, full: bool, model: str | None = None) -> None:
             state.pid = proc.pid
             state.updated_at = _now()
             _persist_state(user_id, state)
+        try:
+            from application import utils
+
+            utils.mirror_wiki_sync_status_to_runtime(user_id)
+        except Exception:
+            logger.exception(
+                "Wiki sync status mirror failed user=%s (running)", user_id
+            )
         logger.info("Wiki sync subprocess user=%s pid=%s", user_id, proc.pid)
 
         assert proc.stdout is not None
@@ -456,17 +501,7 @@ def _run_sync(user_id: str, full: bool, model: str | None = None) -> None:
             _active_procs.pop(user_id, None)
             _persist_state(user_id, state)
         logger.info("Wiki sync finished user=%s status=%s", user_id, state.status)
-        # Mirror wiki → agentcore-sessions so AgentCore Runtime recall_wiki
-        # can read graph.json + converted/*.md (same pattern as graph_jobs).
-        try:
-            from application import utils
-
-            utils.sync_user_wiki_to_runtime_storage(user_id)
-        except Exception:
-            logger.exception(
-                "Wiki→runtime mirror failed for user=%s (sync still ready)",
-                user_id,
-            )
+        _build_wiki_embeddings_and_mirror(user_id)
     except Exception as exc:
         if proc is not None and proc.poll() is None:
             try:
@@ -488,6 +523,12 @@ def _run_sync(user_id: str, full: bool, model: str | None = None) -> None:
             _running_users.discard(user_id)
             _active_procs.pop(user_id, None)
             _persist_state(user_id, state)
+        try:
+            from application import utils
+
+            utils.mirror_wiki_sync_status_to_runtime(user_id)
+        except Exception:
+            logger.exception("Wiki sync status mirror failed user=%s (error)", user_id)
         logger.exception("Wiki sync failed user=%s", user_id)
 
 

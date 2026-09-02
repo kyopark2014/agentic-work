@@ -22,8 +22,8 @@ RUNTIME_TYPE = "langgraph"
 
 
 def runtime_build_context() -> str:
-    """Directory that contains the LangGraph AgentCore Dockerfile."""
-    return script_dir
+    """Agentic-work repo root (Dockerfile copies runtime_agent/langgraph + graph/lib)."""
+    return os.path.dirname(os.path.dirname(script_dir))
 
 
 def ecr_repository_name(config: dict) -> str:
@@ -1534,7 +1534,7 @@ def build_and_push_arm64_image(
         print("  Build on an ARM64 EC2 instance (e.g. t4g, m7g) and retry.", flush=True)
         return False
 
-    dockerfile = os.path.join(build_context, "Dockerfile")
+    dockerfile = os.path.join(build_context, "runtime_agent", "langgraph", "Dockerfile")
     build_command = [
         "docker",
         "build",

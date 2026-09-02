@@ -781,6 +781,42 @@ def sync_user_graph_to_runtime_storage(user_id: str | None) -> dict[str, int]:
 
 
 _WIKI_MIRROR_SKIP_DIR_NAMES = frozenset({"cache"})
+WIKI_SYNC_STATUS_FILENAME = ".wiki_sync_status.json"
+
+
+def mirror_wiki_sync_status_to_runtime(user_id: str | None) -> bool:
+    """Push ``.wiki_sync_status.json`` so Runtime MCP can detect in-progress wiki jobs."""
+    segment = sanitize_user_path_segment(user_id)
+    if not segment:
+        return False
+
+    status_local = os.path.join(wiki_graphify_out_dir(user_id), WIKI_SYNC_STATUS_FILENAME)
+    if not os.path.isfile(status_local):
+        return False
+
+    try:
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+    bucket = (cfg.get("s3_bucket") if isinstance(cfg, dict) else None) or s3_bucket
+    region = (cfg.get("region") if isinstance(cfg, dict) else None) or bedrock_region
+    if not bucket:
+        logger.warning("skip wiki sync status mirror: s3_bucket not configured")
+        return False
+
+    key = (
+        f"{S3_FILES_SESSION_PREFIX}/{segment}/wiki/graphify-out/"
+        f"{WIKI_SYNC_STATUS_FILENAME}"
+    )
+    with _without_env_proxies():
+        s3 = boto3.client("s3", region_name=region)
+        try:
+            s3.upload_file(status_local, bucket, key)
+            logger.info("Mirrored wiki sync status → s3://%s/%s", bucket, key)
+            return True
+        except Exception as e:
+            logger.warning("wiki sync status mirror failed %s: %s", key, e)
+            return False
 
 
 def sync_user_wiki_to_runtime_storage(user_id: str | None) -> dict[str, int]:
@@ -1572,12 +1608,13 @@ def generate_rag_upload_presigned_put(
 
 
 def _s3_client_for_presign():
-    """S3 client for browser-safe regional, virtual-hostedpresigned URLs.
+    """S3 client for browser-safe regional, virtual-hosted presigned URLs.
 
     Global ``*.s3.amazonaws.com`` hosts often 307-redirect to the region
     endpoint; browsers then fail the signed PUT (403/CORS) and our API never
-    sees ``/load/complete``. Prefer virtual-hosted
-    ``https://{bucket}.s3.{region}.amazonaws.com/...``.
+    sees ``/complete``. Prefer virtual-hosted
+    ``https://{bucket}.s3.{region}.amazonaws.com/...`` via SigV4 + regional
+    endpoint so the browser PUT never follows a TemporaryRedirect.
     """
     from botocore.config import Config
 
@@ -1585,6 +1622,7 @@ def _s3_client_for_presign():
     return boto3.client(
         service_name="s3",
         region_name=region,
+        endpoint_url=f"https://s3.{region}.amazonaws.com",
         config=Config(
             signature_version="s3v4",
             s3={"addressing_style": "virtual"},
