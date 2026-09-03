@@ -45,8 +45,10 @@ COPY runtime_agent/langgraph/ .
 COPY graph/lib/ graph/lib/
 
 # Skills that use docx-js / pptxgenjs / sharp via bash/node (local install for require())
-RUN npm install docx pptxgenjs sharp
+# mcp-server-fetch-typescript: preinstall so web_fetch MCP skips npx/npm cold start
+RUN npm install docx pptxgenjs sharp mcp-server-fetch-typescript
 ENV NODE_PATH=/app/node_modules
+ENV PATH="/app/node_modules/.bin:${PATH}"
 
 # OpenTelemetry (ADOT + LangChain instrumentation for AgentCore Evaluations)
 RUN pip install aws-opentelemetry-distro>=0.10.0

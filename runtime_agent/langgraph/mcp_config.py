@@ -145,11 +145,33 @@ def load_config(mcp_type):
         }    
     
     elif mcp_type == "web_fetch":
+        # Prefer image-preinstalled package over npx (avoids NAT/npm cold start).
+        command = shutil.which("mcp-server-fetch-typescript")
+        args: list[str] = []
+        if not command:
+            local_entry = os.path.join(
+                workingDir,
+                "node_modules",
+                "mcp-server-fetch-typescript",
+                "build",
+                "index.js",
+            )
+            if os.path.isfile(local_entry):
+                command = "node"
+                args = [local_entry]
+            else:
+                logger.warning(
+                    "mcp-server-fetch-typescript is not preinstalled; "
+                    "falling back to npx (slow on cold start). "
+                    "Install with: npm install mcp-server-fetch-typescript"
+                )
+                command = "npx"
+                args = ["-y", "mcp-server-fetch-typescript"]
         return {
             "mcpServers": {
                 "web_fetch": {
-                    "command": "npx",
-                    "args": ["-y", "mcp-server-fetch-typescript"]
+                    "command": command,
+                    "args": args,
                 }
             }
         }
