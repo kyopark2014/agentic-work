@@ -25,12 +25,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN pip install --upgrade "setuptools>=83.0.0" \
     && pip install "urllib3>=2.7.0" boto3 botocore --upgrade
-RUN pip install langchain_aws langchain langchain_community langgraph langchain-openai langchain-anthropic "openai>=2.41.0" aws-bedrock-token-generator
+RUN pip install langchain_aws "langchain[mcp]>=1.4.0" langchain_community "langgraph>=1.2.11" langchain-openai langchain-anthropic "openai>=2.41.0" aws-bedrock-token-generator
 RUN pip install langgraph-checkpoint-sqlite aiosqlite
-# Keep FastMCP (mcp.server.fastmcp). mcp 2.x removed it; pin 1.x for stdio MCP servers.
-RUN pip install "mcp>=1.9.0,<2" langchain-mcp-adapters awslabs.aws-documentation-mcp-server
+RUN pip install "mcp>=2.1.1" httpx2 awslabs.aws-documentation-mcp-server
 RUN pip install "bedrock-agentcore>=1.18.1" uv
-RUN pip install "mcp>=1.9.0,<2"
 RUN pip install Pillow pytz tavily-python langchain-text-splitters
 RUN pip install networkx
 RUN pip install requests beautifulsoup4

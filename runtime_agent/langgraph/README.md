@@ -39,8 +39,8 @@ FROM --platform=linux/arm64 python:3.13-slim
 WORKDIR /app
 
 RUN pip install boto3 botocore --upgrade
-RUN pip install langchain_aws langchain langchain_community langchain_experimental langgraph
-RUN pip install mcp langchain-mcp-adapters
+RUN pip install langchain_aws "langchain[mcp]>=1.4.0" langchain_community langchain_experimental "langgraph>=1.2.11"
+RUN pip install "mcp>=2.1.1" httpx2
 RUN pip install bedrock-agentcore bedrock-agentcore-starter-toolkit uv
 
 # OpenTelemetry
@@ -61,6 +61,7 @@ AgentCore에서 사용할 Agent를 agent.py로 구현합니다.
 
 ```python
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
+from langchain.mcp import MCPAdapter
 
 app = BedrockAgentCoreApp()
 
@@ -73,8 +74,10 @@ async def agent_langgraph(payload):
     mcp_json = mcp_config.load_selected_config(mcp_servers)
     server_params = langgraph_agent.load_multiple_mcp_server_parameters(mcp_json)
 
-    client = MultiServerMCPClient(server_params)
-    tools = await client.get_tools()
+    tools = []
+    for server_name, params in server_params.items():
+        async with MCPAdapter({"mcpServers": {server_name: params}}) as adapter:
+            tools.extend(await adapter.list_tools())
     
     tool_list = [tool.name for tool in tools]
     

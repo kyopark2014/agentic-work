@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl \
 
 RUN pip install --upgrade "setuptools>=83.0.0" \
     && pip install \
-    fastapi \
+    "fastapi>=0.134.0" \
     "python-multipart>=0.0.31" \
     "urllib3>=2.7.0" \
     uvicorn[standard] \

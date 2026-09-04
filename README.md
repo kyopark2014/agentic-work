@@ -58,8 +58,8 @@ flowchart TB
     IG[image generation]
   end
 
-  subgraph MCPClient["langchain mcp adapters"]
-    LGM[MultiServerMCPClient]
+  subgraph MCPClient["langchain.mcp"]
+    LGM[MCPAdapter]
   end
 
   subgraph LLM["Amazon Bedrock runtime"]
@@ -96,7 +96,7 @@ flowchart TB
 | 모드 | 모듈 | 설명 |
 |------|------|------|
 | **Agent (Chat)** | `application/server.py` → `agentcore_client.run_agent` | 태스크별 `runtimeSessionId`로 대화 이력(checkpoint) 유지 |
-| LangGraph Runtime | `runtime_agent/langgraph/agent.py` | LangGraph StateGraph + `MultiServerMCPClient` + 내장 도구 |
+| LangGraph Runtime | `runtime_agent/langgraph/agent.py` | LangGraph StateGraph + `langchain.mcp.MCPAdapter` + 내장 도구 |
 | Skill | `runtime_agent/langgraph/skill.py` · `runtime_agent/langgraph/skills/` | `SKILL.md` 기반 지침. UI `application/skills.list`에서 선택 후 `get_skill_instructions`로 로드 |
 | MCP (로컬 stdio) | `runtime_agent/langgraph/mcp_server_*.py` | Agent 컨테이너 안에서 subprocess로 기동 (`runtime_agent/langgraph/mcp_config.py`가 command/args 정의) |
 | Web UI | 루트 `Dockerfile` → ECS | FastAPI + React SPA. Agent 추론은 AgentCore에서 수행 |
@@ -252,17 +252,21 @@ def buildChatAgentWithHistory(tools):
 ```
 
 
-[runtime_agent/langgraph/agent.py](./runtime_agent/langgraph/agent.py)와 같이 stream 방식으로 처리하면 agent가 좀 더 동적으로 동작하게 할 수 있습니다. 아래와 같이 MCP 서버의 정보로 json 파일을 만든 후에 MultiServerMCPClient으로 client를 설정하고 나서 agent를 생성합니다. 이후 stream을 이용해 출력할때 json 형태의 결과값을 stream으로 전달합니다. 
+[runtime_agent/langgraph/agent.py](./runtime_agent/langgraph/agent.py)와 같이 stream 방식으로 처리하면 agent가 좀 더 동적으로 동작하게 할 수 있습니다. 아래와 같이 MCP 서버의 정보로 json 파일을 만든 후에 `langchain.mcp.MCPAdapter`로 client를 설정하고 나서 agent를 생성합니다. 이후 stream을 이용해 출력할때 json 형태의 결과값을 stream으로 전달합니다. 
 
 ```python
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
+from langchain.mcp import MCPAdapter
 app = BedrockAgentCoreApp()
 
 @app.entrypoint
 async def agent_langgraph(payload):
     mcp_json = mcp_config.load_selected_config(mcp_servers)
     server_params = load_multiple_mcp_server_parameters(mcp_json)
-    client = MultiServerMCPClient(server_params)
+    tools = []
+    for server_name, params in server_params.items():
+        async with MCPAdapter({"mcpServers": {server_name: params}}) as adapter:
+            tools.extend(await adapter.list_tools())
 
     app = buildChatAgentWithHistory(tools)
     config = {
@@ -921,6 +925,7 @@ Streamlit에서 입력하면 AgentCore endpoint로 전달되는데 이때에 아
 ```python
 import httpx
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
+from langchain.mcp import MCPAdapter
 
 app = BedrockAgentCoreApp()
 
@@ -928,8 +933,10 @@ app = BedrockAgentCoreApp()
 async def agent_langgraph(payload):
     httpx.AsyncClient.__init__ = patched_init
     
-    client = MultiServerMCPClient(server_params)
-    tools = await client.get_tools()
+    tools = []
+    for server_name, params in server_params.items():
+        async with MCPAdapter({"mcpServers": {server_name: params}}) as adapter:
+            tools.extend(await adapter.list_tools())
     
     app = langgraph_agent.buildChatAgentWithHistory(tools)
     config = {
@@ -1688,7 +1695,7 @@ Long-term 조회가 잘 되려면:
 
 | 파일 | 역할 |
 |------|------|
-| [mcp_server_memory.py](./runtime_agent/langgraph/mcp_server_memory.py) | FastMCP 도구 `recall_memory` (stdio) |
+| [mcp_server_memory.py](./runtime_agent/langgraph/mcp_server_memory.py) | MCPServer 도구 `recall_memory` (stdio) |
 | [mcp_memory.py](./runtime_agent/langgraph/mcp_memory.py) | `retrieve` / `list` / `get` → Bedrock AgentCore Data Plane |
 | [mcp_config.py](./runtime_agent/langgraph/mcp_config.py) | `mcp_type == "memory"` → `mcp_server_memory.py` |
 | [mcp.list](./runtime_agent/langgraph/mcp.list) | UI에서 선택 가능한 MCP에 `memory` 포함 |

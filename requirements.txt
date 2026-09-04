@@ -3,7 +3,7 @@
 # py>=1.11.0 (CVE-2020-29651), tqdm>=4.66.3 (CVE-2016-10075 / CVE-2024-34062)
 bedrock-agentcore>=1.18.1
 bedrock-agentcore-starter-toolkit
-fastapi
+fastapi>=0.134.0
 python-multipart>=0.0.31
 urllib3>=2.7.0
 setuptools>=83.0.0
@@ -14,7 +14,7 @@ pandas
 numpy
 boto3>=1.43.32
 langchain_aws
-langchain
+langchain[mcp]>=1.4.0
 tavily-python==0.5.0
 yfinance==0.2.52
 finance-datareader
@@ -25,7 +25,7 @@ plotly_express==0.4.1
 matplotlib==3.10.0
 PyPDF2==3.0.1
 opensearch-py
-mcp
+mcp>=2.1.1
 wikipedia
 aioboto3
 aiohttp>=3.14.1,<4.0.0
@@ -50,12 +50,12 @@ aiosqlite
 aws-bedrock-token-generator
 aws-opentelemetry-distro>=0.10.0
 httpx
+httpx2
 langchain-anthropic
-langchain-mcp-adapters
 langchain-openai
 langchain-text-splitters
 langchain_community
-langgraph
+langgraph>=1.2.11
 langgraph-checkpoint-sqlite
 openai>=2.41.0
 opentelemetry-instrumentation-langchain

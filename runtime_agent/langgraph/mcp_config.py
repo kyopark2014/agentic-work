@@ -102,12 +102,7 @@ def load_config(mcp_type):
                 "uv tool install awslabs.aws-documentation-mcp-server)"
             )
             command = "uvx"
-            # mcp 2.x removed mcp.server.fastmcp; pin 1.x for this server.
-            args = [
-                "--with",
-                "mcp>=1.9.0,<2",
-                "awslabs.aws-documentation-mcp-server",
-            ]
+            args = ["awslabs.aws-documentation-mcp-server"]
         return {
             "mcpServers": {
                 "awslabs.aws-documentation-mcp-server": {
