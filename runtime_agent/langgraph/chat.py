@@ -2323,6 +2323,56 @@ agent_config = None
 active_mcp_servers = []
 active_skills = []
 current_id = None
+_active_agent_session = None
+
+
+async def get_or_create_agent(
+    mcp_servers: list,
+    skill_list: list,
+    runtime_session_id: str | None = None,
+):
+    """Reuse the previously built LangGraph app/tools when nothing changed.
+
+    ``create_agent()`` always rebuilds every MCP client from scratch (which
+    respawns stdio subprocesses such as memory/wiki/kb-retriever). That is
+    correct the first time a microVM handles a session, but on every
+    subsequent invoke within the *same* microVM + session, rebuilding is
+    pure waste if mcp_servers/skill_list/user_id/session are unchanged.
+
+    This wrapper compares the current call's parameters against the last
+    successful build (kept in module-level globals, i.e. scoped to this
+    microVM's process) and short-circuits to the cached (app, agent_config)
+    when nothing relevant changed.
+    """
+    global app, agent_config, active_mcp_servers, active_skills, current_id, _active_agent_session
+
+    session_id = runtime_session_id or _checkpoint_session_id()
+
+    if (
+        app is not None
+        and active_mcp_servers == mcp_servers
+        and active_skills == skill_list
+        and current_id == user_id
+        and _active_agent_session == session_id
+    ):
+        logger.info(
+            f"Reusing cached agent/MCP tools (session={session_id}, "
+            f"mcp_servers={mcp_servers}, skills={skill_list})"
+        )
+        return app, agent_config
+
+    logger.info(
+        f"Building new agent/MCP tools (session changed: {_active_agent_session} -> {session_id}, "
+        f"or mcp_servers/skills/user_id changed)"
+    )
+    active_mcp_servers = mcp_servers
+    active_skills = skill_list
+    current_id = user_id
+    _active_agent_session = session_id
+
+    app, agent_config = await create_agent(mcp_servers, skill_list, runtime_session_id)
+    return app, agent_config
+
 
 async def run_langgraph_agent(query: str, mcp_servers: list, skill_list: list):
     global app, agent_config, active_mcp_servers, active_skills, current_id

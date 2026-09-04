@@ -199,7 +199,7 @@ async def agent_langgraph(payload):
                 return
 
         try:
-            app, config = await chat.create_agent(
+            app, config = await chat.get_or_create_agent(
                 mcp_servers,
                 skill_list,
                 runtime_session_id=runtime_session_id,
