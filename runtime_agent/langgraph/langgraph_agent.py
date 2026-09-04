@@ -925,8 +925,11 @@ BASE_SYSTEM_PROMPT = (
 
 MAX_CONTEXT_TURNS = 5
 
-# Bedrock Anthropic/Nova prompt caching (ephemeral, 5m TTL).
-PROMPT_CACHE_CONTROL = {"type": "ephemeral", "ttl": "5m"}
+# Bedrock Anthropic/Nova prompt caching (ephemeral, 1h TTL).
+# Bedrock supports "5m" (default) or "1h" for Claude cache_control.ttl; all
+# Claude models currently in info.py (Fable/Mythos 5.x, Opus 4.5-5, Sonnet
+# 4.5-5, Haiku 4.5) support the 1h option. Nova ignores ttl (implicit cache).
+PROMPT_CACHE_CONTROL = {"type": "ephemeral", "ttl": "1h"}
 
 # Mantle GPT 5.6+ explicit prompt caching (Responses API, 30m TTL).
 GPT_PROMPT_CACHE_OPTIONS = {"mode": "explicit", "ttl": "30m"}
@@ -960,13 +963,19 @@ def _gpt_prompt_cache_key(config: dict, tools: list | None) -> str:
 
 
 def _system_message_with_bedrock_cache(system: str) -> SystemMessage:
-    """Build a SystemMessage with an Anthropic/Nova cache breakpoint."""
+    """Build a SystemMessage with an Anthropic/Nova cache breakpoint.
+
+    Uses the same ttl as PROMPT_CACHE_CONTROL (the last-message breakpoint)
+    so both checkpoints share one TTL. Anthropic requires longer-TTL
+    breakpoints to appear before shorter ones in the prompt; since system
+    comes before messages, mismatched TTLs here would violate that order.
+    """
     return SystemMessage(
         content=[
             {
                 "type": "text",
                 "text": system,
-                "cache_control": {"type": "ephemeral"},
+                "cache_control": dict(PROMPT_CACHE_CONTROL),
             }
         ]
     )

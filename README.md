@@ -1531,7 +1531,7 @@ Human(Q2) → AI(A2) → Human(Q3) → AI(tool_calls) → ToolMessage → AI(A3)
 
 LangGraph tool loop마다 반복되는 **system prompt + tool schema**에 [Amazon Bedrock prompt caching](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html)을 적용합니다.
 
-- **Claude / Nova**: `cache_control` (5m TTL)
+- **Claude / Nova**: `cache_control` (1h TTL; Anthropic/Bedrock은 `5m` 또는 `1h`만 지원)
 - **GPT 5.6+ (Mantle)**: `prompt_cache_breakpoint` explicit mode (30m TTL)
 - **GPT 5.5 이하**: AWS implicit caching (자동, 코드 미적용)
 

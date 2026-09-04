@@ -8,7 +8,7 @@ LangGraph 에이전트는 tool loop마다 동일한 **system prompt + tool schem
 
 | 경로 | model_type | 모델 예 | 캐싱 방식 |
 |------|------------|---------|-----------|
-| **Claude / Nova** | `claude`, `nova` | `us.anthropic.claude-sonnet-5` | Explicit (`cache_control`) |
+| **Claude / Nova** | `claude`, `nova` | `us.anthropic.claude-sonnet-5` | Explicit (`cache_control`, TTL 1h) |
 | **GPT 5.6+ (Mantle)** | `openai` | `openai.gpt-5.6-sol`, `-terra`, `-luna` | Explicit (`prompt_cache_breakpoint`) |
 | **GPT 5.5 이하 (Mantle)** | `openai` | `openai.gpt-5.5`, `openai.gpt-5.4` | Implicit (AWS 자동, 코드 미적용) |
 
@@ -26,7 +26,7 @@ GPT 5.6+는 Mantle Responses API(`mantle_api: "responses"`)에서 explicit cachi
 
 ```python
 # runtime_agent/langgraph/langgraph_agent.py
-PROMPT_CACHE_CONTROL = {"type": "ephemeral", "ttl": "5m"}
+PROMPT_CACHE_CONTROL = {"type": "ephemeral", "ttl": "1h"}
 
 
 def _supports_bedrock_prompt_caching(model_type: str | None) -> bool:
@@ -39,7 +39,7 @@ def _system_message_with_bedrock_cache(system: str) -> SystemMessage:
             {
                 "type": "text",
                 "text": system,
-                "cache_control": {"type": "ephemeral"},
+                "cache_control": dict(PROMPT_CACHE_CONTROL),  # same ttl as last-message breakpoint
             }
         ]
     )
@@ -61,7 +61,10 @@ if use_bedrock_cache:
 
 ### 특성
 
-- TTL: **5분** (`ephemeral`)
+- TTL: **1시간** (`ephemeral`, `ttl: "1h"`) — OpenAI Mantle(30분)과 자릿수는 다르지만 Anthropic/Bedrock은 `5m` 또는 `1h`만 지원해 `30m`으로는 맞출 수 없음. 기본값(5분)보다 긴 세션·tool loop 간격에 대응하기 위해 1h로 설정.
+  - 지원 모델(2026-09 기준, Bedrock): Claude Fable 5 / 5.1, Opus 4.5–5, Sonnet 4.5–5, Haiku 4.5 — `info.py`에 등록된 모델은 모두 해당되어 제외할 모델 없음
+  - cache write 비용은 5m 대비 2배(1.25× → 2×), read는 동일(0.1×)하므로 호출 간격이 실제로 5분을 자주 넘는 워크로드에서 유리
+  - system breakpoint(`_system_message_with_bedrock_cache`)와 last-message breakpoint(`PROMPT_CACHE_CONTROL`)의 ttl을 동일하게 유지해야 함 — Anthropic은 "긴 TTL이 짧은 TTL보다 앞에 와야 함" 규칙이 있어, system(선행)이 5m이고 last message(후행)가 1h이면 순서 위반이 됨
 - 최소 prefix: 모델별 512~4,096 tokens (대부분 skill XML + tool schema는 임계치 초과)
 - tool loop **2번째 LLM 호출부터** `cache_read` 발생이 일반적
 - 스트리밍 usage 파싱: [`bedrock_stream_usage_patch.py`](./runtime_agent/langgraph/bedrock_stream_usage_patch.py)
