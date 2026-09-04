@@ -963,22 +963,23 @@ def _gpt_prompt_cache_key(config: dict, tools: list | None) -> str:
 
 
 def _system_message_with_bedrock_cache(system: str) -> SystemMessage:
-    """Build a SystemMessage with an Anthropic/Nova cache breakpoint.
+    """Build a SystemMessage for Bedrock prompt caching.
 
-    Uses the same ttl as PROMPT_CACHE_CONTROL (the last-message breakpoint)
-    so both checkpoints share one TTL. Anthropic requires longer-TTL
-    breakpoints to appear before shorter ones in the prompt; since system
-    comes before messages, mismatched TTLs here would violate that order.
+    Do **not** embed ``cache_control`` on the system content block.
+
+    ``ChatBedrock`` (InvokeModel) strips ``ttl`` from system
+    ``cache_control`` down to ``{"type": "ephemeral"}``, which Bedrock
+    treats as ``5m``. Combined with ``model.bind(cache_control=… ttl=1h)``
+    on the last message, that violates Anthropic's rule that longer TTLs
+    must precede shorter ones (tools → system → messages) and raises
+    ``ValidationException``.
+
+    ``ChatBedrockConverse`` ignores Anthropic-format ``cache_control`` on
+    system text and applies matching ``cachePoint`` blocks (tools /
+    system / last message) from ``bind(cache_control=PROMPT_CACHE_CONTROL)``
+    alone — so a plain SystemMessage is correct for both wrappers.
     """
-    return SystemMessage(
-        content=[
-            {
-                "type": "text",
-                "text": system,
-                "cache_control": dict(PROMPT_CACHE_CONTROL),
-            }
-        ]
-    )
+    return SystemMessage(content=system)
 
 
 def _system_message_with_gpt_cache(system: str) -> SystemMessage:

@@ -20,12 +20,13 @@ GPT 5.6+는 Mantle Responses API(`mantle_api: "responses"`)에서 explicit cachi
 
 ### 적용 방식
 
-1. **SystemMessage cache breakpoint** — system 텍스트를 content block으로 보내고 `cache_control: ephemeral`을 붙입니다.
-2. **`model.bind(cache_control=...)`** — last message에 cache marker를 추가합니다. `ChatBedrockConverse`(Guardrail 경로)는 system + tools + last message에 `cachePoint`를 자동 삽입합니다.
+1. **Plain SystemMessage** — system에 Anthropic-format `cache_control`을 붙이지 **않습니다**.
+   (`ChatBedrock`가 system의 `ttl`을 제거하고 `5m` 기본값으로 두면, last-message `1h`와 충돌해 `ValidationException`이 납니다.)
+2. **`model.bind(cache_control=PROMPT_CACHE_CONTROL)`** — TTL **`1h`** 로 last-message(및 Converse의 tools/system) breakpoint를 맞춥니다.
 3. **관측** — 응답 `usage_metadata.input_token_details`의 `cache_read` / `cache_creation`을 로그합니다.
 
 ```python
-# runtime_agent/langgraph/langgraph_agent.py
+# langgraph_agent.py
 PROMPT_CACHE_CONTROL = {"type": "ephemeral", "ttl": "1h"}
 
 
@@ -34,15 +35,8 @@ def _supports_bedrock_prompt_caching(model_type: str | None) -> bool:
 
 
 def _system_message_with_bedrock_cache(system: str) -> SystemMessage:
-    return SystemMessage(
-        content=[
-            {
-                "type": "text",
-                "text": system,
-                "cache_control": dict(PROMPT_CACHE_CONTROL),  # same ttl as last-message breakpoint
-            }
-        ]
-    )
+    # No embedded cache_control — bind() alone owns the 1h breakpoint(s).
+    return SystemMessage(content=system)
 ```
 
 `call_model`에서의 사용:
@@ -56,15 +50,15 @@ if use_bedrock_cache:
 
 | Wrapper | cache 동작 |
 |---------|------------|
-| `ChatBedrock` (기본 Claude, Guardrail 없음) | system content block + last message `cache_control` → prefix(system/tools 포함) 캐시 |
-| `ChatBedrockConverse` (Guardrail 활성) | `cache_control` bind 시 system / tools / last message에 `cachePoint` 삽입 |
+| `ChatBedrock` (기본 Claude, Guardrail 없음) | last message `cache_control` ttl=`1h` → prefix(system/tools 포함) 캐시 |
+| `ChatBedrockConverse` (Guardrail 활성) | `bind` 시 system / tools / last message에 `cachePoint` ttl=`1h` 삽입 |
 
 ### 특성
 
-- TTL: **1시간** (`ephemeral`, `ttl: "1h"`) — OpenAI Mantle(30분)과 자릿수는 다르지만 Anthropic/Bedrock은 `5m` 또는 `1h`만 지원해 `30m`으로는 맞출 수 없음. 기본값(5분)보다 긴 세션·tool loop 간격에 대응하기 위해 1h로 설정.
+- TTL: **1시간** (`ephemeral`, tools/system/messages 동일)
   - 지원 모델(2026-09 기준, Bedrock): Claude Fable 5 / 5.1, Opus 4.5–5, Sonnet 4.5–5, Haiku 4.5 — `info.py`에 등록된 모델은 모두 해당되어 제외할 모델 없음
   - cache write 비용은 5m 대비 2배(1.25× → 2×), read는 동일(0.1×)하므로 호출 간격이 실제로 5분을 자주 넘는 워크로드에서 유리
-  - system breakpoint(`_system_message_with_bedrock_cache`)와 last-message breakpoint(`PROMPT_CACHE_CONTROL`)의 ttl을 동일하게 유지해야 함 — Anthropic은 "긴 TTL이 짧은 TTL보다 앞에 와야 함" 규칙이 있어, system(선행)이 5m이고 last message(후행)가 1h이면 순서 위반이 됨
+  - system에는 `cache_control`을 넣지 않고 `bind(cache_control=PROMPT_CACHE_CONTROL)`의 1h만 사용 (`ChatBedrock`이 system ttl을 strip하면 5m/1h 충돌)
 - 최소 prefix: 모델별 512~4,096 tokens (대부분 skill XML + tool schema는 임계치 초과)
 - tool loop **2번째 LLM 호출부터** `cache_read` 발생이 일반적
 - 스트리밍 usage 파싱: [`bedrock_stream_usage_patch.py`](./runtime_agent/langgraph/bedrock_stream_usage_patch.py)
