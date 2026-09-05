@@ -34,6 +34,7 @@ from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, AIMessageChunk
 from langchain.mcp import MCPAdapter
+from tool_interceptor import wrap_mcp_tools
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.checkpoint.memory import MemorySaver
 
@@ -2282,7 +2283,7 @@ async def create_agent(
             async with MCPAdapter({"mcpServers": {server_name: params}}) as adapter:
                 logger.info(f"MCP client initialized for server: {server_name}")
                 mcp_tools = await adapter.list_tools()
-            for tool in mcp_tools:
+            for tool in wrap_mcp_tools(mcp_tools):
                 logger.info(f"mcp_tool: {tool.name} (from {server_name})")
                 if tool.name not in [t.name for t in tools]:
                     tools.append(tool)
