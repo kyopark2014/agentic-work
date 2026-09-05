@@ -39,9 +39,21 @@ def commit_streaming_segment(notification_queue, message: str):
         notification_queue.commit_text_segment(message)
 
 
-def tool_slot_update(notification_queue, slot_key: str, message: str):
+def tool_slot_update(
+    notification_queue,
+    slot_key: str,
+    message: str,
+    *,
+    mcp_server: str | None = None,
+    skill_name: str | None = None,
+):
     if notification_queue is not None:
-        notification_queue.tool_update(slot_key, message)
+        notification_queue.tool_update(
+            slot_key,
+            message,
+            mcp_server=mcp_server,
+            skill_name=skill_name,
+        )
 
 
 def on_tool_use_started(
@@ -125,9 +137,15 @@ def _process_tool_events(data_json: dict, notification_queue, stream_state: dict
             notification_queue,
             f"{tool_use_id}:input",
             f"Tool: {tool_name}, Input: {_format_tool_input(effective_input)}",
+            mcp_server=data_json.get("mcpServer"),
+            skill_name=data_json.get("skillName"),
         )
         tool_slot_update(
-            notification_queue, f"{tool_use_id}:result", f"Tool Result: {str(tool_result)}"
+            notification_queue,
+            f"{tool_use_id}:result",
+            f"Tool Result: {str(tool_result)}",
+            mcp_server=data_json.get("mcpServer"),
+            skill_name=data_json.get("skillName"),
         )
         _collect_tool_result_artifacts(tool_name, tool_result, references, image_url)
         return
@@ -151,6 +169,8 @@ def _process_tool_events(data_json: dict, notification_queue, stream_state: dict
                 notification_queue,
                 f"{tool_use_id}:input",
                 f"Tool: {tool}, Input: {_format_tool_input(effective_input)}",
+                mcp_server=data_json.get("mcpServer"),
+                skill_name=data_json.get("skillName"),
             )
 
 

@@ -522,6 +522,46 @@ select {
   color: var(--text-primary);
 }
 
+.task-delete-confirm {
+  align-items: center;
+  justify-content: center;
+  z-index: 1100;
+}
+
+.task-delete-modal {
+  max-width: min(380px, 92vw);
+}
+
+.task-delete-cancel {
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.task-delete-cancel:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.task-delete-confirm-btn {
+  padding: 8px 14px;
+  border: none;
+  border-radius: 8px;
+  background: #f87171;
+  color: #fff;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.task-delete-confirm-btn:hover {
+  background: #ef4444;
+}
+
 .task-menu-wrap {
   position: relative;
 }

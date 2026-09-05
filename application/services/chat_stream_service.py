@@ -176,6 +176,8 @@ class ChatStreamService:
             tool_meta[tool_use_id] = {
                 "tool": mapped.get("tool"),
                 "input": mapped.get("input", {}),
+                "mcpServer": mapped.get("mcpServer"),
+                "skillName": mapped.get("skillName"),
             }
             self.upsert_tool_event(tool_events, mapped)
             return events_to_emit
@@ -192,12 +194,18 @@ class ChatStreamService:
                     "tool": meta.get("tool", "unknown"),
                     "input": meta.get("input", {}),
                     "toolUseId": tool_use_id,
+                    "mcpServer": meta.get("mcpServer"),
+                    "skillName": meta.get("skillName"),
                 }
                 self.upsert_tool_event(tool_events, tool_event)
                 events_to_emit.insert(0, tool_event)
             if meta.get("tool"):
                 mapped = {**mapped, "tool": meta["tool"]}
                 events_to_emit[-1] = mapped
+            if "mcpServer" not in mapped and meta.get("mcpServer"):
+                mapped = {**mapped, "mcpServer": meta["mcpServer"]}
+            if "skillName" not in mapped and meta.get("skillName"):
+                mapped = {**mapped, "skillName": meta["skillName"]}
             self.upsert_tool_event(tool_events, mapped)
             return events_to_emit
 
@@ -228,7 +236,7 @@ class ChatStreamService:
             if tool_match:
                 tool_name = tool_match.group(1)
                 tool_input = parse_tool_input(tool_match.group(2))
-                return {
+                mapped = {
                     "type": "tool",
                     "tool": tool_name,
                     "input": tool_input,
@@ -236,13 +244,23 @@ class ChatStreamService:
                         event.get("toolUseId", tool_name)
                     ),
                 }
+                if event.get("mcpServer"):
+                    mapped["mcpServer"] = event["mcpServer"]
+                if event.get("skillName"):
+                    mapped["skillName"] = event["skillName"]
+                return mapped
             result_match = _TOOL_RESULT_RE.match(str(data))
             if result_match:
-                return {
+                mapped = {
                     "type": "tool_result",
                     "toolUseId": self.normalize_tool_use_id(event.get("toolUseId", "")),
                     "data": result_match.group(1),
                 }
+                if event.get("mcpServer"):
+                    mapped["mcpServer"] = event["mcpServer"]
+                if event.get("skillName"):
+                    mapped["skillName"] = event["skillName"]
+                return mapped
             return {"type": "info", "data": data}
 
         return event

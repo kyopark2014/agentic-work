@@ -2236,11 +2236,15 @@ async def create_agent(
     skill_list: list,
     runtime_session_id: str | None = None,
 ) -> tuple[str, list]:
+    global mcp_tool_servers
     session_id = runtime_session_id or _checkpoint_session_id()
     set_checkpoint_session_id(session_id)
     thread_scope = _thread_scope(session_id)
 
     await ensure_checkpointer()
+
+    # Reset server mapping whenever tools are rebuilt.
+    mcp_tool_servers = {}
 
     # builtin tools
     tools = langgraph_agent.get_builtin_tools()
@@ -2282,6 +2286,7 @@ async def create_agent(
                 logger.info(f"mcp_tool: {tool.name} (from {server_name})")
                 if tool.name not in [t.name for t in tools]:
                     tools.append(tool)
+                    mcp_tool_servers[tool.name] = server_name
                 else:
                     logger.info(f"mcp_tool of {tool.name} already in tools")
         except Exception as e:
@@ -2326,6 +2331,8 @@ active_mcp_servers = []
 active_skills = []
 current_id = None
 _active_agent_session = None
+# tool_name -> MCP server name (populated in create_agent)
+mcp_tool_servers: dict[str, str] = {}
 
 
 async def get_or_create_agent(

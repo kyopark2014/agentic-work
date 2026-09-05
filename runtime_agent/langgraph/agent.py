@@ -274,17 +274,27 @@ async def agent_langgraph(payload):
                 return None
             last_tool_args_json[tool_use_id] = args_json
             yielded_tool_ids.add(tool_use_id)
+            mcp_server = chat.mcp_tool_servers.get(tool_name)
             logger.info(
-                "tool_name: %s, content: %s, toolUseId: %s",
+                "tool_name: %s, content: %s, toolUseId: %s, mcpServer: %s",
                 tool_name,
                 args,
                 tool_use_id,
+                mcp_server,
             )
-            return {
+            payload = {
                 "tool": tool_name,
                 "input": args,
                 "toolUseId": tool_use_id,
             }
+            if mcp_server:
+                payload["mcpServer"] = mcp_server
+            # Skill tools (get_skill_instructions) carry skill_name for UI labels.
+            if tool_name == "get_skill_instructions" and isinstance(args, dict):
+                skill_name = args.get("skill_name")
+                if isinstance(skill_name, str) and skill_name.strip():
+                    payload["skillName"] = skill_name.strip()
+            return payload
 
         def tool_call_fields(tool_call) -> tuple[str, str, dict]:
             if isinstance(tool_call, dict):
@@ -524,11 +534,19 @@ async def agent_langgraph(payload):
                     payload = yield_tool_args(tool_use_id, tool_name, args_obj)
                     if payload:
                         yield payload
-                yield {
+                tool_result_payload = {
                     "toolResult": chunk.content,
                     "toolUseId": tool_use_id,
                     "tool": tool_name,
                 }
+                mcp_server = chat.mcp_tool_servers.get(tool_name)
+                if mcp_server:
+                    tool_result_payload["mcpServer"] = mcp_server
+                if tool_name == "get_skill_instructions":
+                    skill_name = (tool_args_by_id.get(tool_use_id) or {}).get("skill_name")
+                    if isinstance(skill_name, str) and skill_name.strip():
+                        tool_result_payload["skillName"] = skill_name.strip()
+                yield tool_result_payload
 
         for tool_use_id, args_raw in tool_input_list.items():
             if not args_raw or tool_use_id in tool_args_by_id:
