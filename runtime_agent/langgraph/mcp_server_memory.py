@@ -31,7 +31,7 @@ def recall_memory(
     action: str,
     query: Optional[str] = None,
     memory_record_id: Optional[str] = None,
-    max_results: Optional[int] = None,
+    max_results: Optional[int] = 4,
     next_token: Optional[str] = None,
 ) -> Dict:
     """
@@ -53,7 +53,7 @@ def recall_memory(
         action: One of "retrieve", "list", "get"
         query: Search text for retrieve (required for retrieve)
         memory_record_id: Required for get
-        max_results: Optional result cap
+        max_results: Result cap (default: 4)
         next_token: Optional pagination token
 
     Returns:

@@ -239,7 +239,7 @@ def recall_memory(
     action: str,
     query: Optional[str] = None,
     memory_record_id: Optional[str] = None,
-    max_results: Optional[int] = 10,
+    max_results: Optional[int] = 4,
     next_token: Optional[str] = None,
 ) -> Dict:
     """
@@ -271,6 +271,10 @@ def recall_memory(
         if action == "retrieve" and not (query or "").strip():
             query = "집 회사 주소 통근 교통 선호 프로필 요약 사실 user preferences home office commute summary facts"
             logger.info(f"retrieve query was empty; using default profile query: {query}")
+
+        # Cap results when caller omitted max_results (API defaults to ~10).
+        if max_results is None:
+            max_results = 4
 
         logger.info(f"###### action: {action} ######")
         try:
