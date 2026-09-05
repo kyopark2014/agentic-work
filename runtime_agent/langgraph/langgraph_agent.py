@@ -44,6 +44,8 @@ from urllib.parse import quote
 from langchain_core.tools import tool
 
 WORKING_DIR = os.path.dirname(os.path.abspath(__file__))
+# Builtin Agent Skills (SKILL.md trees) shipped in the runtime image.
+SKILLS_DIR = os.path.join(WORKING_DIR, "skills")
 # Per-user artifacts/skills under SESSION_STORAGE_DIR (set via set_user_workspace).
 ARTIFACTS_DIR = utils.get_user_artifacts_dir("default")
 USER_SKILLS_DIR = utils.get_user_skills_dir("default")
@@ -595,6 +597,7 @@ _exec_globals = {
     "re": _re,
     "requests": _requests,
     "WORKING_DIR": WORKING_DIR,
+    "SKILLS_DIR": SKILLS_DIR,
     "ARTIFACTS_DIR": ARTIFACTS_DIR,  # updated by set_user_workspace()
     "USER_SKILLS_DIR": USER_SKILLS_DIR,  # updated by set_user_workspace()
     "register_korean_font": register_korean_font,
@@ -636,6 +639,7 @@ def execute_code(code: str) -> str:
 
     Path variables (pre-defined, do NOT redefine):
     - WORKING_DIR: absolute path to application directory
+    - SKILLS_DIR: absolute path to builtin skills (WORKING_DIR/skills); e.g. last30days engine
     - ARTIFACTS_DIR: absolute path to this user's artifacts ({SESSION_STORAGE_DIR}/{user_id}/artifacts)
     - USER_SKILLS_DIR: absolute path to this user's skills ({SESSION_STORAGE_DIR}/{user_id}/skills)
     - register_korean_font(): registers Nanum TTF or CID fallback for ReportLab; returns font name str

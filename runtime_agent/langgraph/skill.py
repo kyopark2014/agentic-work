@@ -131,13 +131,35 @@ class SkillManager:
         body = parts[2].strip()
         return frontmatter, body
 
+    def get_skill(self, name: str) -> Optional[Skill]:
+        """Return a registered Skill by name, or None."""
+        return self.registry.get(name)
+
     def get_skill_instructions(self, name: str) -> Optional[str]:
-        """Return full instructions for a skill (loaded on demand)."""
-        skill = self.registry.get(name)
-        return skill.instructions if skill else None
+        """Return full instructions for a skill (loaded on demand), with SKILL_DIR."""
+        skill = self.get_skill(name)
+        return format_skill_instructions(skill) if skill else None
 
 # define global skill_managers
 skill_managers: dict[str, SkillManager] = {}
+
+
+def format_skill_instructions(skill: Skill) -> str:
+    """Prefix skill body with SKILL_DIR so agents can run scripts without path search.
+
+    last30days and similar skills require SKILL_DIR = the directory containing
+    SKILL.md. This harness loads instructions via get_skill_instructions (not
+    a filesystem Read), so the path must be injected here.
+    """
+    return (
+        f"SKILL_DIR: {skill.path}\n"
+        f"Use SKILL_DIR as the absolute path for this skill's scripts "
+        f"(e.g. \"${{SKILL_DIR}}/scripts/...\"). "
+        f"Builtin skills are under SKILLS_DIR={SKILLS_DIR}; "
+        f"user-created skills are under USER_SKILLS_DIR "
+        f"(do not search USER_SKILLS_DIR for builtin engines).\n\n"
+        f"{skill.instructions}"
+    )
 
 def get_skills_xml(skill_info: list) -> str:
     lines = ["<available_skills>"]
@@ -270,10 +292,12 @@ SKILL_USAGE_GUIDE = (
     "\n## Skill 사용 가이드\n"
     "위의 <available_skills>에 나열된 skill이 사용자의 요청과 관련될 때:\n"
     "1. 먼저 get_skill_instructions 도구로 해당 skill의 상세 지침을 로드하세요.\n"
-    "2. **중요: 지침을 읽기 전에 어떤 작업을 할지 단정짓지 마세요.** "
+    "2. 응답 첫 줄의 SKILL_DIR을 그대로 쓰세요. builtin 엔진은 SKILLS_DIR 아래이고 "
+    "USER_SKILLS_DIR에는 없습니다. 경로를 추측하거나 USER_SKILLS_DIR만 검색하지 마세요.\n"
+    "3. **중요: 지침을 읽기 전에 어떤 작업을 할지 단정짓지 마세요.** "
     "skill의 description에 서브커맨드(query, path, explain 등)가 있다면, "
     "사용자 명령의 서브커맨드를 정확히 파악한 후 그에 맞는 동작을 설명하세요.\n"
-    "3. 지침에 포함된 코드 패턴을 execute_code 도구로 실행하세요.\n"
+    "4. 지침에 포함된 코드 패턴을 execute_code 또는 bash 도구로 실행하세요.\n"
 )
 
 def build_skill_prompt(skill_info: list) -> str:
@@ -282,11 +306,14 @@ def build_skill_prompt(skill_info: list) -> str:
     path_info = (
         f"## Paths (use absolute paths for write_file, read_file)\n"
         f"- WORKING_DIR: {WORKING_DIR}\n"
+        f"- SKILLS_DIR: {SKILLS_DIR} "
+        f"(builtin skills; e.g. last30days → {os.path.join(SKILLS_DIR, 'last30days')})\n"
         f"- ARTIFACTS_DIR: {ARTIFACTS_DIR}\n"
-        f"- USER_SKILLS_DIR: {USER_SKILLS_DIR}\n"
+        f"- USER_SKILLS_DIR: {USER_SKILLS_DIR} "
+        f"(user-created skills only; not where builtin engines live)\n"
         f"Example: write_file(filepath='{os.path.join(ARTIFACTS_DIR, 'report.drawio')}', content='...')\n"
         f"New skills: write under USER_SKILLS_DIR/<skill-name>/SKILL.md "
-        f"(not under WORKING_DIR/skills/).\n\n"
+        f"(not under SKILLS_DIR).\n\n"
     )
 
     skills_xml = get_skills_xml(skill_info)
@@ -347,10 +374,14 @@ def build_command_prompt(plugin_name: str, command: str) -> str:
     path_info = (
         f"## Paths (use absolute paths for write_file, read_file)\n"
         f"- WORKING_DIR: {WORKING_DIR}\n"
+        f"- SKILLS_DIR: {SKILLS_DIR} "
+        f"(builtin skills; e.g. last30days → {os.path.join(SKILLS_DIR, 'last30days')})\n"
         f"- ARTIFACTS_DIR: {ARTIFACTS_DIR}\n"
-        f"- USER_SKILLS_DIR: {USER_SKILLS_DIR}\n"
+        f"- USER_SKILLS_DIR: {USER_SKILLS_DIR} "
+        f"(user-created skills only; not where builtin engines live)\n"
         f"Example: write_file(filepath='{os.path.join(ARTIFACTS_DIR, 'report.drawio')}', content='...')\n"
-        f"New skills: write under USER_SKILLS_DIR/<skill-name>/SKILL.md.\n\n"
+        f"New skills: write under USER_SKILLS_DIR/<skill-name>/SKILL.md "
+        f"(not under SKILLS_DIR).\n\n"
     )
 
     command_instructions = get_command_instructions(plugin_name, command)
@@ -373,18 +404,22 @@ def get_skill_instructions(plugin_name: str, skill_name: str) -> str:
     Use this when you need detailed instructions for a task that matches
     one of the available skills listed in the system prompt.
 
+    The response starts with SKILL_DIR (absolute path of the skill folder).
+    Use that path for bash/scripts; builtin skills live under SKILLS_DIR,
+    not USER_SKILLS_DIR.
+
     Args:
         skill_name: The name of the skill to load (e.g. 'pdf').
 
     Returns:
-        The full skill instructions, or an error message if not found.
-    """    
+        SKILL_DIR header plus full skill instructions, or an error message.
+    """
     logger.info(f"###### get_skill_instructions: {skill_name} ######")
     skill_manager = skill_managers.get(plugin_name)
     if skill_manager is None:
-        if plugin_name == "base": # base skills
+        if plugin_name == "base":  # base skills
             skills_dir = SKILLS_DIR
-        else:   # plugin skills
+        else:  # plugin skills
             skills_dir = os.path.join(WORKING_DIR, "plugins", plugin_name, "skills")
         skill_manager = SkillManager(skills_dir)
         skill_managers[plugin_name] = skill_manager
