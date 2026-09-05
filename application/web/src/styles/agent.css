@@ -428,6 +428,9 @@ select {
   border-radius: 8px;
   position: relative;
   min-width: 0;
+  min-height: 36px;
+  height: 36px;
+  overflow: hidden;
 }
 
 .task-row:hover {
@@ -451,7 +454,8 @@ select {
 .task-item {
   flex: 1;
   min-width: 0;
-  padding: 8px 10px;
+  height: 100%;
+  padding: 0 10px;
   border-radius: 8px;
   border: none;
   background: transparent;
@@ -491,11 +495,19 @@ select {
   align-items: center;
   gap: 2px;
   padding-right: 4px;
+  height: 100%;
 }
 
 .task-row:hover .task-actions,
 .task-row.active .task-actions {
   display: flex;
+}
+
+.task-delete-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  height: 100%;
 }
 
 .task-action-btn {
@@ -522,24 +534,40 @@ select {
   color: var(--text-primary);
 }
 
-.task-delete-confirm {
+/* Cancel/Delete popover sits on the delete button (right-aligned, content width). */
+.task-delete-popover {
+  position: absolute;
+  right: 0;
+  top: 0;
+  height: 100%;
+  width: max-content;
+  display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 1100;
+  gap: 6px;
+  padding: 0 4px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  z-index: 30;
 }
 
-.task-delete-modal {
-  max-width: min(380px, 92vw);
+.task-delete-popover-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .task-delete-cancel {
-  padding: 8px 14px;
+  padding: 4px 10px;
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 6px;
   background: transparent;
   color: var(--text-secondary);
   cursor: pointer;
-  font-size: 13px;
+  font-size: 12px;
+  white-space: nowrap;
 }
 
 .task-delete-cancel:hover {
@@ -548,14 +576,15 @@ select {
 }
 
 .task-delete-confirm-btn {
-  padding: 8px 14px;
+  padding: 4px 10px;
   border: none;
-  border-radius: 8px;
+  border-radius: 6px;
   background: #f87171;
   color: #fff;
   cursor: pointer;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 600;
+  white-space: nowrap;
 }
 
 .task-delete-confirm-btn:hover {

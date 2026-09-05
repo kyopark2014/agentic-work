@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
 import type { Task } from "../types";
 
 interface Props {
@@ -26,6 +25,7 @@ export function TaskListItem({
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [renameValue, setRenameValue] = useState(task.title);
   const menuRef = useRef<HTMLDivElement>(null);
+  const deleteWrapRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     setRenameValue(task.title);
@@ -41,6 +41,17 @@ export function TaskListItem({
     document.addEventListener("mousedown", onDocClick);
     return () => document.removeEventListener("mousedown", onDocClick);
   }, [menuOpen]);
+
+  useEffect(() => {
+    if (!confirmDelete) return;
+    function onDocClick(e: MouseEvent) {
+      if (deleteWrapRef.current && !deleteWrapRef.current.contains(e.target as Node)) {
+        setConfirmDelete(false);
+      }
+    }
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, [confirmDelete]);
 
   useEffect(() => {
     if (!confirmDelete) return;
@@ -99,23 +110,45 @@ export function TaskListItem({
         <span className="task-item-label">{task.title}</span>
       </button>
       <div className="task-actions">
-        <button
-          type="button"
-          className="task-action-btn"
-          aria-label="Delete task"
-          aria-expanded={confirmDelete}
-          onClick={(e) => {
-            e.stopPropagation();
-            setConfirmDelete(true);
-          }}
-        >
-          <svg viewBox="0 0 16 16" aria-hidden="true">
-            <path
-              fill="currentColor"
-              d="M5 2V1h6v1h4v2H1V2h4ZM3 6h1v8H2V6h1Zm3 0h1v8H6V6Zm4 0h1v8h-1V6ZM3 16h10V6H3v10Z"
-            />
-          </svg>
-        </button>
+        <div className="task-delete-wrap" ref={deleteWrapRef}>
+          <button
+            type="button"
+            className="task-action-btn"
+            aria-label="Delete task"
+            aria-expanded={confirmDelete}
+            onClick={(e) => {
+              e.stopPropagation();
+              setConfirmDelete((open) => !open);
+            }}
+          >
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path
+                fill="currentColor"
+                d="M5 2V1h6v1h4v2H1V2h4ZM3 6h1v8H2V6h1Zm3 0h1v8H6V6Zm4 0h1v8h-1V6ZM3 16h10V6H3v10Z"
+              />
+            </svg>
+          </button>
+          {confirmDelete && (
+            <div className="task-delete-popover" role="dialog" aria-label="Delete task">
+              <div className="task-delete-popover-actions">
+                <button
+                  type="button"
+                  className="task-delete-cancel"
+                  onClick={() => setConfirmDelete(false)}
+                >
+                  취소
+                </button>
+                <button
+                  type="button"
+                  className="task-delete-confirm-btn"
+                  onClick={handleDelete}
+                >
+                  삭제
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
         <div className="task-menu-wrap" ref={menuRef}>
           <button
             type="button"
@@ -171,44 +204,6 @@ export function TaskListItem({
           )}
         </div>
       </div>
-      {confirmDelete &&
-        createPortal(
-          <div
-            className="modal-overlay task-delete-confirm"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="task-delete-title"
-            onClick={(e) => {
-              if (e.target === e.currentTarget) setConfirmDelete(false);
-            }}
-          >
-            <div className="modal task-delete-modal">
-              <h2 id="task-delete-title">작업을 삭제할까요?</h2>
-              <p>
-                이 작업은 다시 복구되지 않습니다.
-                <br />
-                &ldquo;{task.title}&rdquo; 을 삭제할까요?
-              </p>
-              <div className="modal-actions">
-                <button
-                  type="button"
-                  className="task-delete-cancel"
-                  onClick={() => setConfirmDelete(false)}
-                >
-                  취소
-                </button>
-                <button
-                  type="button"
-                  className="task-delete-confirm-btn"
-                  onClick={handleDelete}
-                >
-                  삭제
-                </button>
-              </div>
-            </div>
-          </div>,
-          document.body,
-        )}
     </div>
   );
 }
