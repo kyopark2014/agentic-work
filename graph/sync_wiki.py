@@ -940,7 +940,9 @@ def _build_from_extract(
 ) -> None:
     from graphify.build import build_from_json
     from graphify.cluster import cluster
+    from lib.build_graph import sanitize_extraction
 
+    extraction = sanitize_extraction(extraction)
     G = build_from_json(extraction)
     if G.number_of_nodes() == 0:
         raise SystemExit("ERROR: Graph is empty - extraction produced no nodes.")
@@ -1014,6 +1016,7 @@ def run_sync(
     from graphify.cluster import cluster
     from graphify.detect import detect
     from networkx.readwrite import json_graph
+    from lib.build_graph import sanitize_extraction
 
     graph_json = out / "graph.json"
     wiki_converted = _wiki_converted_dir(out)
@@ -1170,7 +1173,7 @@ def run_sync(
             G_existing = json_graph.node_link_graph(existing_data, edges="links")
         except TypeError:
             G_existing = json_graph.node_link_graph(existing_data)
-        G_new = build_from_json(merged)
+        G_new = build_from_json(sanitize_extraction(merged))
         deleted = set(
             json.loads((out / ".graphify_incremental.json").read_text()).get(
                 "deleted_files", []
