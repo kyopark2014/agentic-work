@@ -19,6 +19,28 @@ except ImportError:
 
 logger = logging.getLogger("agentcore_sse")
 
+# Cap tool payloads for logs / UI notifications (runtime already truncates
+# stream payloads; this is a second guard for ECS-side flood).
+_LOG_TRUNCATE_CHARS = 2_000
+_NOTIFY_TRUNCATE_CHARS = 8_000
+
+
+def _truncate_text(text: object, max_chars: int) -> str:
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        try:
+            text = json.dumps(text, ensure_ascii=False, default=str)
+        except TypeError:
+            text = str(text)
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    omitted = len(text) - max_chars
+    suffix = f"\n...[truncated {omitted} chars]"
+    keep = max(0, max_chars - len(suffix))
+    return text[:keep] + suffix
+
+
 tool_info_list: dict = {}
 tool_result_list: list = []
 tool_name_list: dict = {}
@@ -121,13 +143,14 @@ def _process_tool_events(data_json: dict, notification_queue, stream_state: dict
     references = stream_state["references"]
     image_url = stream_state["image_url"]
 
+    # toolResult payloads also carry a "tool" label — check before "tool" input events
     if "toolResult" in data_json:
         tool_result = data_json["toolResult"]
         tool_use_id = data_json["toolUseId"]
         if data_json.get("tool"):
             tool_name_list[tool_use_id] = data_json["tool"]
         tool_name = tool_name_list.get(tool_use_id, data_json.get("tool", "unknown"))
-        logger.info("[tool_result] %s", tool_result)
+        logger.info("[tool_result] %s", _truncate_text(tool_result, _LOG_TRUNCATE_CHARS))
 
         effective_input = tool_input_cache.get(tool_use_id, {})
         stream_state["current"] = on_tool_use_started(
@@ -136,14 +159,14 @@ def _process_tool_events(data_json: dict, notification_queue, stream_state: dict
         tool_slot_update(
             notification_queue,
             f"{tool_use_id}:input",
-            f"Tool: {tool_name}, Input: {_format_tool_input(effective_input)}",
+            f"Tool: {tool_name}, Input: {_truncate_text(_format_tool_input(effective_input), _NOTIFY_TRUNCATE_CHARS)}",
             mcp_server=data_json.get("mcpServer"),
             skill_name=data_json.get("skillName"),
         )
         tool_slot_update(
             notification_queue,
             f"{tool_use_id}:result",
-            f"Tool Result: {str(tool_result)}",
+            f"Tool Result: {_truncate_text(tool_result, _NOTIFY_TRUNCATE_CHARS)}",
             mcp_server=data_json.get("mcpServer"),
             skill_name=data_json.get("skillName"),
         )
@@ -168,7 +191,7 @@ def _process_tool_events(data_json: dict, notification_queue, stream_state: dict
             tool_slot_update(
                 notification_queue,
                 f"{tool_use_id}:input",
-                f"Tool: {tool}, Input: {_format_tool_input(effective_input)}",
+                f"Tool: {tool}, Input: {_truncate_text(_format_tool_input(effective_input), _NOTIFY_TRUNCATE_CHARS)}",
                 mcp_server=data_json.get("mcpServer"),
                 skill_name=data_json.get("skillName"),
             )
@@ -177,14 +200,14 @@ def _process_tool_events(data_json: dict, notification_queue, stream_state: dict
 def _process_strands_sse_event(data_json: dict, notification_queue, stream_state: dict) -> None:
     if "data" in data_json:
         text = normalize_bedrock_message_content(data_json["data"])
-        logger.info("[data] %s", text)
+        logger.info("[data] %s", _truncate_text(text, _LOG_TRUNCATE_CHARS))
         stream_state["current"] += text
         update_streaming_result(notification_queue, stream_state["current"])
         return
 
     if "result" in data_json:
         final_output = data_json["result"]
-        logger.info("[result] %s", final_output)
+        logger.info("[result] %s", _truncate_text(final_output, _LOG_TRUNCATE_CHARS))
         stream_state["result"] = final_output.get("messages", [])
         if "image_url" in final_output:
             stream_state["image_url"] = final_output.get("image_url", [])
@@ -196,14 +219,14 @@ def _process_strands_sse_event(data_json: dict, notification_queue, stream_state
 def _process_langgraph_sse_event(data_json: dict, notification_queue, stream_state: dict) -> None:
     if "data" in data_json:
         text = normalize_bedrock_message_content(data_json["data"])
-        logger.info("[data] %s", text)
+        logger.info("[data] %s", _truncate_text(text, _LOG_TRUNCATE_CHARS))
         stream_state["current"] += text
         update_streaming_result(notification_queue, stream_state["current"])
         return
 
     if "result" in data_json:
         final_output = data_json["result"]
-        logger.info("[result] %s", final_output)
+        logger.info("[result] %s", _truncate_text(final_output, _LOG_TRUNCATE_CHARS))
         messages = final_output.get("messages", [])
         raw_content = messages[-1].get("content") if messages else ""
         stream_state["result"] = normalize_bedrock_message_content(raw_content)
