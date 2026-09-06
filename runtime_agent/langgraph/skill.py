@@ -21,9 +21,41 @@ SKILLS_DIR = os.path.join(WORKING_DIR, "skills")
 # Per-user artifacts / skills under SESSION_STORAGE_DIR (via set_user_workspace).
 ARTIFACTS_DIR = utils.get_user_artifacts_dir("default")
 USER_SKILLS_DIR = utils.get_user_skills_dir("default")
+# name -> absolute skill folder; safe for parallel skill use (no single SKILL_DIR env).
+SKILL_DIRS: dict[str, str] = {}
 
 config = utils.load_config()
 sharing_url = config.get("sharing_url")
+
+
+def _export_workspace_path_env(
+    *,
+    skills_dir: str | None = None,
+    user_skills_dir: str | None = None,
+    artifacts_dir: str | None = None,
+) -> None:
+    """Expose fixed/per-user roots to bash via os.environ (not per-skill SKILL_DIR)."""
+    if skills_dir is not None:
+        os.environ["SKILLS_DIR"] = skills_dir
+    if user_skills_dir is not None:
+        os.environ["USER_SKILLS_DIR"] = user_skills_dir
+    if artifacts_dir is not None:
+        os.environ["ARTIFACTS_DIR"] = artifacts_dir
+
+
+def register_skill_path(name: str, path: str) -> None:
+    """Record skill absolute path in SKILL_DIRS (parallel-safe map)."""
+    if not name or not path:
+        return
+    SKILL_DIRS[name] = path
+
+
+# Builtin parent is fixed for the process lifetime.
+_export_workspace_path_env(
+    skills_dir=SKILLS_DIR,
+    user_skills_dir=USER_SKILLS_DIR,
+    artifacts_dir=ARTIFACTS_DIR,
+)
 
 
 def set_user_artifacts(user_id: str | None) -> str:
@@ -31,6 +63,7 @@ def set_user_artifacts(user_id: str | None) -> str:
     global ARTIFACTS_DIR
     artifacts_dir = utils.ensure_user_artifacts_dir(user_id)
     ARTIFACTS_DIR = artifacts_dir
+    _export_workspace_path_env(artifacts_dir=artifacts_dir)
     logger.info(f"skill ARTIFACTS_DIR set for user {user_id!r}: {artifacts_dir}")
     return artifacts_dir
 
@@ -41,6 +74,7 @@ def set_user_skills(user_id: str | None) -> str:
     skills_dir = utils.ensure_user_skills_dir(user_id)
     USER_SKILLS_DIR = skills_dir
     utils.ensure_user_skills_list(user_id)
+    _export_workspace_path_env(user_skills_dir=skills_dir)
     logger.info(f"skill USER_SKILLS_DIR set for user {user_id!r}: {skills_dir}")
     return skills_dir
 
@@ -90,6 +124,7 @@ class SkillManager:
                         path=os.path.join(skills_dir, entry),
                     )
                     self.registry[skill.name] = skill
+                    register_skill_path(skill.name, skill.path)
                     logger.info(f"Skill discovered: {skill.name}")
                 except Exception as e:
                     logger.warning(f"Failed to load skill '{entry}': {e}")
@@ -110,6 +145,7 @@ class SkillManager:
                         path=os.path.join(skills_dir, entry),
                     )
                     self.registry[skill.name] = skill
+                    register_skill_path(skill.name, skill.path)
                     logger.info(f"Plugin skill discovered: {skill.name}")
                 except Exception as e:
                     logger.warning(f"Failed to load plugin skill '{entry}': {e}")
@@ -145,19 +181,31 @@ skill_managers: dict[str, SkillManager] = {}
 
 
 def format_skill_instructions(skill: Skill) -> str:
-    """Prefix skill body with SKILL_DIR so agents can run scripts without path search.
+    """Prefix skill body with absolute SKILL_DIR for command-local use.
 
     last30days and similar skills require SKILL_DIR = the directory containing
-    SKILL.md. This harness loads instructions via get_skill_instructions (not
-    a filesystem Read), so the path must be injected here.
+    SKILL.md. Do not set a process-global SKILL_DIR (skills may run in parallel);
+    prefix each bash engine call with SKILL_DIR=... instead.
     """
+    register_skill_path(skill.name, skill.path)
+    builtin_hint = (
+        f"$SKILLS_DIR/{skill.name}"
+        if skill.path.startswith(SKILLS_DIR + os.sep) or skill.path == SKILLS_DIR
+        else skill.path
+    )
     return (
-        f"SKILL_DIR: {skill.path}\n"
-        f"Use SKILL_DIR as the absolute path for this skill's scripts "
-        f"(e.g. \"${{SKILL_DIR}}/scripts/...\"). "
-        f"Builtin skills are under SKILLS_DIR={SKILLS_DIR}; "
-        f"user-created skills are under USER_SKILLS_DIR "
-        f"(do not search USER_SKILLS_DIR for builtin engines).\n\n"
+        f"SKILL_DIR={skill.path}\n"
+        f"SKILL_NAME={skill.name}\n"
+        f"Parallel-safe path rules:\n"
+        f"- bash: prefix each engine call with "
+        f"SKILL_DIR={skill.path} "
+        f"(command-local; do NOT export a process-global SKILL_DIR).\n"
+        f"  Example: SKILL_DIR={skill.path} \"${{SKILL_DIR}}/scripts/...\"\n"
+        f"- Or use $SKILLS_DIR / $USER_SKILLS_DIR roots already in the shell env "
+        f"(e.g. {builtin_hint}).\n"
+        f"- execute_code: SKILL_DIRS[{skill.name!r}] == {skill.path!r}\n"
+        f"- Builtin engines live under SKILLS_DIR={SKILLS_DIR}; "
+        f"do not search USER_SKILLS_DIR for them.\n\n"
         f"{skill.instructions}"
     )
 
@@ -292,8 +340,10 @@ SKILL_USAGE_GUIDE = (
     "\n## Skill 사용 가이드\n"
     "위의 <available_skills>에 나열된 skill이 사용자의 요청과 관련될 때:\n"
     "1. 먼저 get_skill_instructions 도구로 해당 skill의 상세 지침을 로드하세요.\n"
-    "2. 응답 첫 줄의 SKILL_DIR을 그대로 쓰세요. builtin 엔진은 SKILLS_DIR 아래이고 "
-    "USER_SKILLS_DIR에는 없습니다. 경로를 추측하거나 USER_SKILLS_DIR만 검색하지 마세요.\n"
+    "2. 응답의 SKILL_DIR=... 절대경로를 쓰세요. bash에서는 호출마다 "
+    "SKILL_DIR=<path> 를 커맨드 앞에 붙이세요(프로세스 전역 export 금지; "
+    "skill은 병렬로 돌 수 있음). builtin은 $SKILLS_DIR/<name>, "
+    "execute_code는 SKILL_DIRS['name']. USER_SKILLS_DIR만 검색하지 마세요.\n"
     "3. **중요: 지침을 읽기 전에 어떤 작업을 할지 단정짓지 마세요.** "
     "skill의 description에 서브커맨드(query, path, explain 등)가 있다면, "
     "사용자 명령의 서브커맨드를 정확히 파악한 후 그에 맞는 동작을 설명하세요.\n"
@@ -307,10 +357,17 @@ def build_skill_prompt(skill_info: list) -> str:
         f"## Paths (use absolute paths for write_file, read_file)\n"
         f"- WORKING_DIR: {WORKING_DIR}\n"
         f"- SKILLS_DIR: {SKILLS_DIR} "
-        f"(builtin skills; e.g. last30days → {os.path.join(SKILLS_DIR, 'last30days')})\n"
-        f"- ARTIFACTS_DIR: {ARTIFACTS_DIR}\n"
+        f"(builtin skills; also exported as $SKILLS_DIR; "
+        f"e.g. last30days → {os.path.join(SKILLS_DIR, 'last30days')})\n"
+        f"- ARTIFACTS_DIR: {ARTIFACTS_DIR} (also $ARTIFACTS_DIR)\n"
         f"- USER_SKILLS_DIR: {USER_SKILLS_DIR} "
-        f"(user-created skills only; not where builtin engines live)\n"
+        f"(user-created skills only; also $USER_SKILLS_DIR; "
+        f"not where builtin engines live)\n"
+        f"- SKILL_DIRS: name→path map in execute_code (parallel-safe; "
+        f"no process-global $SKILL_DIR)\n"
+        f"- bash skill engines: "
+        f"SKILL_DIR=$SKILLS_DIR/<name> \"${{SKILL_DIR}}/scripts/...\" "
+        f"per invocation\n"
         f"Example: write_file(filepath='{os.path.join(ARTIFACTS_DIR, 'report.drawio')}', content='...')\n"
         f"New skills: write under USER_SKILLS_DIR/<skill-name>/SKILL.md "
         f"(not under SKILLS_DIR).\n\n"
@@ -375,10 +432,17 @@ def build_command_prompt(plugin_name: str, command: str) -> str:
         f"## Paths (use absolute paths for write_file, read_file)\n"
         f"- WORKING_DIR: {WORKING_DIR}\n"
         f"- SKILLS_DIR: {SKILLS_DIR} "
-        f"(builtin skills; e.g. last30days → {os.path.join(SKILLS_DIR, 'last30days')})\n"
-        f"- ARTIFACTS_DIR: {ARTIFACTS_DIR}\n"
+        f"(builtin skills; also exported as $SKILLS_DIR; "
+        f"e.g. last30days → {os.path.join(SKILLS_DIR, 'last30days')})\n"
+        f"- ARTIFACTS_DIR: {ARTIFACTS_DIR} (also $ARTIFACTS_DIR)\n"
         f"- USER_SKILLS_DIR: {USER_SKILLS_DIR} "
-        f"(user-created skills only; not where builtin engines live)\n"
+        f"(user-created skills only; also $USER_SKILLS_DIR; "
+        f"not where builtin engines live)\n"
+        f"- SKILL_DIRS: name→path map in execute_code (parallel-safe; "
+        f"no process-global $SKILL_DIR)\n"
+        f"- bash skill engines: "
+        f"SKILL_DIR=$SKILLS_DIR/<name> \"${{SKILL_DIR}}/scripts/...\" "
+        f"per invocation\n"
         f"Example: write_file(filepath='{os.path.join(ARTIFACTS_DIR, 'report.drawio')}', content='...')\n"
         f"New skills: write under USER_SKILLS_DIR/<skill-name>/SKILL.md "
         f"(not under SKILLS_DIR).\n\n"
@@ -404,9 +468,10 @@ def get_skill_instructions(plugin_name: str, skill_name: str) -> str:
     Use this when you need detailed instructions for a task that matches
     one of the available skills listed in the system prompt.
 
-    The response starts with SKILL_DIR (absolute path of the skill folder).
-    Use that path for bash/scripts; builtin skills live under SKILLS_DIR,
-    not USER_SKILLS_DIR.
+    The response starts with SKILL_DIR=<absolute path>. For bash, prefix each
+    engine call with that assignment (command-local). Do not rely on a
+    process-global $SKILL_DIR — skills may run in parallel. Builtin skills
+    live under $SKILLS_DIR; execute_code can use SKILL_DIRS[name].
 
     Args:
         skill_name: The name of the skill to load (e.g. 'pdf').
@@ -454,4 +519,30 @@ def get_skill_instructions(plugin_name: str, skill_name: str) -> str:
 def get_skill_tools():
     """Return the list of skill tools for the skill-aware agent."""
     return [get_skill_instructions]
+
+
+def _seed_builtin_skill_dirs() -> None:
+    """Preload SKILL_DIRS from builtin SKILLS_DIR so execute_code works before first load."""
+    if not os.path.isdir(SKILLS_DIR):
+        return
+    try:
+        entries = os.listdir(SKILLS_DIR)
+    except OSError as e:
+        logger.warning("Failed to seed SKILL_DIRS from %s: %s", SKILLS_DIR, e)
+        return
+    for entry in entries:
+        skill_md = os.path.join(SKILLS_DIR, entry, "SKILL.md")
+        if not os.path.isfile(skill_md):
+            continue
+        # Prefer frontmatter name when present; fall back to folder name.
+        name = entry
+        try:
+            meta, _ = SkillManager._parse_skill_md(skill_md)
+            name = meta.get("name", entry) or entry
+        except Exception:
+            pass
+        register_skill_path(name, os.path.join(SKILLS_DIR, entry))
+
+
+_seed_builtin_skill_dirs()
 

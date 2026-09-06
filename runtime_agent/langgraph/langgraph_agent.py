@@ -53,6 +53,11 @@ USER_SKILLS_DIR = utils.get_user_skills_dir("default")
 CURRENT_USER_ID: str | None = None
 _ALLOWED_S3_PREFIXES = ("artifacts/", "images/", "docs/")
 
+# Fixed/per-user roots for bash ($SKILLS_DIR etc.). Per-skill paths use skill.SKILL_DIRS.
+os.environ["SKILLS_DIR"] = SKILLS_DIR
+os.environ["ARTIFACTS_DIR"] = ARTIFACTS_DIR
+os.environ["USER_SKILLS_DIR"] = USER_SKILLS_DIR
+
 _py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
 _user_bin = os.path.expanduser(f"~/Library/Python/{_py_ver}/bin")
 if os.path.isdir(_user_bin) and _user_bin not in os.environ.get("PATH", ""):
@@ -98,6 +103,7 @@ def set_user_artifacts(user_id: str | None) -> str:
     CURRENT_USER_ID = user_id
     artifacts_dir = utils.ensure_user_artifacts_dir(user_id)
     ARTIFACTS_DIR = artifacts_dir
+    os.environ["ARTIFACTS_DIR"] = artifacts_dir
     exec_globals = globals().get("_exec_globals")
     if isinstance(exec_globals, dict):
         exec_globals["ARTIFACTS_DIR"] = artifacts_dir
@@ -113,6 +119,7 @@ def set_user_skills(user_id: str | None) -> str:
     skills_dir = utils.ensure_user_skills_dir(user_id)
     USER_SKILLS_DIR = skills_dir
     utils.ensure_user_skills_list(user_id)
+    os.environ["USER_SKILLS_DIR"] = skills_dir
     exec_globals = globals().get("_exec_globals")
     if isinstance(exec_globals, dict):
         exec_globals["USER_SKILLS_DIR"] = skills_dir
@@ -581,6 +588,15 @@ def register_korean_font() -> str:
     return "Helvetica"
 
 
+def _skill_dirs_map() -> dict:
+    """Parallel-safe name→path map owned by skill.py (lazy import)."""
+    try:
+        import skill as skill_mod
+        return getattr(skill_mod, "SKILL_DIRS", {}) or {}
+    except Exception:
+        return {}
+
+
 _exec_globals = {
     "__builtins__": __builtins__,
     "subprocess": _subprocess,
@@ -600,6 +616,7 @@ _exec_globals = {
     "SKILLS_DIR": SKILLS_DIR,
     "ARTIFACTS_DIR": ARTIFACTS_DIR,  # updated by set_user_workspace()
     "USER_SKILLS_DIR": USER_SKILLS_DIR,  # updated by set_user_workspace()
+    "SKILL_DIRS": _skill_dirs_map(),  # name→path; refreshed in execute_code
     "register_korean_font": register_korean_font,
 }
 
@@ -639,9 +656,11 @@ def execute_code(code: str) -> str:
 
     Path variables (pre-defined, do NOT redefine):
     - WORKING_DIR: absolute path to application directory
-    - SKILLS_DIR: absolute path to builtin skills (WORKING_DIR/skills); e.g. last30days engine
+    - SKILLS_DIR: absolute path to builtin skills (WORKING_DIR/skills); also $SKILLS_DIR in bash
     - ARTIFACTS_DIR: absolute path to this user's artifacts ({SESSION_STORAGE_DIR}/{user_id}/artifacts)
     - USER_SKILLS_DIR: absolute path to this user's skills ({SESSION_STORAGE_DIR}/{user_id}/skills)
+    - SKILL_DIRS: dict mapping skill name → absolute skill folder (parallel-safe;
+      use SKILL_DIRS['last30days'], not a single global SKILL_DIR)
     - register_korean_font(): registers Nanum TTF or CID fallback for ReportLab; returns font name str
 
     Matplotlib: Korean fonts are configured automatically (NanumGothic). Do NOT set
@@ -659,6 +678,8 @@ def execute_code(code: str) -> str:
     os.makedirs(ARTIFACTS_DIR, exist_ok=True)
     _exec_globals["ARTIFACTS_DIR"] = ARTIFACTS_DIR
     _exec_globals["USER_SKILLS_DIR"] = USER_SKILLS_DIR
+    _exec_globals["SKILLS_DIR"] = SKILLS_DIR
+    _exec_globals["SKILL_DIRS"] = _skill_dirs_map()
     before_files = _working_dir_files_mtime_snapshot()
 
     old_cwd = os.getcwd()
@@ -812,7 +833,19 @@ def upload_file_to_s3(filepath: str) -> str:
 
 @tool
 def bash(command: str) -> str:
-    """Execute a bash command and return the result"""
+    """Execute a bash command and return the result.
+
+    Path env already set by the runtime (do not guess or search USER_SKILLS_DIR
+    for builtin engines):
+    - $SKILLS_DIR: builtin skills parent (fixed)
+    - $USER_SKILLS_DIR: this user's skills root
+    - $ARTIFACTS_DIR: this user's artifacts
+
+    Per-skill path (skills may run in parallel): do NOT rely on a process-global
+    $SKILL_DIR. Prefix each engine call, e.g.
+    SKILL_DIR="$SKILLS_DIR/last30days" "${SKILL_DIR}/scripts/last30days.py" ...
+    Or use the absolute SKILL_DIR=... from get_skill_instructions on that call only.
+    """
     logger.info(f"###### bash: {command} ######")
     _ensure_cli_scripts_on_path()
     _ensure_node_path()
