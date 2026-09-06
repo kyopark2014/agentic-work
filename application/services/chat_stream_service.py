@@ -11,6 +11,7 @@ import time
 from typing import Any, Generator
 
 from application import chat
+from application import run_registry
 from application import task_store
 from application.notification_queue import QueueNotificationSink
 from application.runtime_mode import run_agent
@@ -268,6 +269,7 @@ class ChatStreamService:
     def run_agent_thread(
         self,
         *,
+        task_id: str,
         prompt: str,
         user_id: str,
         mcp_servers: list[str],
@@ -282,6 +284,7 @@ class ChatStreamService:
         result_holder: dict[str, Any],
     ) -> None:
         sink = QueueNotificationSink(message_queue)
+        run_registry.mark_running(task_id, user_id)
 
         try:
             logger.info("Using AgentCore runtime invoke_agent_runtime")
@@ -302,10 +305,16 @@ class ChatStreamService:
                 response = json.dumps(response, ensure_ascii=False)
             result_holder["content"] = response
             result_holder["images"] = image_url or []
+            run_registry.mark_done(
+                task_id,
+                content=response,
+                images=image_url or [],
+            )
         except Exception as exc:
             logger.exception("Agent run failed")
             result_holder["error"] = CLIENT_SAFE_AGENT_ERROR
             result_holder["error_type"] = type(exc).__name__
+            run_registry.mark_done(task_id, error=CLIENT_SAFE_AGENT_ERROR)
         finally:
             message_queue.put(None)
 
@@ -335,6 +344,7 @@ class ChatStreamService:
         result_holder: dict[str, Any] = {"content": "", "images": []}
 
         self.start_agent_worker(
+            task_id=task_id,
             prompt=prompt,
             user_id=user_id,
             mcp_servers=task["mcp_servers"],
@@ -446,6 +456,45 @@ class ChatStreamService:
         events.append({"type": "info", "data": notice})
         return content, events
 
+    @staticmethod
+    def _messages_need_assistant(task_id: str, user_id: str) -> bool:
+        messages = task_store.list_messages(task_id, user_id)
+        return not messages or messages[-1].get("role") != "assistant"
+
+    def _persist_assistant_now(
+        self,
+        *,
+        task_id: str,
+        user_id: str,
+        result_holder: dict[str, Any],
+        tool_events: list[dict[str, Any]],
+        streamed_text: str,
+        on_assistant_done: Any,
+        on_flush: Any,
+    ) -> bool:
+        """Write assistant message if DB still ends on user. Returns True if written."""
+        if not self._messages_need_assistant(task_id, user_id):
+            return False
+        if "error" in result_holder and not (result_holder.get("content") or "").strip():
+            content, events = self.build_partial_error_payload(
+                tool_events=tool_events,
+                streamed_text=streamed_text,
+                error_text=result_holder.get("error") or CLIENT_SAFE_AGENT_ERROR,
+            )
+            on_assistant_done(content, [], events)
+            on_flush()
+            return True
+        final_content, images, events = self._build_final_payload(
+            result_holder=result_holder,
+            tool_events=tool_events,
+            streamed_text=streamed_text,
+        )
+        if not (final_content or events):
+            return False
+        on_assistant_done(final_content, images, events)
+        on_flush()
+        return True
+
     def _spawn_late_persist(
         self,
         *,
@@ -456,6 +505,8 @@ class ChatStreamService:
         streamed_text: str,
         on_assistant_done: Any,
         on_flush: Any,
+        task_id: str | None = None,
+        user_id: str | None = None,
     ) -> None:
         """Keep draining the agent queue after SSE ends; persist the final answer."""
 
@@ -499,6 +550,15 @@ class ChatStreamService:
                     logger.info("Late persist skipped: empty final payload")
                     return
 
+                # Another path (SSE finally / hydrate) may have already written.
+                if (
+                    task_id
+                    and user_id
+                    and not self._messages_need_assistant(task_id, user_id)
+                ):
+                    logger.info("Late persist skipped: assistant already persisted")
+                    return
+
                 logger.info(
                     "Late persist saving assistant message (%s chars, %s events)",
                     len(final_content),
@@ -523,6 +583,8 @@ class ChatStreamService:
         on_assistant_error: Any,
         on_assistant_done: Any,
         on_flush: Any,
+        task_id: str | None = None,
+        user_id: str | None = None,
     ) -> Generator[str, None, None]:
         """Yield SSE frames until the agent worker finishes."""
         tool_events: list[dict[str, Any]] = []
@@ -574,6 +636,8 @@ class ChatStreamService:
                         streamed_text=streamed_text,
                         on_assistant_done=on_assistant_done,
                         on_flush=on_flush,
+                        task_id=task_id,
+                        user_id=user_id,
                     )
                     return
 
@@ -636,23 +700,46 @@ class ChatStreamService:
                 }
             )
         except GeneratorExit:
-            # Client disconnected (refresh/navigation) while the agent is still running.
-            already_final = bool((result_holder.get("content") or "").strip()) or (
-                "error" in result_holder
+            # Always persist if DB still ends on user — including the race where
+            # the worker finished (already_final) but add_message never ran.
+            needs_assistant = (
+                bool(task_id and user_id)
+                and self._messages_need_assistant(task_id, user_id)
             )
-            if not sse_closed_early and not already_final:
-                logger.warning(
-                    "SSE client disconnected before agent finished; scheduling late persist"
-                )
-                self._spawn_late_persist(
-                    message_queue=message_queue,
-                    result_holder=result_holder,
-                    tool_events=tool_events,
-                    tool_meta=tool_meta,
-                    streamed_text=streamed_text,
-                    on_assistant_done=on_assistant_done,
-                    on_flush=on_flush,
-                )
+            if not sse_closed_early and needs_assistant:
+                already_final = bool(
+                    (result_holder.get("content") or "").strip()
+                ) or ("error" in result_holder)
+                if already_final:
+                    logger.warning(
+                        "SSE client disconnected after agent finished; "
+                        "persisting assistant immediately"
+                    )
+                    self._persist_assistant_now(
+                        task_id=task_id or "",
+                        user_id=user_id or "",
+                        result_holder=result_holder,
+                        tool_events=tool_events,
+                        streamed_text=streamed_text,
+                        on_assistant_done=on_assistant_done,
+                        on_flush=on_flush,
+                    )
+                else:
+                    logger.warning(
+                        "SSE client disconnected before agent finished; "
+                        "scheduling late persist"
+                    )
+                    self._spawn_late_persist(
+                        message_queue=message_queue,
+                        result_holder=result_holder,
+                        tool_events=tool_events,
+                        tool_meta=tool_meta,
+                        streamed_text=streamed_text,
+                        on_assistant_done=on_assistant_done,
+                        on_flush=on_flush,
+                        task_id=task_id,
+                        user_id=user_id,
+                    )
             raise
         finally:
             if not sse_closed_early:

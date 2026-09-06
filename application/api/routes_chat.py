@@ -97,6 +97,8 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
             on_assistant_error=on_assistant_error,
             on_assistant_done=on_assistant_done,
             on_flush=on_flush,
+            task_id=task_id,
+            user_id=user_id,
         ),
         media_type="text/event-stream",
         headers={
