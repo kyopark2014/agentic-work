@@ -587,6 +587,35 @@ class ChatStreamService:
                     and user_id
                     and not self._messages_need_assistant(task_id, user_id)
                 ):
+                    # Text-only hydrate may have won the race — backfill tools.
+                    if events:
+                        msgs = task_store.list_messages(task_id, user_id)
+                        last = msgs[-1] if msgs else None
+                        if (
+                            last
+                            and last.get("role") == "assistant"
+                            and not (last.get("tool_events") or [])
+                        ):
+                            updated = task_store.update_message_tool_events(
+                                last["id"],
+                                task_id,
+                                user_id,
+                                events,
+                            )
+                            if updated:
+                                run_registry.mark_done(
+                                    task_id,
+                                    content=final_content
+                                    or (last.get("content") or ""),
+                                    images=images or (last.get("images") or []),
+                                    tool_events=events,
+                                )
+                                on_flush()
+                                logger.info(
+                                    "Late persist backfilled tool_events (%s)",
+                                    len(events),
+                                )
+                                return
                     logger.info("Late persist skipped: assistant already persisted")
                     return
 
@@ -596,6 +625,13 @@ class ChatStreamService:
                     len(events),
                 )
                 on_assistant_done(final_content, images, events)
+                if task_id:
+                    run_registry.mark_done(
+                        task_id,
+                        content=final_content,
+                        images=images,
+                        tool_events=events,
+                    )
                 on_flush()
             except Exception:
                 logger.exception("Late persist failed")
