@@ -4,6 +4,10 @@ import sys
 import traceback
 import chat
 import utils
+try:
+    from application import run_cancel
+except ImportError:
+    import run_cancel
 import httpx
 import boto3
 from datetime import datetime, timezone
@@ -181,7 +185,12 @@ async def agent_langgraph(payload):
         runtime_session_id = chat._runtime_session_id()
     logger.info(f"runtime_session_id: {runtime_session_id}")
     chat.set_checkpoint_session_id(runtime_session_id)
+    if runtime_session_id:
+        run_cancel.clear(runtime_session_id)
 
+    cancelled = False
+    app = None
+    config = None
     try:
         if auth_type == "iam":
             httpx.AsyncClient.__init__ = patched_init
@@ -360,6 +369,13 @@ async def agent_langgraph(payload):
 
         # call_model이 chain.astream을 쓰므로 LLM 토큰/청크가 그래프로 전달됨 (langgraph_agent.call_model)
         async for stream in app.astream(inputs, config, stream_mode="messages"):
+            if runtime_session_id and run_cancel.is_cancelled(runtime_session_id):
+                cancelled = True
+                logger.info(
+                    "Cancel detected for session %s; stopping astream",
+                    runtime_session_id,
+                )
+                break
             chunk = stream[0] if isinstance(stream, (list, tuple)) and stream else stream
 
             if isinstance(chunk, AIMessageChunk):
@@ -567,10 +583,26 @@ async def agent_langgraph(payload):
             if payload:
                 yield payload
 
+        if not cancelled and runtime_session_id and run_cancel.is_cancelled(runtime_session_id):
+            cancelled = True
+
+        if cancelled:
+            try:
+                await _heal_cancelled_checkpoint(app, config)
+            except Exception as e:
+                logger.warning(f"cancel checkpoint heal skipped: {e}")
+
         # Final stop_reason wins even when earlier turns left preamble text
         # (e.g. "확인해보겠습니다" + tools, then empty refusal).
         skip_memory = False
-        if stop_reason == "content_filtered":
+        if cancelled:
+            # Keep partial text if any; empty is fine — UI persists the stop notice.
+            skip_memory = True
+            logger.info(
+                f"Run cancelled for session {runtime_session_id}; "
+                f"partial result len={len(result_text)}"
+            )
+        elif stop_reason == "content_filtered":
             result_text = (
                 "요청이 모델 안전 정책에 의해 차단되었습니다. "
                 "다른 모델로 시도하거나 질문을 바꿔 주세요."
@@ -600,8 +632,43 @@ async def agent_langgraph(payload):
         }
         logger.info(f"final_output: {result_text[:200]!r}...")
         yield {"result": final_output}
+    except GeneratorExit:
+        cancelled = True
+        try:
+            await _heal_cancelled_checkpoint(app, config)
+        except Exception as e:
+            logger.warning(f"cancel checkpoint heal on disconnect skipped: {e}")
+        raise
     finally:
         await chat.persist_checkpoint_to_session_storage()
+
+
+async def _heal_cancelled_checkpoint(app, agent_config) -> None:
+    """Ensure pending AIMessage.tool_calls have ToolMessages so the next turn can continue."""
+    if app is None or agent_config is None:
+        return
+    state = await app.aget_state(agent_config)
+    values = getattr(state, "values", None) or {}
+    messages = values.get("messages") or []
+    if not messages:
+        return
+    last = messages[-1]
+    if not (isinstance(last, AIMessage) and getattr(last, "tool_calls", None)):
+        return
+    tool_msgs = []
+    for tc in last.tool_calls:
+        tid = tc.get("id") if isinstance(tc, dict) else None
+        if tid:
+            tool_msgs.append(
+                ToolMessage(content="Cancelled by user", tool_call_id=tid)
+            )
+    if not tool_msgs:
+        return
+    logger.info(
+        "Healing cancelled checkpoint with %s ToolMessage(s)", len(tool_msgs)
+    )
+    await app.aupdate_state(agent_config, {"messages": tool_msgs}, as_node="action")
+
 
 if __name__ == "__main__":
     app.run()

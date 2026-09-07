@@ -12,6 +12,7 @@ from typing import Any, Generator
 
 from application import chat
 from application import run_registry
+from application import run_cancel
 from application import task_store
 from application.notification_queue import QueueNotificationSink
 from application.runtime_mode import run_agent
@@ -30,6 +31,20 @@ LATE_PERSIST_WAIT_SECONDS = 1800
 STREAMING_PREFIX_COMPARISON_LENGTH = 80
 CLIENT_SAFE_AGENT_ERROR = "Agent processing failed"
 CLIENT_SAFE_AGENT_TIMEOUT = "Agent timeout"
+
+
+def _cancel_ids_from_holder(result_holder: dict[str, Any], task_id: str | None = None) -> list[str]:
+    ids = list(result_holder.get("_cancel_ids") or [])
+    if task_id and task_id not in ids:
+        ids.append(task_id)
+    return [i for i in ids if i]
+
+
+def _is_run_cancelled(result_holder: dict[str, Any], task_id: str | None = None) -> bool:
+    if result_holder.get("cancelled"):
+        return True
+    from application import run_cancel
+    return any(run_cancel.is_cancelled(cid) for cid in _cancel_ids_from_holder(result_holder, task_id))
 
 _TOOL_INPUT_RE = re.compile(r"^Tool: (.+?), Input:\s*(.*)$", re.DOTALL)
 _TOOL_RESULT_RE = re.compile(r"^Tool Result: (.+)$", re.DOTALL)
@@ -285,6 +300,9 @@ class ChatStreamService:
     ) -> None:
         sink = QueueNotificationSink(message_queue)
         run_registry.mark_running(task_id, user_id)
+        # Fresh turn: clear any stale stop signal from a prior request.
+        run_cancel.clear(task_id)
+        run_cancel.clear(runtime_session_id)
 
         try:
             logger.info("Using AgentCore runtime invoke_agent_runtime")
@@ -305,6 +323,8 @@ class ChatStreamService:
                 response = json.dumps(response, ensure_ascii=False)
             result_holder["content"] = response
             result_holder["images"] = image_url or []
+            if _is_run_cancelled(result_holder, task_id):
+                result_holder["cancelled"] = True
             run_registry.mark_done(
                 task_id,
                 content=response,
@@ -314,6 +334,8 @@ class ChatStreamService:
             logger.exception("Agent run failed")
             result_holder["error"] = CLIENT_SAFE_AGENT_ERROR
             result_holder["error_type"] = type(exc).__name__
+            if _is_run_cancelled(result_holder, task_id):
+                result_holder["cancelled"] = True
             run_registry.mark_done(task_id, error=CLIENT_SAFE_AGENT_ERROR)
         finally:
             message_queue.put(None)
@@ -341,7 +363,12 @@ class ChatStreamService:
         )
 
         message_queue: queue.Queue = queue.Queue()
-        result_holder: dict[str, Any] = {"content": "", "images": []}
+        runtime_session_id = task.get("runtime_session_id") or task_id
+        result_holder: dict[str, Any] = {
+            "content": "",
+            "images": [],
+            "_cancel_ids": [task_id, runtime_session_id],
+        }
 
         self.start_agent_worker(
             task_id=task_id,
@@ -534,6 +561,10 @@ class ChatStreamService:
                         streamed_text=text,
                     )
 
+                if _is_run_cancelled(result_holder, task_id):
+                    logger.info("Late persist skipped: user cancelled")
+                    return
+
                 if "error" in result_holder:
                     logger.info(
                         "Late persist skipped: agent worker error=%s",
@@ -689,6 +720,22 @@ class ChatStreamService:
                 streamed_text=streamed_text,
             )
 
+            if _is_run_cancelled(result_holder, task_id):
+                logger.info(
+                    "Agent finished after cancel; skip server persist "
+                    "(client stop message)"
+                )
+                yield sse_event(
+                    {
+                        "type": "done",
+                        "content": final_content,
+                        "images": images,
+                        "tool_events": events,
+                        "cancelled": True,
+                    }
+                )
+                return
+
             on_assistant_done(final_content, images, events)
 
             yield sse_event(
@@ -700,6 +747,14 @@ class ChatStreamService:
                 }
             )
         except GeneratorExit:
+            # Stop calls POST /cancel before abort; refresh only aborts SSE.
+            if _is_run_cancelled(result_holder, task_id):
+                result_holder["cancelled"] = True
+                logger.info(
+                    "SSE disconnected after cancel; skip server persist "
+                    "(client stop message)"
+                )
+                raise
             # Always persist if DB still ends on user — including the race where
             # the worker finished (already_final) but add_message never ran.
             needs_assistant = (
