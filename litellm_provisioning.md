@@ -242,6 +242,7 @@ UI에서 Gateway 설정을 저장하면 application + runtime `config.json`을 �
 | Claude 4.5 Haiku | `claude-haiku-4-5` |
 | OpenAI GPT 5.5 | `gpt-5.5` |
 | OpenAI GPT 5.4 | `gpt-5.4` |
+| OpenAI GPT 6 Astra | `gpt-6-astra` |
 | OpenAI GPT 5.6 Sol | `gpt-5.6-sol` |
 | OpenAI GPT 5.6 Terra | `gpt-5.6-terra` |
 | OpenAI GPT 5.6 Luna | `gpt-5.6-luna` |

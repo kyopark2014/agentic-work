@@ -121,9 +121,13 @@ def update(
         logger.info(f"model_name: {model_name}")
         
         models = info.get_model_info(model_name)
+        if not models:
+            raise ValueError(
+                f"Unknown model_name={model_name!r}. "
+                "Redeploy AgentCore runtime after adding the model to info.py."
+            )
         model_id = models[0]["model_id"]
         model_type = models[0]["model_type"]
-                                
     if debug_mode != debugMode:
         debug_mode = debugMode        
         logger.info(f"debug_mode: {debug_mode}")
@@ -604,7 +608,7 @@ def get_max_output_tokens(model_id: str = "") -> int:
     return 8192
     
 def _build_openai_chat(profile: dict, max_output_tokens: int):
-    """Build OpenAI-on-Bedrock chat model (Mantle Responses API or invoke_model)."""
+    """Build OpenAI-on-Bedrock chat model (Mantle Responses API or Converse)."""
     bedrock_region = profile["bedrock_region"]
     model_id = profile["model_id"]
     mantle_api = profile.get("mantle_api", "chat")
@@ -621,24 +625,15 @@ def _build_openai_chat(profile: dict, max_output_tokens: int):
             max_tokens=max_output_tokens,
         )
 
-    boto3_bedrock = boto3.client(
-        service_name="bedrock-runtime",
+    # GPT-5.6 / Astra etc.: Bedrock Converse + inference profile (us.openai.*)
+    converse_chat = ChatBedrockConverse(
+        model=model_id,
         region_name=bedrock_region,
-        config=Config(
-            retries={"max_attempts": 30},
-            read_timeout=300,
-        ),
+        max_tokens=max_output_tokens,
+        provider="openai",
     )
-    chat = ChatBedrock(
-        model_id=model_id,
-        client=boto3_bedrock,
-        model_kwargs={
-            "max_tokens": max_output_tokens,
-        },
-        region_name=bedrock_region,
-    )
-    chat.streaming = False
-    return chat
+    converse_chat.streaming = False
+    return converse_chat
 
 
 def _build_llm_gateway_chat(profile: dict, max_output_tokens: int):
