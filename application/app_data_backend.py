@@ -2,9 +2,9 @@
 
 ECS mounts a dedicated S3 Files filesystem at /mnt/app-data (prefix app-data/).
 Runtime mounts agentcore-sessions/ at /mnt/workspace separately.
-Locally that mount is usually absent; when config.json has s3_bucket we talk to
-the same objects via the S3 API so local runs share tasks.db / virtual_key.json
-with production.
+Locally that mount is usually absent; with s3_bucket the S3 API can share
+tasks.db / virtual_key.json with production — but that path is **opt-in**
+(``APP_DATA_S3_ENABLE=1``). Default local mode stays disk-only.
 """
 
 from __future__ import annotations
@@ -74,22 +74,26 @@ def s3_bucket_and_region() -> tuple[Optional[str], str]:
     return bucket, region
 
 
+def _env_flag(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def s3_available() -> bool:
-    """True when we can use the S3 API as a stand-in for the S3 Files mount."""
+    """True when we can use the S3 API as a stand-in for the S3 Files mount.
+
+    Local S3 sync (download server DB / upload local DB) is disabled by default.
+    Re-enable with ``APP_DATA_S3_ENABLE=1``. ``APP_DATA_S3_DISABLE=1`` still forces off.
+    ECS with the app-data mount uses mount mode and is unaffected.
+    """
     if mount_available():
         return False
     bucket, _ = s3_bucket_and_region()
     if not bucket:
         return False
-    # Allow explicit disable for offline local work.
-    if (os.environ.get("APP_DATA_S3_DISABLE") or "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
+    if _env_flag("APP_DATA_S3_DISABLE"):
         return False
-    return True
+    # Opt-in: avoid accidental local ↔ production DB/key sharing.
+    return _env_flag("APP_DATA_S3_ENABLE")
 
 
 def backend_mode() -> str:
