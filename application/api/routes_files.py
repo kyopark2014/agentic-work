@@ -110,7 +110,7 @@ def view_loaded_file(
     """Open a Load-files attachment in a new browser tab (viewer or inline).
 
     Reads from ``agentcore-sessions/{user}/upload/{filename}``. PDF/images stream
-    inline; text/markdown/json render in an HTML viewer; other types download.
+    inline; text/markdown/json/csv render in an HTML viewer; other types download.
 
     Viewer HTML is CSP-safe (no inline scripts / CDN) so it works under the app
     Content-Security-Policy.
@@ -142,18 +142,28 @@ def view_loaded_file(
             user_id=user_id,
             max_bytes=TEXT_VIEWER_MAX_BYTES,
         )
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError:
-            text = data.decode("utf-8", errors="replace")
+        text = _decode_text_bytes(data)
 
         as_markdown = ext in {".md", ".markdown"}
+        as_csv = ext == ".csv"
+        as_json = ext == ".json"
         page = build_text_viewer_page(
             safe_name,
             text,
             as_markdown=as_markdown,
+            as_csv=as_csv,
+            as_json=as_json,
             download_href=f"/api/files/view/{quote(safe_name)}?download=1",
         )
         return HTMLResponse(content=page, media_type="text/html; charset=utf-8")
     except FileUploadServiceError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+def _decode_text_bytes(data: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")

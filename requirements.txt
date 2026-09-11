@@ -60,6 +60,7 @@ langgraph-checkpoint-sqlite
 openai>=2.41.0
 opentelemetry-instrumentation-langchain
 pyyaml
+markdown>=3.5
 graphifyy
 pypdf
 pdfplumber
