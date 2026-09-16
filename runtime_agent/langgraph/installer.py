@@ -501,17 +501,25 @@ def _project_s3_resource_arns(config) -> tuple:
 
 
 def _project_secret_resource_arns(config) -> list:
-    """Shared Secrets Manager ARNs used by Runtime (Tavily / Notion).
+    """Shared Secrets Manager ARNs used by Runtime (Tavily / Notion / vault).
 
     Names match root ``installer.create_secrets`` and ``utils._load_*_api_key``:
     account/region shared secrets ``tavilyapikey`` / ``notionapikey`` (not
     ``tavilyapikey-{project}``). LiteLLM master / signing keys are never granted.
+
+    ``{project}/vault-agent-token`` is allowed so my-vaults can call ob-docs
+    without reading session-signing-key (still denied below).
     """
     region = config["region"]
     account_id = config["accountId"]
+    project_name = config.get("projectName", "agentcore")
     return [
         f"arn:aws:secretsmanager:{region}:{account_id}:secret:tavilyapikey*",
         f"arn:aws:secretsmanager:{region}:{account_id}:secret:notionapikey*",
+        (
+            f"arn:aws:secretsmanager:{region}:{account_id}:"
+            f"secret:{project_name}/vault-agent-token*"
+        ),
     ]
 
 

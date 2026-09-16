@@ -107,6 +107,12 @@ def set_user_artifacts(user_id: str | None) -> str:
     """Point ARTIFACTS_DIR at {SESSION_STORAGE_DIR}/{user_id}/artifacts."""
     global ARTIFACTS_DIR, CURRENT_USER_ID, USER_SKILLS_DIR
     CURRENT_USER_ID = user_id
+    if user_id:
+        os.environ["USER_ID"] = user_id
+        os.environ["CURRENT_USER_ID"] = user_id
+    else:
+        os.environ.pop("USER_ID", None)
+        os.environ.pop("CURRENT_USER_ID", None)
     artifacts_dir = utils.ensure_user_artifacts_dir(user_id)
     ARTIFACTS_DIR = artifacts_dir
     os.environ["ARTIFACTS_DIR"] = artifacts_dir

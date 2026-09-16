@@ -412,6 +412,7 @@ def _ecs_execution_secrets_policy_document() -> Dict:
                     f"arn:aws:secretsmanager:{region}:{account_id}:secret:{project_name}/session-signing-key*",
                     f"arn:aws:secretsmanager:{region}:{account_id}:secret:{project_name}/cloudfront-signing-key*",
                     f"arn:aws:secretsmanager:{region}:{account_id}:secret:{project_name}/llm-gateway-key*",
+                    f"arn:aws:secretsmanager:{region}:{account_id}:secret:{project_name}/vault-agent-token*",
                 ],
             }
         ],
