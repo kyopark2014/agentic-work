@@ -43,6 +43,7 @@ def run_agent(
     memory_enabled=None,
     llm_gateway_enabled=None,
     files=None,
+    task_id=None,
 ):
     """Dispatch agent calls to AgentCore runtime only.
 
@@ -104,4 +105,5 @@ def run_agent(
         llm_gateway_url=gateway_url or None,
         llm_gateway_key=gateway_key or None,
         files=files,
+        task_id=task_id,
     )

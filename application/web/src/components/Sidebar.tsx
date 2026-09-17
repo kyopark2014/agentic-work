@@ -7,6 +7,7 @@ import type { AppConfig, Task } from "../types";
 import { ConfigDrawer } from "./ConfigDrawer";
 import { KnowledgeGraphModal } from "./KnowledgeGraphModal";
 import { LlmGatewayModal } from "./LlmGatewayModal";
+import { ScheduleListModal } from "./ScheduleListModal";
 import { WikiConfigureModal } from "./WikiConfigureModal";
 import { WikiGraphModal } from "./WikiGraphModal";
 import { WikiSyncStartModal } from "./WikiSyncStartModal";
@@ -24,6 +25,7 @@ import {
   MemoryIcon,
   ModelIcon,
   NewTaskIcon,
+  ScheduleIcon,
   SettingsIcon,
   SkillIcon,
   WikiIcon,
@@ -96,6 +98,7 @@ export function Sidebar({
   const knowledgeBtnRef = useRef<HTMLButtonElement>(null);
   const settingsSectionRef = useRef<HTMLDivElement>(null);
   const [llmGatewayOpen, setLlmGatewayOpen] = useState(false);
+  const [scheduleListOpen, setScheduleListOpen] = useState(false);
   const [settingsExpanded, setSettingsExpanded] = useState(false);
   const [knowledgeGraphOpen, setKnowledgeGraphOpen] = useState(false);
   const [wikiGraphOpen, setWikiGraphOpen] = useState(false);
@@ -653,6 +656,17 @@ export function Sidebar({
                 </span>
               </button>
               <button
+                type="button"
+                className={`sidebar-menu-btn${scheduleListOpen ? " is-active" : ""}`}
+                onClick={() => {
+                  onCloseDrawer();
+                  setScheduleListOpen(true);
+                }}
+              >
+                <ScheduleIcon className="sidebar-icon" />
+                <span>Schedule List</span>
+              </button>
+              <button
                 ref={appearanceBtnRef}
                 type="button"
                 className={`sidebar-menu-btn${drawer === "appearance" ? " is-active" : ""}`}
@@ -788,6 +802,17 @@ export function Sidebar({
           }}
         />
       )}
+
+      <ScheduleListModal
+        open={scheduleListOpen}
+        tasks={tasks}
+        onSelectTask={onSelectTask}
+        onClose={() => {
+          setScheduleListOpen(false);
+          setSettingsExpanded(false);
+          onCloseDrawer();
+        }}
+      />
 
       {knowledgeGraphOpen && (
         <KnowledgeGraphModal

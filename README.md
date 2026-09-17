@@ -799,7 +799,7 @@ runtime_agent/langgraph/
 
 **MCP 목록 (`mcp.list`)**: knowledge base, aws documentation, trade info, websearch, web_fetch, image generation, tavily, notion, aws-drawio, memory
 
-**Skill 목록 (`skills.list`)**: docx, pdf, pptx, xlsx, skill-creator, seoul-subway, korea-weather, myslide, …
+**Skill 목록 (`skills.list`)**: docx, pdf, pptx, xlsx, skill-creator, seoul-subway, korea-weather, my-schedule, my-vaults, myslide, …
 
 > OpenAI GPT 5.4/5.5는 Bedrock Mantle Responses API(`mantle_api: "responses"`)를 사용합니다. Runtime IAM 정책(`installer.py`의 `BedrockMantleAccess`)에 모델이 호출하는 Mantle 리전(예: `us-east-2`)이 포함되어야 합니다.
 
@@ -822,6 +822,14 @@ skills/
 │   └── SKILL.md
 ├── subway/               # seoul-subway
 │   └── SKILL.md
+├── my-schedule/
+│   ├── SKILL.md
+│   └── scripts/
+│       ├── manage_schedule.py
+│       └── lib_schedule.py
+├── my-vaults/
+│   ├── SKILL.md
+│   └── scripts/
 └── korea-weather/
     ├── SKILL.md
     └── scripts/
@@ -2004,6 +2012,194 @@ Sync 우선순위: Configure Sources + `raw/`에 파일이 있으면 함께 추�
 | `POST /api/wiki/raw` | 문서 업로드 → `raw/` |
 | `POST /api/wiki/urls` | URL ingest |
 | `PATCH /api/wiki/pattern` | 시각화 패턴 |
+
+### Schedule
+
+대화방에 **예약 작업(job)** 을 등록하고, [Amazon EventBridge Scheduler](https://docs.aws.amazon.com/scheduler/latest/UserGuide/what-is-scheduler.html)가 시각에 맞춰 실행합니다. 실행 결과는 해당 대화방에 일반 채팅 메시지처럼 저장되며, Settings의 **Schedule List**에서 조회·삭제할 수 있습니다.
+
+#### 동작 흐름
+
+```mermaid
+flowchart LR
+  U["사용자: 매일 8시 날씨 알려줘"] --> SK["my-schedule skill"]
+  SK --> API["ECS POST /api/schedules"]
+  API --> DDB[(DynamoDB job JSON)]
+  API --> EBS["EventBridge Scheduler"]
+  EBS -->|"cron/rate 시각"| L["Lambda job_id"]
+  L --> DDB
+  L --> RUN["ECS POST /api/internal/schedules/{id}/run"]
+  RUN --> AG["AgentCore prompt 실행"]
+  AG --> MSG["task_id 대화방 메시지 저장"]
+```
+
+1. Agent가 `my-schedule` skill로 예약을 생성합니다 (`TASK_ID` = 현재 대화방).
+2. ECS가 DynamoDB에 job JSON을 저장하고 EventBridge Scheduler schedule을 등록합니다.
+3. 시각이 되면 Scheduler → Lambda(`job_id`) → DynamoDB 조회 → ECS 내부 API.
+4. ECS가 `[예약 실행] {prompt}` 로 agent를 돌리고 user/assistant 메시지를 저장합니다.
+5. 사용자는 나중에 같은 대화방에서 결과를 확인합니다.
+
+#### 구성 요소
+
+| 구분 | 경로 | 역할 |
+|------|------|------|
+| Skill | [`runtime_agent/langgraph/skills/my-schedule/`](./runtime_agent/langgraph/skills/my-schedule/) | 예약 생성·조회·수정·삭제 CLI |
+| Auth | [`application/schedule_auth.py`](./application/schedule_auth.py) | `ScheduleAgent` HMAC (AgentCore는 session-signing-key를 못 읽음) |
+| Store | [`application/schedule_store.py`](./application/schedule_store.py) | DynamoDB CRUD / scan |
+| Service | [`application/schedule_service.py`](./application/schedule_service.py) | Scheduler create/update/delete + 완료 job 정리 |
+| Run | [`application/services/scheduled_job_service.py`](./application/services/scheduled_job_service.py) | prompt로 chat 경로 실행 |
+| API | [`application/api/routes_schedules.py`](./application/api/routes_schedules.py) | REST + Lambda용 internal run |
+| Lambda | [`lambda-schedule/lambda_function.py`](./lambda-schedule/lambda_function.py) | Scheduler 타겟 → ECS 호출 |
+| UI | [`application/web/src/components/ScheduleListModal.tsx`](./application/web/src/components/ScheduleListModal.tsx) | Settings → Schedule List |
+| Infra | [`installer.py`](./installer.py) `deploy_schedule_infrastructure` | DDB / Lambda / Scheduler group·role / secret |
+
+#### Job JSON (DynamoDB)
+
+테이블: `dynamodb-{project}-schedules` (PK `job_id`, GSI `user_id-created_at-index`, `task_id-created_at-index`).
+
+```json
+{
+  "job_id": "uuid",
+  "user_id": "user@example.com",
+  "task_id": "대화방 id",
+  "runtime_session_id": "AgentCore/checkpoint session",
+  "prompt": "오늘 날씨와 미세먼지를 알려줘",
+  "title": "아침 날씨",
+  "schedule_expression": "cron(0 8 * * ? *)",
+  "timezone": "Asia/Seoul",
+  "enabled": true,
+  "schedule_name": "agentic-work-job-...",
+  "schedule_group": "schedule-group-agentic-work",
+  "schedule_arn": "arn:aws:scheduler:...",
+  "created_at": "...",
+  "updated_at": "...",
+  "last_run_at": "",
+  "last_run_status": "",
+  "last_error": ""
+}
+```
+
+`task_id`는 대화방, `runtime_session_id`는 LangGraph checkpoint / AgentCore 세션입니다. 실행 시 앱은 live task의 `runtime_session_id`를 우선 사용합니다.
+
+#### 인증 (`ScheduleAgent`)
+
+AgentCore Runtime은 `session-signing-key` 읽기가 거부됩니다. vault와 같이 전용 시크릿 `{project}/schedule-agent-token`을 사용합니다.
+
+```http
+Authorization: ScheduleAgent v1.<payload_b64>.<sig_b64>
+```
+
+payload 예: `{"uid":"<user_id>","exp":<unix>}`.  
+Skill·Lambda는 이 헤더로 ECS를 호출하고, 브라우저 Schedule List는 세션 쿠키로 `/api/schedules`에 접근합니다 ([`schedule_auth.require_schedule_user`](./application/schedule_auth.py)).
+
+#### REST API
+
+| Method | Path | 인증 | 설명 |
+|--------|------|------|------|
+| `POST` | `/api/schedules` | ScheduleAgent 또는 세션 | 예약 생성 (DDB + Scheduler) |
+| `GET` | `/api/schedules` | 동일 | 목록 (`?task_id=` 선택) |
+| `GET` | `/api/schedules/{job_id}` | 동일 | 단건 조회 |
+| `PATCH` | `/api/schedules/{job_id}` | 동일 | prompt/cron/enabled 수정 |
+| `DELETE` | `/api/schedules/{job_id}` | 동일 | Scheduler + DDB 삭제 |
+| `POST` | `/api/internal/schedules/{job_id}/run` | ScheduleAgent only | Lambda 진입점 (202 async) |
+
+생성 요청 본문 예:
+
+```json
+{
+  "prompt": "오늘 날씨 알려줘",
+  "schedule_expression": "cron(0 8 * * ? *)",
+  "task_id": "<현재 대화방>",
+  "runtime_session_id": "<optional>",
+  "timezone": "Asia/Seoul",
+  "title": "아침 날씨",
+  "enabled": true
+}
+```
+
+#### Skill (`my-schedule`)
+
+`application/skills.list`와 `runtime_agent/langgraph/skills/my-schedule/`에 포함됩니다. Agent는 스크립트로만 조작합니다.
+
+```bash
+python skills/my-schedule/scripts/manage_schedule.py create \
+  --prompt "오늘 날씨와 미세먼지를 알려줘" \
+  --cron "cron(0 8 * * ? *)" \
+  --timezone Asia/Seoul \
+  --title "아침 날씨"
+
+python skills/my-schedule/scripts/manage_schedule.py list --this-task
+python skills/my-schedule/scripts/manage_schedule.py delete <job_id>
+```
+
+환경 변수: `TASK_ID`, `RUNTIME_SESSION_ID`, `USER_ID` / `CURRENT_USER_ID`, `SCHEDULE_AGENT_TOKEN`(또는 Secrets Manager), `APP_BASE_URL` / config `sharing_url`.
+
+ECS → AgentCore payload에 `task_id`를 넣고, Runtime [`agent.py`](./runtime_agent/langgraph/agent.py)가 `TASK_ID` / `RUNTIME_SESSION_ID` env를 설정합니다.
+
+#### EventBridge Scheduler 표현식
+
+형식: `cron(분 시 일 월 요일 년도)` — 일과 요일 중 하나는 `?`.
+
+| 요청 | schedule_expression | timezone |
+|------|---------------------|----------|
+| 매일 아침 8시 | `cron(0 8 * * ? *)` | `Asia/Seoul` |
+| 평일 9시 | `cron(0 9 ? * MON-FRI *)` | `Asia/Seoul` |
+| 1시간마다 | `rate(1 hours)` | `Asia/Seoul` |
+| 일회성 (예: 2026-09-17 18:05) | `cron(5 18 17 9 ? 2026)` | `Asia/Seoul` |
+
+Scheduler Target Input은 `{"job_id":"<uuid>"}` 입니다. Legacy EventBridge Rule이 아니라 **EventBridge Scheduler**를 사용합니다.
+
+#### Lambda → ECS 실행
+
+[`lambda-schedule/lambda_function.py`](./lambda-schedule/lambda_function.py):
+
+```python
+def handler(event, context):
+    job_id = str(event.get("job_id") or "").strip()
+    # DynamoDB에서 job 조회 (disabled면 skip)
+    # ScheduleAgent HMAC으로 ECS 호출
+    # POST {APP_BASE_URL}/api/internal/schedules/{job_id}/run
+```
+
+ECS [`scheduled_job_service`](./application/services/scheduled_job_service.py)는 기존 `ChatStreamService`로 agent를 돌리고, user 메시지에 `[예약 실행]` prefix를 붙인 뒤 assistant 응답을 `task_store`에 저장합니다.
+
+#### Settings UI — Schedule List
+
+Sidebar **Settings → Schedule List** ([`ScheduleListModal.tsx`](./application/web/src/components/ScheduleListModal.tsx), ob-docs Shared List와 동일 패턴):
+
+- 목록: title, cron/timezone, 활성 여부, 대화방 제목, 최근 실행
+- **열기**: 예약을 등록한 `task_id` 대화방으로 전환
+- **삭제**: 확인 다이얼로그 후 Scheduler + DDB 삭제 (`다시 묻지 않기` 지원)
+
+API: `GET/DELETE /api/schedules` (세션 쿠키).
+
+#### 앱 기동 시 완료 job 정리
+
+[`server.py` lifespan](./application/server.py)에서 `schedule_service.cleanup_completed_schedules()`를 호출합니다.
+
+- 일회성 cron/at의 실행 시각이 지났으면 삭제
+- Scheduler에 스케줄이 없고 DDB만 남은 orphan도 삭제
+- `rate(...)` / `cron(... *)` 반복 스케줄은 유지
+
+판별 로직은 [`schedule_has_future_runs`](./application/schedule_service.py)에 있습니다.
+
+#### 인프라 배포
+
+루트 installer가 CloudFront 생성 후 `deploy_schedule_infrastructure()`로 다음을 만듭니다.
+
+- Secrets Manager: `{project}/schedule-agent-token`
+- DynamoDB: `dynamodb-{project}-schedules`
+- Scheduler group: `schedule-group-{project}`
+- Lambda: `lambda-schedule-for-{project}` (+ IAM)
+- Scheduler invoke role + ECS task role의 DDB/Scheduler/PassRole 정책
+- ECS env: `SCHEDULE_JOBS_TABLE`, `SCHEDULE_GROUP_NAME`, `SCHEDULE_LAMBDA_ARN`, `SCHEDULER_ROLE_ARN`, secret `SCHEDULE_AGENT_TOKEN`
+
+기존 스택만 갱신할 때:
+
+```bash
+python3 installer.py --schedule-only
+```
+
+AgentCore가 토큰을 읽으려면 Runtime installer 정책에 `{project}/schedule-agent-token*` Allow가 필요합니다 ([`runtime_agent/langgraph/installer.py`](./runtime_agent/langgraph/installer.py)). Web 이미지에도 Schedule API·UI가 포함되어야 하므로 ECS 앱을 재배포하세요.
 
 ## 배포하기
 

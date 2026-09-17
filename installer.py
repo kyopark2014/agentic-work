@@ -59,6 +59,13 @@ custom_header_name = "X-Custom-Header"
 ALB_ORIGIN_HEADER_SECRET_NAME = f"{project_name}/cloudfront-alb-origin-header"
 # HMAC key for Web UI session cookies (never hardcode in source).
 SESSION_SIGNING_KEY_SECRET_NAME = f"{project_name}/session-signing-key"
+# HMAC for my-schedule skill + Lambda → ECS (AgentCore may read this; not session-signing-key).
+SCHEDULE_AGENT_TOKEN_SECRET_NAME = f"{project_name}/schedule-agent-token"
+SCHEDULE_JOBS_TABLE_NAME = f"dynamodb-{project_name}-schedules"
+SCHEDULE_LAMBDA_NAME = f"lambda-schedule-for-{project_name}"
+SCHEDULE_LAMBDA_ROLE_NAME = f"role-lambda-schedule-for-{project_name}-{region}"
+SCHEDULER_INVOKE_ROLE_NAME = f"role-scheduler-invoke-for-{project_name}-{region}"
+SCHEDULE_GROUP_NAME = f"schedule-group-{project_name}"
 # RSA private key + CloudFront public key / key group ids for signed cookies.
 CLOUDFRONT_SIGNING_KEY_SECRET_NAME = f"{project_name}/cloudfront-signing-key"
 # Shared LLM Gateway fallback key (stripped from APP_CONFIG_JSON; ECS secrets inject).
@@ -157,6 +164,8 @@ ec2_client = boto3.client("ec2", region_name=region)
 elbv2_client = boto3.client("elbv2", region_name=region)
 cloudfront_client = boto3.client("cloudfront", region_name=region)
 lambda_client = boto3.client("lambda", region_name=region)
+dynamodb_client = boto3.client("dynamodb", region_name=region)
+scheduler_client = boto3.client("scheduler", region_name=region)
 ssm_client = boto3.client("ssm", region_name=region)
 ecr_client = boto3.client("ecr", region_name=region)
 ecs_client = boto3.client("ecs", region_name=region)
@@ -329,6 +338,54 @@ def get_or_create_session_signing_key(*, rotate: bool = False) -> str:
         raise
 
 
+def get_or_create_schedule_agent_token(*, rotate: bool = False) -> str:
+    """HMAC token for my-schedule (skill + Lambda → ECS)."""
+    secret_name = SCHEDULE_AGENT_TOKEN_SECRET_NAME
+    try:
+        existing = secretsmanager_client.get_secret_value(SecretId=secret_name)
+        current = (existing.get("SecretString") or "").strip()
+        if current and not rotate:
+            logger.info(f"  ✓ Reusing schedule agent token: {secret_name}")
+            return current
+        new_value = secrets.token_urlsafe(32)
+        secretsmanager_client.put_secret_value(
+            SecretId=secret_name,
+            SecretString=new_value,
+        )
+        logger.info(f"  ✓ Rotated schedule agent token: {secret_name}")
+        return new_value
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ResourceNotFoundException":
+            raise
+
+    new_value = secrets.token_urlsafe(32)
+    try:
+        secretsmanager_client.create_secret(
+            Name=secret_name,
+            Description=f"HMAC token for {project_name} my-schedule (skill/Lambda)",
+            SecretString=new_value,
+            Tags=[
+                {"Key": "Name", "Value": secret_name},
+                {"Key": "Project", "Value": project_name},
+            ],
+        )
+        logger.info(f"  ✓ Created schedule agent token secret: {secret_name}")
+        return new_value
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ResourceExistsException":
+            if rotate:
+                new_value = secrets.token_urlsafe(32)
+                secretsmanager_client.put_secret_value(
+                    SecretId=secret_name,
+                    SecretString=new_value,
+                )
+                logger.info(f"  ✓ Rotated schedule agent token: {secret_name}")
+                return new_value
+            response = secretsmanager_client.get_secret_value(SecretId=secret_name)
+            return response["SecretString"]
+        raise
+
+
 def _describe_secret_arn(secret_id: str) -> str:
     """Return the full Secrets Manager ARN (includes random suffix)."""
     return secretsmanager_client.describe_secret(SecretId=secret_id)["ARN"]
@@ -413,6 +470,7 @@ def _ecs_execution_secrets_policy_document() -> Dict:
                     f"arn:aws:secretsmanager:{region}:{account_id}:secret:{project_name}/cloudfront-signing-key*",
                     f"arn:aws:secretsmanager:{region}:{account_id}:secret:{project_name}/llm-gateway-key*",
                     f"arn:aws:secretsmanager:{region}:{account_id}:secret:{project_name}/vault-agent-token*",
+                    f"arn:aws:secretsmanager:{region}:{account_id}:secret:{project_name}/schedule-agent-token*",
                 ],
             }
         ],
@@ -438,6 +496,7 @@ def build_ecs_runtime_secret_refs(
     ``extras`` holds non-sensitive env such as CLOUDFRONT_KEY_PAIR_ID.
     """
     get_or_create_session_signing_key(rotate=False)
+    get_or_create_schedule_agent_token(rotate=False)
     cf_signing = get_or_create_cloudfront_signing_material(rotate=False)
 
     preferred_gateway = ""
@@ -449,6 +508,10 @@ def build_ecs_runtime_secret_refs(
         {
             "name": "SESSION_SIGNING_KEY",
             "valueFrom": _ecs_secret_value_from(SESSION_SIGNING_KEY_SECRET_NAME),
+        },
+        {
+            "name": "SCHEDULE_AGENT_TOKEN",
+            "valueFrom": _ecs_secret_value_from(SCHEDULE_AGENT_TOKEN_SECRET_NAME),
         },
         {
             "name": "CLOUDFRONT_SIGNING_PRIVATE_KEY",
@@ -771,7 +834,11 @@ def ensure_alb_listener_origin_protection(
         for rule in rules.get("Rules", []):
             if rule.get("Priority") == "default":
                 continue
-            for condition in rule.get("Conditions", []):
+            conditions = rule.get("Conditions") or []
+            # Never rewrite path-scoped rules (e.g. ob-docs /vault* → TG-for-ob-docs).
+            if any(c.get("Field") == "path-pattern" for c in conditions):
+                continue
+            for condition in conditions:
                 if condition.get("Field") != "http-header":
                     continue
                 header_cfg = condition.get("HttpHeaderConfig") or {}
@@ -1476,6 +1543,341 @@ def create_ecs_roles() -> Dict[str, str]:
         "execution_role_arn": execution_role_arn,
     }
 
+
+def create_schedule_jobs_table() -> str:
+    """DynamoDB table for my-schedule jobs."""
+    table_name = SCHEDULE_JOBS_TABLE_NAME
+    logger.info(f"[schedule] Creating DynamoDB table: {table_name}")
+    try:
+        dynamodb_client.create_table(
+            TableName=table_name,
+            AttributeDefinitions=[
+                {"AttributeName": "job_id", "AttributeType": "S"},
+                {"AttributeName": "user_id", "AttributeType": "S"},
+                {"AttributeName": "task_id", "AttributeType": "S"},
+                {"AttributeName": "created_at", "AttributeType": "S"},
+            ],
+            KeySchema=[{"AttributeName": "job_id", "KeyType": "HASH"}],
+            GlobalSecondaryIndexes=[
+                {
+                    "IndexName": "user_id-created_at-index",
+                    "KeySchema": [
+                        {"AttributeName": "user_id", "KeyType": "HASH"},
+                        {"AttributeName": "created_at", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                },
+                {
+                    "IndexName": "task_id-created_at-index",
+                    "KeySchema": [
+                        {"AttributeName": "task_id", "KeyType": "HASH"},
+                        {"AttributeName": "created_at", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                },
+            ],
+            BillingMode="PAY_PER_REQUEST",
+            Tags=[
+                {"Key": "Name", "Value": table_name},
+                {"Key": "Project", "Value": project_name},
+            ],
+        )
+        waiter = dynamodb_client.get_waiter("table_exists")
+        waiter.wait(TableName=table_name)
+        logger.info(f"  ✓ Created DynamoDB table: {table_name}")
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ResourceInUseException":
+            raise
+        logger.warning(f"  DynamoDB table already exists: {table_name}")
+    return table_name
+
+
+def create_schedule_group() -> str:
+    group_name = SCHEDULE_GROUP_NAME
+    logger.info(f"[schedule] Creating Scheduler group: {group_name}")
+    try:
+        scheduler_client.create_schedule_group(
+            Name=group_name,
+            Tags=[
+                {"Key": "Name", "Value": group_name},
+                {"Key": "Project", "Value": project_name},
+            ],
+        )
+        logger.info(f"  ✓ Created schedule group: {group_name}")
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code not in {"ConflictException", "ResourceAlreadyExistsException"}:
+            raise
+        logger.warning(f"  Schedule group already exists: {group_name}")
+    return group_name
+
+
+def create_scheduler_invoke_role(lambda_arn: str) -> str:
+    """EventBridge Scheduler execution role that invokes the schedule Lambda."""
+    role_name = SCHEDULER_INVOKE_ROLE_NAME
+    trust = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"Service": "scheduler.amazonaws.com"},
+                "Action": "sts:AssumeRole",
+                "Condition": {
+                    "StringEquals": {"aws:SourceAccount": account_id},
+                },
+            }
+        ],
+    }
+    role_arn = create_iam_role(role_name, trust)
+    attach_inline_policy(
+        role_name,
+        f"scheduler-invoke-lambda-for-{project_name}",
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": ["lambda:InvokeFunction"],
+                    "Resource": [lambda_arn, f"{lambda_arn}:*"],
+                }
+            ],
+        },
+    )
+    return role_arn
+
+
+def create_schedule_lambda_role() -> str:
+    role_name = SCHEDULE_LAMBDA_ROLE_NAME
+    trust = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"Service": "lambda.amazonaws.com"},
+                "Action": "sts:AssumeRole",
+            }
+        ],
+    }
+    role_arn = create_iam_role(
+        role_name,
+        trust,
+        managed_policies=[
+            "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        ],
+    )
+    attach_inline_policy(
+        role_name,
+        f"lambda-schedule-policy-for-{project_name}",
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "ReadScheduleJobs",
+                    "Effect": "Allow",
+                    "Action": [
+                        "dynamodb:GetItem",
+                        "dynamodb:Query",
+                    ],
+                    "Resource": [
+                        f"arn:aws:dynamodb:{region}:{account_id}:table/{SCHEDULE_JOBS_TABLE_NAME}",
+                        f"arn:aws:dynamodb:{region}:{account_id}:table/{SCHEDULE_JOBS_TABLE_NAME}/index/*",
+                    ],
+                },
+                {
+                    "Sid": "ReadScheduleToken",
+                    "Effect": "Allow",
+                    "Action": ["secretsmanager:GetSecretValue"],
+                    "Resource": [
+                        f"arn:aws:secretsmanager:{region}:{account_id}:secret:{project_name}/schedule-agent-token*",
+                    ],
+                },
+            ],
+        },
+    )
+    return role_arn
+
+
+def _package_schedule_lambda_zip() -> bytes:
+    import io
+    import zipfile
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    src = os.path.join(root, "lambda-schedule", "lambda_function.py")
+    if not os.path.isfile(src):
+        raise FileNotFoundError(f"Missing schedule lambda source: {src}")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(src, arcname="lambda_function.py")
+    return buf.getvalue()
+
+
+def create_or_update_schedule_lambda(
+    *,
+    role_arn: str,
+    app_base_url: str,
+    table_name: str,
+) -> str:
+    """Deploy schedule runner Lambda. Returns function ARN."""
+    get_or_create_schedule_agent_token(rotate=False)
+    zip_bytes = _package_schedule_lambda_zip()
+    fn_name = SCHEDULE_LAMBDA_NAME
+    secret_arn = _describe_secret_arn(SCHEDULE_AGENT_TOKEN_SECRET_NAME)
+    env = {
+        "Variables": {
+            "APP_BASE_URL": (app_base_url or "").rstrip("/"),
+            "SCHEDULE_JOBS_TABLE": table_name,
+            "SCHEDULE_AGENT_TOKEN_SECRET": SCHEDULE_AGENT_TOKEN_SECRET_NAME,
+        }
+    }
+    logger.info(f"[schedule] Deploying Lambda: {fn_name}")
+    try:
+        resp = lambda_client.create_function(
+            FunctionName=fn_name,
+            Runtime="python3.12",
+            Role=role_arn,
+            Handler="lambda_function.handler",
+            Code={"ZipFile": zip_bytes},
+            Timeout=60,
+            MemorySize=256,
+            Environment=env,
+            Description=f"my-schedule runner for {project_name}",
+            Tags={"Project": project_name, "Name": fn_name},
+        )
+        arn = resp["FunctionArn"]
+        logger.info(f"  ✓ Created Lambda: {arn}")
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ResourceConflictException":
+            raise
+        lambda_client.update_function_code(FunctionName=fn_name, ZipFile=zip_bytes)
+        # Wait briefly for code update before config update
+        time.sleep(2)
+        try:
+            lambda_client.update_function_configuration(
+                FunctionName=fn_name,
+                Role=role_arn,
+                Timeout=60,
+                MemorySize=256,
+                Environment=env,
+            )
+        except ClientError as cfg_err:
+            # Concurrent update during code publish — retry once
+            if cfg_err.response["Error"]["Code"] == "ResourceConflictException":
+                time.sleep(5)
+                lambda_client.update_function_configuration(
+                    FunctionName=fn_name,
+                    Role=role_arn,
+                    Timeout=60,
+                    MemorySize=256,
+                    Environment=env,
+                )
+            else:
+                raise
+        arn = lambda_client.get_function(FunctionName=fn_name)["Configuration"][
+            "FunctionArn"
+        ]
+        logger.info(f"  ✓ Updated Lambda: {arn}")
+
+    # Allow EventBridge Scheduler service to invoke (also via role; permission is belt+suspenders)
+    try:
+        lambda_client.add_permission(
+            FunctionName=fn_name,
+            StatementId=f"AllowSchedulerInvoke-{project_name}",
+            Action="lambda:InvokeFunction",
+            Principal="scheduler.amazonaws.com",
+            SourceAccount=account_id,
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ResourceConflictException":
+            logger.warning(f"  Lambda permission note: {e}")
+
+    return arn
+
+
+def attach_ecs_schedule_policy(task_role_name: str) -> None:
+    """Allow ECS Web to manage schedule jobs + EventBridge Scheduler."""
+    attach_inline_policy(
+        task_role_name,
+        f"ecs-task-schedule-policy-for-{project_name}",
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "ScheduleJobsTable",
+                    "Effect": "Allow",
+                    "Action": [
+                        "dynamodb:GetItem",
+                        "dynamodb:PutItem",
+                        "dynamodb:UpdateItem",
+                        "dynamodb:DeleteItem",
+                        "dynamodb:Query",
+                    ],
+                    "Resource": [
+                        f"arn:aws:dynamodb:{region}:{account_id}:table/{SCHEDULE_JOBS_TABLE_NAME}",
+                        f"arn:aws:dynamodb:{region}:{account_id}:table/{SCHEDULE_JOBS_TABLE_NAME}/index/*",
+                    ],
+                },
+                {
+                    "Sid": "EventBridgeSchedulerManage",
+                    "Effect": "Allow",
+                    "Action": [
+                        "scheduler:CreateSchedule",
+                        "scheduler:UpdateSchedule",
+                        "scheduler:DeleteSchedule",
+                        "scheduler:GetSchedule",
+                    ],
+                    "Resource": [
+                        f"arn:aws:scheduler:{region}:{account_id}:schedule/{SCHEDULE_GROUP_NAME}/*",
+                    ],
+                },
+                {
+                    "Sid": "PassSchedulerRole",
+                    "Effect": "Allow",
+                    "Action": ["iam:PassRole"],
+                    "Resource": [
+                        f"arn:aws:iam::{account_id}:role/{SCHEDULER_INVOKE_ROLE_NAME}",
+                    ],
+                    "Condition": {
+                        "StringEquals": {
+                            "iam:PassedToService": "scheduler.amazonaws.com"
+                        }
+                    },
+                },
+            ],
+        },
+    )
+    logger.info(f"  ✓ Attached schedule policy to {task_role_name}")
+
+
+def deploy_schedule_infrastructure(
+    *,
+    app_base_url: str,
+    ecs_task_role_name: str,
+) -> Dict[str, str]:
+    """Provision DynamoDB + Lambda + Scheduler group/roles for my-schedule."""
+    logger.info("[schedule] Deploying my-schedule infrastructure")
+    get_or_create_schedule_agent_token(rotate=False)
+    table_name = create_schedule_jobs_table()
+    group_name = create_schedule_group()
+    lambda_role_arn = create_schedule_lambda_role()
+    # IAM role propagation
+    time.sleep(8)
+    lambda_arn = create_or_update_schedule_lambda(
+        role_arn=lambda_role_arn,
+        app_base_url=app_base_url,
+        table_name=table_name,
+    )
+    scheduler_role_arn = create_scheduler_invoke_role(lambda_arn)
+    if ecs_task_role_name:
+        attach_ecs_schedule_policy(ecs_task_role_name)
+    info = {
+        "schedule_jobs_table": table_name,
+        "schedule_group_name": group_name,
+        "schedule_lambda_arn": lambda_arn,
+        "scheduler_role_arn": scheduler_role_arn,
+        "schedule_lambda_role_arn": lambda_role_arn,
+    }
+    logger.info(f"  ✓ my-schedule infra ready: {info}")
+    return info
 
 
 def _get_installer_iam_arn() -> str:
@@ -7292,6 +7694,22 @@ def deploy_ecs_service(
             "name": "CLOUDFRONT_KEY_PAIR_ID",
             "value": secret_env_extras.get("CLOUDFRONT_KEY_PAIR_ID") or "",
         },
+        {
+            "name": "SCHEDULE_JOBS_TABLE",
+            "value": str(public_app_config.get("schedule_jobs_table") or SCHEDULE_JOBS_TABLE_NAME),
+        },
+        {
+            "name": "SCHEDULE_GROUP_NAME",
+            "value": str(public_app_config.get("schedule_group_name") or SCHEDULE_GROUP_NAME),
+        },
+        {
+            "name": "SCHEDULE_LAMBDA_ARN",
+            "value": str(public_app_config.get("schedule_lambda_arn") or ""),
+        },
+        {
+            "name": "SCHEDULER_ROLE_ARN",
+            "value": str(public_app_config.get("scheduler_role_arn") or ""),
+        },
     ]
     container_definition: Dict[str, object] = {
         "name": container_name,
@@ -9218,6 +9636,11 @@ def main():
         const="langgraph",
         help="Install Agent Runtime. RUNTIME_TYPE can be 'langgraph' (default)."
     )
+    parser.add_argument(
+        "--schedule-only",
+        action="store_true",
+        help="Deploy only my-schedule infra (DynamoDB, Lambda, Scheduler) and update config.",
+    )
     
     args = parser.parse_args()
     
@@ -9230,6 +9653,32 @@ def main():
     # If --verify-deployment flag is provided, verify EC2 subnet deployment
     if args.verify_deployment:
         verify_ec2_subnet_deployment()
+        return
+
+    if args.schedule_only:
+        ensure_boto3_supports_agentcore_connector()
+        cfg = {}
+        try:
+            cfg = load_application_config()
+        except Exception:
+            pass
+        sharing = (cfg.get("sharing_url") or "").strip()
+        if not sharing:
+            raise SystemExit(
+                "--schedule-only requires application/config.json sharing_url "
+                "(run a full install first, or set sharing_url)."
+            )
+        ecs_task_role_name = f"role-ecs-task-for-{project_name}-{region}"
+        schedule_info = deploy_schedule_infrastructure(
+            app_base_url=sharing,
+            ecs_task_role_name=ecs_task_role_name,
+        )
+        merged = dict(cfg)
+        merged.update(schedule_info)
+        write_application_config(merged)
+        logger.info("✓ my-schedule infrastructure deployed (--schedule-only)")
+        for key, value in schedule_info.items():
+            logger.info(f"  {key}: {value}")
         return
     
     # If --install-agent-runtime flag is provided, install Agent Runtime
@@ -9353,6 +9802,12 @@ def main():
             alb_info, s3_bucket_name, origin_header_value
         )
         logger.info(f"CloudFront distribution created...")
+
+        # 7.5 my-schedule: DynamoDB + Lambda + EventBridge Scheduler
+        schedule_info = deploy_schedule_infrastructure(
+            app_base_url=f"https://{cloudfront_info['domain']}",
+            ecs_task_role_name=ecs_task_role_name,
+        )
         
         # 8. Build and push Docker image to ECR, then deploy ECS service
         sync_application_capability_lists()
@@ -9370,6 +9825,7 @@ def main():
         app_environment = apply_s3_files_config(
             app_environment, s3_files_info, s3_files_app_data_info
         )
+        app_environment.update(schedule_info)
         if write_application_config(app_environment):
             logger.info("Local testing is available while deployment continues:")
             logger.info("  uvicorn application.server:app --host 0.0.0.0 --port 8501")

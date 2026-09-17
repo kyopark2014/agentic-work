@@ -17,6 +17,7 @@ from application.api.routes_rag import router as rag_router
 from application.api.routes_admin import router as admin_router
 from application.api.routes_graph import router as graph_router
 from application.api.routes_wiki import router as wiki_router
+from application.api.routes_schedules import router as schedules_router
 from application.security_headers import SecurityHeadersMiddleware
 from application.task_store import init_db
 from application.task_store_persistence import (
@@ -77,6 +78,13 @@ async def lifespan(app: FastAPI):
             "per-user DBs under session_storage/{user}/{user}.db",
             mode,
         )
+    try:
+        from application import schedule_service
+
+        result = schedule_service.cleanup_completed_schedules()
+        logger.info("Startup schedule cleanup: %s", result)
+    except Exception:
+        logger.exception("Startup schedule cleanup failed (non-fatal)")
     yield
     flush_persist()
     logger.info("Task store shutdown persist complete")
@@ -103,6 +111,7 @@ app.include_router(rag_router)
 app.include_router(admin_router)
 app.include_router(graph_router)
 app.include_router(wiki_router)
+app.include_router(schedules_router)
 
 
 @app.get("/api/health")

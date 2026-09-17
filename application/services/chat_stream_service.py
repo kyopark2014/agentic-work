@@ -318,6 +318,7 @@ class ChatStreamService:
                 memory_enabled=memory_enabled,
                 llm_gateway_enabled=llm_gateway_enabled,
                 files=files,
+                task_id=task_id,
             )
             if not isinstance(response, str):
                 response = json.dumps(response, ensure_ascii=False)

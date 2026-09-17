@@ -509,6 +509,9 @@ def _project_secret_resource_arns(config) -> list:
 
     ``{project}/vault-agent-token`` is allowed so my-vaults can call ob-docs
     without reading session-signing-key (still denied below).
+
+    ``{project}/schedule-agent-token`` is allowed so my-schedule can call the
+    ECS schedule API without reading session-signing-key.
     """
     region = config["region"]
     account_id = config["accountId"]
@@ -519,6 +522,10 @@ def _project_secret_resource_arns(config) -> list:
         (
             f"arn:aws:secretsmanager:{region}:{account_id}:"
             f"secret:{project_name}/vault-agent-token*"
+        ),
+        (
+            f"arn:aws:secretsmanager:{region}:{account_id}:"
+            f"secret:{project_name}/schedule-agent-token*"
         ),
     ]
 
