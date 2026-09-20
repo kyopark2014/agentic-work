@@ -1377,6 +1377,32 @@ def _ecs_agent_runtime_resource_arns() -> List[str]:
             seen.add(endpoint_arn)
             arns.append(endpoint_arn)
 
+        vault_runtime_arn = (config.get("use_vault_mcp_runtime_arn") or "").strip()
+        if vault_runtime_arn and vault_runtime_arn not in seen:
+            seen.add(vault_runtime_arn)
+            arns.append(vault_runtime_arn)
+            vault_endpoint = f"{vault_runtime_arn}/runtime-endpoint/*"
+            if vault_endpoint not in seen:
+                seen.add(vault_endpoint)
+                arns.append(vault_endpoint)
+
+    # Always allow ob-docs use-vault MCP Runtime by name pattern.
+    for pattern_arn in (
+        f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/use_vault_of_ob_docs",
+        f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/use_vault_of_ob_docs-*",
+        (
+            f"arn:aws:bedrock-agentcore:{region}:{account_id}:"
+            f"runtime/use_vault_of_ob_docs/runtime-endpoint/*"
+        ),
+        (
+            f"arn:aws:bedrock-agentcore:{region}:{account_id}:"
+            f"runtime/use_vault_of_ob_docs-*/runtime-endpoint/*"
+        ),
+    ):
+        if pattern_arn not in seen:
+            seen.add(pattern_arn)
+            arns.append(pattern_arn)
+
     return arns
 
 

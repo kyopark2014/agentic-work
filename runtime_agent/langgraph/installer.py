@@ -68,6 +68,10 @@ def _merge_application_config(config: dict) -> dict:
         "s3_files_file_system_id",
         "agent_runtime_vpc_subnets",
         "agent_runtime_security_groups",
+        "use_vault_mcp_url",
+        "use_vault_mcp_runtime_arn",
+        "use_vault_mcp_region",
+        "agentcore_websearch_gateway_url",
     ):
         app_value = app_config.get(key)
         if app_value and updated.get(key) != app_value:
@@ -346,12 +350,13 @@ def _project_agent_runtime_resource_arns(config) -> list:
 
     Use name + wildcard only (exact runtime id is covered by ``{name}-*``) to
     stay under the managed-policy 6144-byte PolicySize quota.
+    Also includes ob-docs use-vault MCP Runtime when configured.
     """
     region = config["region"]
     account_id = config["accountId"]
     project_name = config.get("projectName", "agentcore")
     runtime_name = agent_runtime_name(project_name)
-    return [
+    arns = [
         f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/{runtime_name}",
         f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/{runtime_name}-*",
         (
@@ -363,6 +368,30 @@ def _project_agent_runtime_resource_arns(config) -> list:
             f"runtime/{runtime_name}-*/runtime-endpoint/*"
         ),
     ]
+
+    # Remote use-vault MCP (ob-docs AgentCore Runtime)
+    vault_arn = (config.get("use_vault_mcp_runtime_arn") or "").strip()
+    vault_name = "use_vault_of_ob_docs"
+    arns.extend(
+        [
+            f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/{vault_name}",
+            f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/{vault_name}-*",
+            (
+                f"arn:aws:bedrock-agentcore:{region}:{account_id}:"
+                f"runtime/{vault_name}/runtime-endpoint/*"
+            ),
+            (
+                f"arn:aws:bedrock-agentcore:{region}:{account_id}:"
+                f"runtime/{vault_name}-*/runtime-endpoint/*"
+            ),
+        ]
+    )
+    if vault_arn and vault_arn not in arns:
+        arns.append(vault_arn)
+        endpoint = f"{vault_arn}/runtime-endpoint/*"
+        if endpoint not in arns:
+            arns.append(endpoint)
+    return arns
 
 
 def _compact_policy_json(policy_document: dict) -> str:
