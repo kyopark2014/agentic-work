@@ -12,10 +12,12 @@ try:
     from application import utils
     from application import session_cookie
     from application import cloudfront_cookies
+    from application import allow_list
 except ImportError:
     import utils
     import session_cookie
     import cloudfront_cookies
+    import allow_list
 
 logger = logging.getLogger("routes_auth")
 
@@ -210,7 +212,16 @@ def _set_user_cookie(response: Response, request: Request, user_id: str) -> None
 
 def get_optional_user_id(request: Request) -> str | None:
     """Return verified user_id from the HMAC session cookie, or None."""
-    return session_cookie.verify_session(request.cookies.get(SESSION_COOKIE) or "")
+    user_id = session_cookie.verify_session(request.cookies.get(SESSION_COOKIE) or "")
+    if not user_id:
+        return None
+    # Local/dev bypass: do not enforce allowlist on loopback sessions.
+    if local_auth_bypass_enabled(request):
+        return user_id
+    if not allow_list.is_allowed_user(user_id):
+        logger.warning("Session user not on allow-list: %s", user_id)
+        return None
+    return user_id
 
 
 def _kick_graph_job(user_id: str, *, force: bool = False) -> None:
@@ -305,7 +316,7 @@ def set_session(body: SessionRequest, request: Request, response: Response) -> S
             logger.warning("Google login rejected: %s", e)
             raise HTTPException(status_code=401, detail="Invalid Google credential") from e
 
-        user_id = idinfo["email"].strip()
+        user_id = allow_list.require_allowed_user(idinfo["email"])
         _set_user_cookie(response, request, user_id)
         utils.ensure_user_artifacts_dir(user_id)
         utils.ensure_user_skills_dir(user_id)
@@ -343,29 +354,31 @@ def set_session(body: SessionRequest, request: Request, response: Response) -> S
                 status_code=403,
                 detail="Local auth bypass is disabled",
             )
-        _set_user_cookie(response, request, local_user_id)
-        utils.ensure_user_artifacts_dir(local_user_id)
-        utils.ensure_user_skills_dir(local_user_id)
-        utils.ensure_user_skills_list(local_user_id)
+        # Local bypass (localhost / ALLOW_LOCAL_AUTH_BYPASS) skips allowlist.
+        user_id = local_user_id.strip()
+        _set_user_cookie(response, request, user_id)
+        utils.ensure_user_artifacts_dir(user_id)
+        utils.ensure_user_skills_dir(user_id)
+        utils.ensure_user_skills_list(user_id)
         try:
-            utils.ensure_user_graph_dir(local_user_id)
-            utils.ensure_user_wiki_dir(local_user_id)
+            utils.ensure_user_graph_dir(user_id)
+            utils.ensure_user_wiki_dir(user_id)
         except Exception:
-            logger.exception("Failed to ensure graph dir for %s", local_user_id)
-        _kick_graph_job(local_user_id)
+            logger.exception("Failed to ensure graph dir for %s", user_id)
+        _kick_graph_job(user_id)
         try:
             from application import task_store
 
-            task_store.record_login(local_user_id, method="local")
+            task_store.record_login(user_id, method="local")
         except Exception:
             logger.exception("Failed to record local login event")
-        gateway_ready = _ensure_litellm_virtual_key(local_user_id)
+        gateway_ready = _ensure_litellm_virtual_key(user_id)
         logger.warning(
             "Local auth bypass login: %s (llm_gateway_ready=%s)",
-            local_user_id,
+            user_id,
             gateway_ready,
         )
-        return _session_response(local_user_id, llm_gateway_ready=gateway_ready)
+        return _session_response(user_id, llm_gateway_ready=gateway_ready)
 
     raise HTTPException(
         status_code=400, detail="credential, access_token, or user_id is required"
@@ -374,6 +387,21 @@ def set_session(body: SessionRequest, request: Request, response: Response) -> S
 
 @router.get("", response_model=SessionResponse | None)
 def get_session(request: Request, response: Response) -> SessionResponse | None:
+    raw_user = session_cookie.verify_session(
+        request.cookies.get(SESSION_COOKIE) or ""
+    )
+    if (
+        raw_user
+        and not local_auth_bypass_enabled(request)
+        and not allow_list.is_allowed_user(raw_user)
+    ):
+        # Drop stale cookie for accounts removed from the allow list.
+        secure = _cookie_secure(request)
+        response.delete_cookie(key=SESSION_COOKIE, samesite="lax", secure=secure)
+        cloudfront_cookies.clear_signed_cookies(response, secure=secure)
+        logger.warning("Cleared session for non-allow-listed user: %s", raw_user)
+        return None
+
     user_id = get_optional_user_id(request)
     if not user_id:
         return None
@@ -449,4 +477,6 @@ def require_user_id(request: Request) -> str:
     user_id = get_optional_user_id(request)
     if not user_id:
         raise HTTPException(status_code=401, detail="User session required")
-    return user_id
+    if local_auth_bypass_enabled(request):
+        return user_id
+    return allow_list.require_allowed_user(user_id)

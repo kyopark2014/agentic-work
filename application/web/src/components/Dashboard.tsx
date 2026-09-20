@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
 import type { DashboardStats } from "../types";
+import { AllowlistPanel } from "./AllowlistPanel";
 
 interface Props {
   onBack: () => void;
+  currentUser: string;
 }
 
 function formatWhen(value?: string | null): string {
@@ -19,7 +21,8 @@ function formatWhen(value?: string | null): string {
   });
 }
 
-export function Dashboard({ onBack }: Props) {
+export function Dashboard({ onBack, currentUser }: Props) {
+  const [mode, setMode] = useState<"stats" | "allowlist">("stats");
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -39,8 +42,10 @@ export function Dashboard({ onBack }: Props) {
   }, []);
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    if (mode === "stats") {
+      void load();
+    }
+  }, [load, mode]);
 
   const summary = stats?.summary;
 
@@ -48,157 +53,189 @@ export function Dashboard({ onBack }: Props) {
     <div className="dashboard">
       <header className="dashboard-header">
         <div>
-          <h1>Dashboard</h1>
-          <p>가입자 현황과 접속 현황</p>
+          <h1>{mode === "allowlist" ? "등록" : "Dashboard"}</h1>
+          <p>
+            {mode === "allowlist"
+              ? "로그인 허용 계정 관리"
+              : "가입자 현황과 접속 현황"}
+          </p>
         </div>
         <div className="dashboard-header-actions">
-          <button type="button" className="sidebar-menu-btn" onClick={() => void load()}>
-            새로고침
+          <button
+            type="button"
+            className={
+              mode === "allowlist"
+                ? "sidebar-menu-btn is-active"
+                : "sidebar-menu-btn"
+            }
+            onClick={() => setMode("allowlist")}
+            aria-pressed={mode === "allowlist"}
+          >
+            등록
           </button>
+          {mode === "stats" ? (
+            <button
+              type="button"
+              className="sidebar-menu-btn"
+              onClick={() => void load()}
+            >
+              새로고침
+            </button>
+          ) : null}
           <button type="button" className="sidebar-menu-btn" onClick={onBack}>
             채팅으로 돌아가기
           </button>
         </div>
       </header>
 
-      {loading && <div className="dashboard-status">불러오는 중…</div>}
-      {error && <div className="dashboard-error">{error}</div>}
-
-      {!loading && !error && summary && (
+      {mode === "allowlist" ? (
+        <AllowlistPanel
+          currentUser={currentUser}
+          onBack={() => setMode("stats")}
+        />
+      ) : (
         <>
-          <section className="dashboard-section">
-            <h2>요약</h2>
-            <div className="dashboard-metrics">
-              <div className="dashboard-metric">
-                <span className="dashboard-metric-label">전체 사용자</span>
-                <strong>{summary.total_users}</strong>
-              </div>
-              <div className="dashboard-metric">
-                <span className="dashboard-metric-label">Google 가입</span>
-                <strong>{summary.google_users}</strong>
-              </div>
-              <div className="dashboard-metric">
-                <span className="dashboard-metric-label">레거시 User ID</span>
-                <strong>{summary.legacy_users}</strong>
-              </div>
-              <div className="dashboard-metric">
-                <span className="dashboard-metric-label">오늘 로그인</span>
-                <strong>{summary.logins_today}</strong>
-              </div>
-              <div className="dashboard-metric">
-                <span className="dashboard-metric-label">오늘 접속자</span>
-                <strong>{summary.active_users_today}</strong>
-              </div>
-              <div className="dashboard-metric">
-                <span className="dashboard-metric-label">7일 로그인</span>
-                <strong>{summary.logins_7d}</strong>
-              </div>
-              <div className="dashboard-metric">
-                <span className="dashboard-metric-label">7일 접속자</span>
-                <strong>{summary.active_users_7d}</strong>
-              </div>
-              <div className="dashboard-metric">
-                <span className="dashboard-metric-label">태스크 / 메시지</span>
-                <strong>
-                  {summary.total_tasks} / {summary.total_messages}
-                </strong>
-              </div>
-            </div>
-          </section>
+          {loading && <div className="dashboard-status">불러오는 중…</div>}
+          {error && <div className="dashboard-error">{error}</div>}
 
-          <section className="dashboard-section">
-            <h2>일별 접속 (최근 14일)</h2>
-            {stats.daily_logins.length === 0 ? (
-              <p className="dashboard-empty">아직 기록된 로그인이 없습니다.</p>
-            ) : (
-              <div className="dashboard-table-wrap">
-                <table className="dashboard-table">
-                  <thead>
-                    <tr>
-                      <th>날짜</th>
-                      <th>로그인 수</th>
-                      <th>고유 사용자</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {[...stats.daily_logins].reverse().map((row) => (
-                      <tr key={row.date}>
-                        <td>{row.date}</td>
-                        <td>{row.logins}</td>
-                        <td>{row.unique_users}</td>
+          {!loading && !error && summary && (
+            <>
+              <section className="dashboard-section">
+                <h2>요약</h2>
+                <div className="dashboard-metrics">
+                  <div className="dashboard-metric">
+                    <span className="dashboard-metric-label">전체 사용자</span>
+                    <strong>{summary.total_users}</strong>
+                  </div>
+                  <div className="dashboard-metric">
+                    <span className="dashboard-metric-label">Google 가입</span>
+                    <strong>{summary.google_users}</strong>
+                  </div>
+                  <div className="dashboard-metric">
+                    <span className="dashboard-metric-label">레거시 User ID</span>
+                    <strong>{summary.legacy_users}</strong>
+                  </div>
+                  <div className="dashboard-metric">
+                    <span className="dashboard-metric-label">오늘 로그인</span>
+                    <strong>{summary.logins_today}</strong>
+                  </div>
+                  <div className="dashboard-metric">
+                    <span className="dashboard-metric-label">오늘 접속자</span>
+                    <strong>{summary.active_users_today}</strong>
+                  </div>
+                  <div className="dashboard-metric">
+                    <span className="dashboard-metric-label">7일 로그인</span>
+                    <strong>{summary.logins_7d}</strong>
+                  </div>
+                  <div className="dashboard-metric">
+                    <span className="dashboard-metric-label">7일 접속자</span>
+                    <strong>{summary.active_users_7d}</strong>
+                  </div>
+                  <div className="dashboard-metric">
+                    <span className="dashboard-metric-label">태스크 / 메시지</span>
+                    <strong>
+                      {summary.total_tasks} / {summary.total_messages}
+                    </strong>
+                  </div>
+                </div>
+              </section>
+
+              <section className="dashboard-section">
+                <h2>일별 접속 (최근 14일)</h2>
+                {stats.daily_logins.length === 0 ? (
+                  <p className="dashboard-empty">아직 기록된 로그인이 없습니다.</p>
+                ) : (
+                  <div className="dashboard-table-wrap">
+                    <table className="dashboard-table">
+                      <thead>
+                        <tr>
+                          <th>날짜</th>
+                          <th>로그인 수</th>
+                          <th>고유 사용자</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {[...stats.daily_logins].reverse().map((row) => (
+                          <tr key={row.date}>
+                            <td>{row.date}</td>
+                            <td>{row.logins}</td>
+                            <td>{row.unique_users}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </section>
+
+              <section className="dashboard-section">
+                <h2>가입자 현황</h2>
+                <div className="dashboard-table-wrap">
+                  <table className="dashboard-table">
+                    <thead>
+                      <tr>
+                        <th>사용자</th>
+                        <th>인증</th>
+                        <th>태스크</th>
+                        <th>메시지</th>
+                        <th>로그인</th>
+                        <th>최초 활동</th>
+                        <th>최근 활동</th>
+                        <th>최근 로그인</th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </section>
+                    </thead>
+                    <tbody>
+                      {stats.users.map((user) => (
+                        <tr key={user.user_id}>
+                          <td className="dashboard-user-cell">{user.user_id}</td>
+                          <td>{user.is_google ? "Google" : "Legacy"}</td>
+                          <td>{user.task_count}</td>
+                          <td>{user.message_count}</td>
+                          <td>{user.login_count}</td>
+                          <td>{formatWhen(user.first_seen)}</td>
+                          <td>{formatWhen(user.last_active)}</td>
+                          <td>{formatWhen(user.last_login)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
 
-          <section className="dashboard-section">
-            <h2>가입자 현황</h2>
-            <div className="dashboard-table-wrap">
-              <table className="dashboard-table">
-                <thead>
-                  <tr>
-                    <th>사용자</th>
-                    <th>인증</th>
-                    <th>태스크</th>
-                    <th>메시지</th>
-                    <th>로그인</th>
-                    <th>최초 활동</th>
-                    <th>최근 활동</th>
-                    <th>최근 로그인</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {stats.users.map((user) => (
-                    <tr key={user.user_id}>
-                      <td className="dashboard-user-cell">{user.user_id}</td>
-                      <td>{user.is_google ? "Google" : "Legacy"}</td>
-                      <td>{user.task_count}</td>
-                      <td>{user.message_count}</td>
-                      <td>{user.login_count}</td>
-                      <td>{formatWhen(user.first_seen)}</td>
-                      <td>{formatWhen(user.last_active)}</td>
-                      <td>{formatWhen(user.last_login)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </section>
-
-          <section className="dashboard-section">
-            <h2>최근 접속</h2>
-            {stats.recent_logins.length === 0 ? (
-              <p className="dashboard-empty">
-                로그인 이벤트는 Google(또는 로컬 우회) 로그인 시점부터 기록됩니다.
-              </p>
-            ) : (
-              <div className="dashboard-table-wrap">
-                <table className="dashboard-table">
-                  <thead>
-                    <tr>
-                      <th>시각</th>
-                      <th>사용자</th>
-                      <th>이름</th>
-                      <th>방식</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {stats.recent_logins.map((login) => (
-                      <tr key={login.id}>
-                        <td>{formatWhen(login.logged_at)}</td>
-                        <td className="dashboard-user-cell">{login.user_id}</td>
-                        <td>{login.name || "—"}</td>
-                        <td>{login.method}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </section>
+              <section className="dashboard-section">
+                <h2>최근 접속</h2>
+                {stats.recent_logins.length === 0 ? (
+                  <p className="dashboard-empty">
+                    로그인 이벤트는 Google(또는 로컬 우회) 로그인 시점부터
+                    기록됩니다.
+                  </p>
+                ) : (
+                  <div className="dashboard-table-wrap">
+                    <table className="dashboard-table">
+                      <thead>
+                        <tr>
+                          <th>시각</th>
+                          <th>사용자</th>
+                          <th>이름</th>
+                          <th>방식</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {stats.recent_logins.map((login) => (
+                          <tr key={login.id}>
+                            <td>{formatWhen(login.logged_at)}</td>
+                            <td className="dashboard-user-cell">{login.user_id}</td>
+                            <td>{login.name || "—"}</td>
+                            <td>{login.method}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </section>
+            </>
+          )}
         </>
       )}
     </div>

@@ -361,6 +361,18 @@ export const api = {
   },
   getConfig: () => request<AppConfig>("/api/config"),
   getAdminDashboard: () => request<DashboardStats>("/api/admin/dashboard"),
+  getAllowlist: () =>
+    request<{ ids: string[]; admin_ids: string[] }>("/api/allowlist"),
+  addAllowlistId: (id: string) =>
+    request<{ ids: string[]; admin_ids: string[] }>("/api/allowlist", {
+      method: "POST",
+      body: JSON.stringify({ id }),
+    }),
+  removeAllowlistId: (id: string) =>
+    request<{ ids: string[]; admin_ids: string[] }>("/api/allowlist", {
+      method: "DELETE",
+      body: JSON.stringify({ id }),
+    }),
   getLlmGateway: () =>
     request<LlmGatewayConfig>("/api/config/llm-gateway"),
   verifyLlmGateway: (body: { url: string; key?: string }) =>

@@ -1990,6 +1990,11 @@ a.chat-attachment-open:focus-visible {
   flex-shrink: 0;
 }
 
+.dashboard-header-actions .sidebar-menu-btn {
+  width: auto;
+  white-space: nowrap;
+}
+
 .dashboard-status,
 .dashboard-empty {
   color: var(--text-secondary);
@@ -2011,6 +2016,133 @@ a.chat-attachment-open:focus-visible {
   font-size: 15px;
   color: var(--text-secondary);
   font-weight: 600;
+}
+
+.dashboard-section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.dashboard-section-head h2 {
+  margin-bottom: 4px;
+}
+
+.dashboard-section-sub {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.allowlist-head-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.allowlist-add {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.allowlist-add input {
+  border: 1px solid var(--border);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 14px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  outline: none;
+}
+
+.allowlist-add input:focus {
+  border-color: var(--accent, #3b82f6);
+}
+
+.allowlist-add button {
+  border: 0;
+  background: var(--accent, #3b82f6);
+  color: #fff;
+  font: inherit;
+  font-weight: 600;
+  padding: 10px 16px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.allowlist-add button:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.allowlist-error {
+  margin: 0 0 12px;
+  color: #f87171;
+  font-size: 13px;
+}
+
+.allowlist-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-secondary);
+  overflow: hidden;
+}
+
+.allowlist-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.allowlist-row:last-child {
+  border-bottom: 0;
+}
+
+.allowlist-id {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: normal;
+  font-size: 14px;
+}
+
+.allowlist-you {
+  flex-shrink: 0;
+  font-style: normal;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  background: var(--bg-primary, rgba(255, 255, 255, 0.08));
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.allowlist-remove,
+.allowlist-row .sidebar-menu-btn {
+  width: auto;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.allowlist-remove:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 .dashboard-metrics {

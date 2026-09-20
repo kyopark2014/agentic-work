@@ -48,6 +48,7 @@ export const appDataService = {
     try {
       return await api.setSession(credential);
     } catch (error) {
+      if (error instanceof Error && error.message) throw error;
       throw sanitizeError(error, "Google login failed.");
     }
   },
@@ -56,6 +57,7 @@ export const appDataService = {
     try {
       return await api.setSessionWithAccessToken(accessToken);
     } catch (error) {
+      if (error instanceof Error && error.message) throw error;
       throw sanitizeError(error, "Google login failed.");
     }
   },
@@ -64,6 +66,7 @@ export const appDataService = {
     try {
       return await api.setLocalSession(userId);
     } catch (error) {
+      if (error instanceof Error && error.message) throw error;
       throw sanitizeError(error, "Login failed.");
     }
   },

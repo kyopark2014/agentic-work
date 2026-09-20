@@ -507,8 +507,9 @@ def _project_secret_resource_arns(config) -> list:
     account/region shared secrets ``tavilyapikey`` / ``notionapikey`` (not
     ``tavilyapikey-{project}``). LiteLLM master / signing keys are never granted.
 
-    ``{project}/vault-agent-token`` is allowed so my-vaults can call ob-docs
-    without reading session-signing-key (still denied below).
+    ``{project}/vault-agent-token`` and ``ob-docs/vault-agent-token`` are
+    allowed so my-vaults can call standalone ob-docs without reading
+    session-signing-key (still denied below).
 
     ``{project}/schedule-agent-token`` is allowed so my-schedule can call the
     ECS schedule API without reading session-signing-key.
@@ -522,6 +523,10 @@ def _project_secret_resource_arns(config) -> list:
         (
             f"arn:aws:secretsmanager:{region}:{account_id}:"
             f"secret:{project_name}/vault-agent-token*"
+        ),
+        (
+            f"arn:aws:secretsmanager:{region}:{account_id}:"
+            f"secret:ob-docs/vault-agent-token*"
         ),
         (
             f"arn:aws:secretsmanager:{region}:{account_id}:"

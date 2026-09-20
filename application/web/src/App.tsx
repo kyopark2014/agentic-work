@@ -830,7 +830,7 @@ export default function App() {
       />
       <div className="main-panel">
         {view === "dashboard" ? (
-          <Dashboard onBack={() => setView("chat")} />
+          <Dashboard onBack={() => setView("chat")} currentUser={userId} />
         ) : (
           <ChatThread
             messages={messages}

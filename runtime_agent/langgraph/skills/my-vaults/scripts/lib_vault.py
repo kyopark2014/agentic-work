@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """HTTP client helpers for ob-docs vault API.
 
+ob-docs is a standalone site (default ``https://vault.my-agentic-ai.click``).
+APIs live at ``/api/...`` (not the legacy ``/vault/api/...`` prefix).
+
 Auth order (production AgentCore cannot read session-signing-key):
   1. VAULT_AGENT_TOKEN / Secrets Manager ``{project}/vault-agent-token``
+     or ``ob-docs/vault-agent-token``
      → ``Authorization: VaultAgent v1.<payload>.<sig>``
   2. SESSION_SIGNING_KEY (local / app ECS) → Bearer session cookie token
   3. Loopback + no key → unauthenticated (ob-docs ALLOW_LOCAL_AUTH_BYPASS)
@@ -95,7 +99,11 @@ def _region(cfg: Optional[dict[str, Any]] = None) -> str:
     )
 
 
+DEFAULT_OB_DOCS_URL = "https://vault.my-agentic-ai.click"
+
+
 def vault_base_url() -> str:
+    """ob-docs public base URL (site root — not agentic-work CloudFront)."""
     explicit = (
         (os.environ.get("OB_DOCS_URL") or "").strip()
         or (os.environ.get("VAULT_API_URL") or "").strip()
@@ -104,14 +112,14 @@ def vault_base_url() -> str:
         return explicit.rstrip("/")
 
     cfg = load_agentic_config()
-    sharing = (
-        (cfg.get("sharing_url") or cfg.get("agentic_work_url") or "").strip()
-        or (os.environ.get("SHARING_URL") or "").strip()
+    dedicated = (
+        (cfg.get("ob_docs_url") or cfg.get("vault_url") or "").strip()
     )
-    if sharing:
-        return sharing.rstrip("/")
+    if dedicated:
+        return dedicated.rstrip("/")
 
-    return "http://127.0.0.1:8502"
+    # Do not fall back to agentic-work sharing_url (cowork…): that is not ob-docs.
+    return DEFAULT_OB_DOCS_URL
 
 
 def resolve_user_id(cli_user_id: Optional[str] = None) -> str:
@@ -120,6 +128,7 @@ def resolve_user_id(cli_user_id: Optional[str] = None) -> str:
         os.environ.get("USER_ID"),
         os.environ.get("CURRENT_USER_ID"),
         os.environ.get("AGENT_USER_ID"),
+        os.environ.get("ACTOR_ID"),
     ):
         value = (candidate or "").strip()
         if value:
@@ -156,17 +165,35 @@ def _get_secret_string(secret_id: str) -> tuple[Optional[str], Optional[str]]:
 
 
 def _vault_agent_token() -> tuple[Optional[bytes], list[str]]:
+    """Load HMAC key shared with ob-docs VaultAgent auth.
+
+    Tries (in order):
+      1. VAULT_AGENT_TOKEN env
+      2. ``{agentic-work}/vault-agent-token`` (Runtime IAM already allows)
+      3. ``ob-docs/vault-agent-token`` (same value should be provisioned)
+    """
     errors: list[str] = []
     env = (os.environ.get("VAULT_AGENT_TOKEN") or "").strip()
     if env:
         return env.encode("utf-8"), errors
 
-    secret_id = f"{_project_name()}/vault-agent-token"
-    value, err = _get_secret_string(secret_id)
-    if value:
-        return value.encode("utf-8"), errors
-    if err:
-        errors.append(err)
+    secret_ids: list[str] = []
+    override = (os.environ.get("OB_DOCS_VAULT_AGENT_SECRET") or "").strip()
+    if override:
+        secret_ids.append(override)
+    secret_ids.append(f"{_project_name()}/vault-agent-token")
+    secret_ids.append("ob-docs/vault-agent-token")
+
+    seen: set[str] = set()
+    for secret_id in secret_ids:
+        if secret_id in seen:
+            continue
+        seen.add(secret_id)
+        value, err = _get_secret_string(secret_id)
+        if value:
+            return value.encode("utf-8"), errors
+        if err:
+            errors.append(err)
     return None, errors
 
 
@@ -247,9 +274,9 @@ def _auth_headers(user_id: str, *, require_auth: bool = True) -> dict[str, str]:
     detail = "; ".join(errors) if errors else "no credentials resolved"
     raise RuntimeError(
         "Vault auth unavailable. Need VAULT_AGENT_TOKEN "
-        f"(Secrets Manager `{_project_name()}/vault-agent-token`) "
-        "for AgentCore, or SESSION_SIGNING_KEY for local/app. "
-        f"Details: {detail}"
+        f"(Secrets Manager `{_project_name()}/vault-agent-token` or "
+        "`ob-docs/vault-agent-token`) for AgentCore, or SESSION_SIGNING_KEY "
+        f"for local/app. Details: {detail}"
     )
 
 
@@ -271,7 +298,7 @@ def api_request(
             url = f"{url}?{urllib.parse.urlencode(filtered)}"
 
     # health is public
-    require_auth = path.rstrip("/") != "/vault/api/health"
+    require_auth = path.rstrip("/") != "/api/health"
     data = None
     headers = _auth_headers(uid, require_auth=require_auth)
     if body is not None:

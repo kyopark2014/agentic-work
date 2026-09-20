@@ -15,6 +15,7 @@ from application.api.routes_files import router as files_router
 from application.api.routes_artifacts import router as artifacts_router
 from application.api.routes_rag import router as rag_router
 from application.api.routes_admin import router as admin_router
+from application.api.routes_allowlist import router as allowlist_router
 from application.api.routes_graph import router as graph_router
 from application.api.routes_wiki import router as wiki_router
 from application.api.routes_schedules import router as schedules_router
@@ -109,6 +110,7 @@ app.include_router(files_router)
 app.include_router(artifacts_router)
 app.include_router(rag_router)
 app.include_router(admin_router)
+app.include_router(allowlist_router)
 app.include_router(graph_router)
 app.include_router(wiki_router)
 app.include_router(schedules_router)
