@@ -835,7 +835,7 @@ def ensure_alb_listener_origin_protection(
             if rule.get("Priority") == "default":
                 continue
             conditions = rule.get("Conditions") or []
-            # Never rewrite path-scoped rules (e.g. ob-docs /vault* → TG-for-ob-docs).
+            # Never rewrite path-scoped rules (e.g. ob-note /vault* → TG-for-ob-docs).
             if any(c.get("Field") == "path-pattern" for c in conditions):
                 continue
             for condition in conditions:
@@ -1386,8 +1386,18 @@ def _ecs_agent_runtime_resource_arns() -> List[str]:
                 seen.add(vault_endpoint)
                 arns.append(vault_endpoint)
 
-    # Always allow ob-docs use-vault MCP Runtime by name pattern.
+    # Always allow ob-note (and legacy ob-docs) use-vault MCP Runtime by name pattern.
     for pattern_arn in (
+        f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/use_vault_of_ob_note",
+        f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/use_vault_of_ob_note-*",
+        (
+            f"arn:aws:bedrock-agentcore:{region}:{account_id}:"
+            f"runtime/use_vault_of_ob_note/runtime-endpoint/*"
+        ),
+        (
+            f"arn:aws:bedrock-agentcore:{region}:{account_id}:"
+            f"runtime/use_vault_of_ob_note-*/runtime-endpoint/*"
+        ),
         f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/use_vault_of_ob_docs",
         f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/use_vault_of_ob_docs-*",
         (

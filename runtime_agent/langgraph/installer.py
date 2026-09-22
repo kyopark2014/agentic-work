@@ -350,7 +350,7 @@ def _project_agent_runtime_resource_arns(config) -> list:
 
     Use name + wildcard only (exact runtime id is covered by ``{name}-*``) to
     stay under the managed-policy 6144-byte PolicySize quota.
-    Also includes ob-docs use-vault MCP Runtime when configured.
+    Also includes ob-note use-vault MCP Runtime when configured.
     """
     region = config["region"]
     account_id = config["accountId"]
@@ -369,23 +369,23 @@ def _project_agent_runtime_resource_arns(config) -> list:
         ),
     ]
 
-    # Remote use-vault MCP (ob-docs AgentCore Runtime)
+    # Remote use-vault MCP (ob-note AgentCore Runtime; legacy ob-docs also allowed)
     vault_arn = (config.get("use_vault_mcp_runtime_arn") or "").strip()
-    vault_name = "use_vault_of_ob_docs"
-    arns.extend(
-        [
-            f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/{vault_name}",
-            f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/{vault_name}-*",
-            (
-                f"arn:aws:bedrock-agentcore:{region}:{account_id}:"
-                f"runtime/{vault_name}/runtime-endpoint/*"
-            ),
-            (
-                f"arn:aws:bedrock-agentcore:{region}:{account_id}:"
-                f"runtime/{vault_name}-*/runtime-endpoint/*"
-            ),
-        ]
-    )
+    for vault_name in ("use_vault_of_ob_note", "use_vault_of_ob_docs"):
+        arns.extend(
+            [
+                f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/{vault_name}",
+                f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/{vault_name}-*",
+                (
+                    f"arn:aws:bedrock-agentcore:{region}:{account_id}:"
+                    f"runtime/{vault_name}/runtime-endpoint/*"
+                ),
+                (
+                    f"arn:aws:bedrock-agentcore:{region}:{account_id}:"
+                    f"runtime/{vault_name}-*/runtime-endpoint/*"
+                ),
+            ]
+        )
     if vault_arn and vault_arn not in arns:
         arns.append(vault_arn)
         endpoint = f"{vault_arn}/runtime-endpoint/*"
@@ -536,8 +536,9 @@ def _project_secret_resource_arns(config) -> list:
     account/region shared secrets ``tavilyapikey`` / ``notionapikey`` (not
     ``tavilyapikey-{project}``). LiteLLM master / signing keys are never granted.
 
-    ``{project}/vault-agent-token`` and ``ob-docs/vault-agent-token`` are
-    allowed so my-vaults can call standalone ob-docs without reading
+    ``{project}/vault-agent-token``, ``ob-note/vault-agent-token``, and legacy
+    ``ob-docs/vault-agent-token`` are allowed so my-vaults can call standalone
+    ob-note without reading
     session-signing-key (still denied below).
 
     ``{project}/schedule-agent-token`` is allowed so my-schedule can call the
@@ -552,6 +553,10 @@ def _project_secret_resource_arns(config) -> list:
         (
             f"arn:aws:secretsmanager:{region}:{account_id}:"
             f"secret:{project_name}/vault-agent-token*"
+        ),
+        (
+            f"arn:aws:secretsmanager:{region}:{account_id}:"
+            f"secret:ob-note/vault-agent-token*"
         ),
         (
             f"arn:aws:secretsmanager:{region}:{account_id}:"

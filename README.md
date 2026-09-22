@@ -2164,7 +2164,7 @@ ECS [`scheduled_job_service`](./application/services/scheduled_job_service.py)�
 
 #### Settings UI — Schedule List
 
-Sidebar **Settings → Schedule List** ([`ScheduleListModal.tsx`](./application/web/src/components/ScheduleListModal.tsx), ob-docs Shared List와 동일 패턴):
+Sidebar **Settings → Schedule List** ([`ScheduleListModal.tsx`](./application/web/src/components/ScheduleListModal.tsx), ob-note Shared List와 동일 패턴):
 
 - 목록: title, cron/timezone, 활성 여부, 대화방 제목, 최근 실행
 - **열기**: 예약을 등록한 `task_id` 대화방으로 전환
