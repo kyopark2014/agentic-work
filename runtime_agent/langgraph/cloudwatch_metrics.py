@@ -95,6 +95,12 @@ MODEL_PRICING_PER_MILLION: dict[str, dict[str, float]] = {
     "openai.gpt-5.6-luna": {"input": 1.0, "output": 6.0},
     "openai.gpt-6-astra": {"input": 10.0, "output": 50.0},
     "us.openai.gpt-6-astra": {"input": 10.0, "output": 50.0},
+    "openai.gpt-6-sol": {"input": 2.5, "output": 15.0},
+    "us.openai.gpt-6-sol": {"input": 2.5, "output": 15.0},
+    "openai.gpt-6-luna": {"input": 0.5, "output": 3.0},
+    "us.openai.gpt-6-luna": {"input": 0.5, "output": 3.0},
+    "us.anthropic.claude-opus-5": {"input": 5.0, "output": 25.0},
+    "us.anthropic.claude-opus-5-5": {"input": 4.4, "output": 22.0},
     "openai.gpt-oss-120b-1:0": {"input": 0.30, "output": 0.60},
     "openai.gpt-oss-20b-1:0": {"input": 0.10, "output": 0.30},
 }
