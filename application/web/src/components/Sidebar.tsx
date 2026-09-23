@@ -10,6 +10,8 @@ import { LlmGatewayModal } from "./LlmGatewayModal";
 import { ScheduleListModal } from "./ScheduleListModal";
 import { WikiConfigureModal } from "./WikiConfigureModal";
 import { WikiGraphModal } from "./WikiGraphModal";
+import { DocumentsConfigureModal } from "./DocumentsConfigureModal";
+import { DocumentsListModal } from "./DocumentsListModal";
 import { SyncProgressModal } from "./SyncProgressModal";
 import { TaskListItem } from "./TaskListItem";
 import {
@@ -28,16 +30,18 @@ import {
   SettingsIcon,
   SkillIcon,
   WikiIcon,
+  DocumentsIcon,
   CloseIcon,
 } from "./SidebarIcons";
 
-type DrawerKind = "skill" | "mcp" | "model" | "appearance" | "wiki" | "knowledge" | null;
+type DrawerKind = "skill" | "mcp" | "model" | "appearance" | "wiki" | "knowledge" | "documents" | null;
 
 const LLM_GATEWAY_NOT_CONFIGURED =
   "LLM Gateway가 설정되어 있지 않아 활성화할 수 없습니다. 관리자에게 설정을 요청하세요.";
 
 const THEME_OPTIONS = ["Light", "Dark"] as const;
 const WIKI_OPTIONS = ["Sync", "Rebuild", "Graph", "Configure"] as const;
+const DOCUMENTS_OPTIONS = ["Projects", "Drawings", "Configure"] as const;
 const KNOWLEDGE_ACTIONS = ["Sync", "Rebuild", "Graph"] as const;
 
 function themeToLabel(theme: Theme): string {
@@ -100,6 +104,7 @@ export function Sidebar({
   const modelBtnRef = useRef<HTMLButtonElement>(null);
   const appearanceBtnRef = useRef<HTMLButtonElement>(null);
   const wikiBtnRef = useRef<HTMLButtonElement>(null);
+  const documentsBtnRef = useRef<HTMLButtonElement>(null);
   const knowledgeBtnRef = useRef<HTMLButtonElement>(null);
   const settingsSectionRef = useRef<HTMLDivElement>(null);
   const [llmGatewayOpen, setLlmGatewayOpen] = useState(false);
@@ -121,6 +126,21 @@ export function Sidebar({
   } | null>(null);
   const [wikiSyncPopupOpen, setWikiSyncPopupOpen] = useState(false);
   const [wikiSyncTitle, setWikiSyncTitle] = useState("Wiki Sync");
+  const [documentsConfigureOpen, setDocumentsConfigureOpen] = useState(false);
+  const [documentsListOpen, setDocumentsListOpen] = useState(false);
+  const [documentsListKind, setDocumentsListKind] = useState<"project" | "drawing">("project");
+  const [documentsSyncBusy, setDocumentsSyncBusy] = useState(false);
+  const [documentsSyncMessage, setDocumentsSyncMessage] = useState<string | null>(null);
+  const [documentsSyncProgress, setDocumentsSyncProgress] = useState<{
+    file?: string | null;
+    file_i?: number | null;
+    file_n?: number | null;
+    page?: number | null;
+    page_n?: number | null;
+    pct?: number | null;
+    aggregated?: boolean | null;
+  } | null>(null);
+  const [documentsSyncPopupOpen, setDocumentsSyncPopupOpen] = useState(false);
   const [knowledgeSyncBusy, setKnowledgeSyncBusy] = useState(false);
   const [knowledgeSyncMessage, setKnowledgeSyncMessage] = useState<string | null>(null);
   const [knowledgeSyncPopupOpen, setKnowledgeSyncPopupOpen] = useState(false);
@@ -168,7 +188,7 @@ export function Sidebar({
       if (!(target instanceof Element)) return;
       if (settingsSectionRef.current?.contains(target)) return;
       if (target.closest(".config-popover")) return;
-      if (target.closest(".modal-overlay, .llm-gateway-modal, .knowledge-graph-modal, .wiki-configure-modal, .sync-progress-modal")) return;
+      if (target.closest(".modal-overlay, .llm-gateway-modal, .knowledge-graph-modal, .wiki-configure-modal, .documents-configure-modal, .documents-doc-list-modal, .sync-progress-modal")) return;
       collapseSettings();
     }
 
@@ -225,6 +245,56 @@ export function Sidebar({
       setWikiSyncBusy(false);
       setWikiSyncMessage(
         err instanceof Error ? err.message : `Wiki ${label}에 실패했습니다.`,
+      );
+    } finally {
+      handleSettingApplied();
+    }
+  }
+
+
+  async function handleDocumentsAction(choice: string) {
+    if (choice === "Configure") {
+      setDocumentsConfigureOpen(true);
+      handleSettingApplied();
+      return;
+    }
+    if (choice === "Projects") {
+      setDocumentsListKind("project");
+      setDocumentsListOpen(true);
+      handleSettingApplied();
+      return;
+    }
+    if (choice === "Drawings") {
+      setDocumentsListKind("drawing");
+      setDocumentsListOpen(true);
+      handleSettingApplied();
+      return;
+    }
+    if (choice !== "Sync") return;
+    setDocumentsSyncPopupOpen(true);
+    setDocumentsSyncBusy(true);
+    setDocumentsSyncMessage("Documents 동기화를 시작합니다…");
+    try {
+      const result = await api.syncDocuments(false, modelName || undefined);
+      const status = result.status;
+      if (status === "error") {
+        setDocumentsSyncBusy(false);
+        setDocumentsSyncMessage(result.error || "Documents 동기화에 실패했습니다.");
+      } else if (status === "unchanged") {
+        setDocumentsSyncBusy(false);
+        setDocumentsSyncMessage(
+          result.message || "No files changed since last run. Nothing to update.",
+        );
+      } else {
+        setDocumentsSyncBusy(true);
+        setDocumentsSyncMessage(
+          result.message || "Documents 동기화를 백그라운드에서 실행 중입니다.",
+        );
+      }
+    } catch (err) {
+      setDocumentsSyncBusy(false);
+      setDocumentsSyncMessage(
+        err instanceof Error ? err.message : "Documents 동기화에 실패했습니다.",
       );
     } finally {
       handleSettingApplied();
@@ -346,6 +416,51 @@ export function Sidebar({
       if (timer) clearTimeout(timer);
     };
   }, [wikiSyncBusy]);
+
+  useEffect(() => {
+    if (!documentsSyncBusy && !documentsSyncPopupOpen) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    async function pollDocumentsSync() {
+      try {
+        const next = await api.getDocumentsStatus();
+        if (cancelled) return;
+        const busy = next.status === "queued" || next.status === "running";
+        setDocumentsSyncBusy(busy);
+        if (next.progress) {
+          setDocumentsSyncProgress(next.progress);
+        }
+        if (busy) {
+          setDocumentsSyncMessage(
+            next.message || "Documents 동기화를 백그라운드에서 실행 중입니다.",
+          );
+          timer = setTimeout(pollDocumentsSync, 1500);
+          return;
+        }
+        if (next.status === "ready") {
+          setDocumentsSyncMessage(next.message || "Documents 동기화가 완료되었습니다.");
+        } else if (next.status === "unchanged") {
+          setDocumentsSyncMessage(
+            next.message || "변경된 파일이 없습니다.",
+          );
+        } else if (next.status === "error") {
+          setDocumentsSyncMessage(next.error || "Documents 동기화에 실패했습니다.");
+        }
+      } catch {
+        if (cancelled) return;
+        if (documentsSyncBusy) {
+          timer = setTimeout(pollDocumentsSync, 4000);
+        }
+      }
+    }
+
+    void pollDocumentsSync();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [documentsSyncBusy, documentsSyncPopupOpen]);
 
   useEffect(() => {
     let cancelled = false;
@@ -588,6 +703,18 @@ export function Sidebar({
                 <span>{wikiSyncBusy ? "Wiki (Syncing…)" : "Wiki"}</span>
               </button>
               <button
+                ref={documentsBtnRef}
+                type="button"
+                className={`sidebar-menu-btn${drawer === "documents" || documentsSyncBusy ? " is-active" : ""}`}
+                aria-expanded={drawer === "documents"}
+                aria-haspopup="dialog"
+                title={documentsSyncMessage ?? "Documents"}
+                onClick={() => toggleDrawer("documents")}
+              >
+                <DocumentsIcon className="sidebar-icon" />
+                <span>{documentsSyncBusy ? "Documents (Syncing…)" : "Documents"}</span>
+              </button>
+              <button
                 ref={knowledgeBtnRef}
                 type="button"
                 className={`sidebar-menu-btn${drawer === "knowledge" || knowledgeSyncBusy ? " is-active" : ""}`}
@@ -739,6 +866,19 @@ export function Sidebar({
           onClose={handleDrawerClose}
         />
       )}
+      {drawer === "documents" && (
+        <ConfigDrawer
+          title="Documents"
+          options={[...DOCUMENTS_OPTIONS]}
+          selected={[]}
+          mode="single"
+          anchorEl={documentsBtnRef.current}
+          onChange={(next) => {
+            if (next[0]) void handleDocumentsAction(next[0]);
+          }}
+          onClose={handleDrawerClose}
+        />
+      )}
       {drawer === "knowledge" && (
         <ConfigDrawer
           title="Knowledge"
@@ -826,6 +966,30 @@ export function Sidebar({
 
       {wikiConfigureOpen && (
         <WikiConfigureModal onClose={() => setWikiConfigureOpen(false)} />
+      )}
+
+      {documentsConfigureOpen && (
+        <DocumentsConfigureModal
+          onClose={() => setDocumentsConfigureOpen(false)}
+          onFileUploaded={() => {
+            void handleDocumentsAction("Sync");
+          }}
+        />
+      )}
+      {documentsListOpen && (
+        <DocumentsListModal
+          kind={documentsListKind}
+          onClose={() => setDocumentsListOpen(false)}
+        />
+      )}
+      {documentsSyncPopupOpen && (
+        <SyncProgressModal
+          title="Documents Sync"
+          busy={documentsSyncBusy}
+          message={documentsSyncMessage}
+          progress={documentsSyncProgress}
+          onClose={() => setDocumentsSyncPopupOpen(false)}
+        />
       )}
 
       {wikiSyncPopupOpen && (

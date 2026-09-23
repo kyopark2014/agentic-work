@@ -20,15 +20,18 @@ standalone **ob-note** (`https://vault.my-agentic-ai.click`) vault를 API로 읽
 
 ## Script Location
 
-application working directory 기준 전체 경로를 사용하세요.
+이 `SKILL.md`가 있는 디렉터리 기준으로 스크립트를 실행하세요.
+Cursor 개인 스킬(`~/.cursor/skills/my-vaults`)이거나 agentic-work 런타임 모두 동일합니다.
 
 | 스크립트 | 용도 |
 | --- | --- |
-| `skills/my-vaults/scripts/read_vault.py` | 조회 (health / tree / list / read / search / graph / backlinks) |
-| `skills/my-vaults/scripts/write_vault.py` | 쓰기 (write / append / mkdir / rename / delete / rebuild) |
-| `skills/my-vaults/scripts/lib_vault.py` | HTTP·인증 헬퍼 (직접 실행하지 않음) |
+| `scripts/read_vault.py` | 조회 (health / tree / list / read / search / graph / backlinks) |
+| `scripts/write_vault.py` | 쓰기 (write / append / mkdir / rename / delete / rebuild) |
+| `scripts/lib_vault.py` | HTTP·인증 헬퍼 (직접 실행하지 않음) |
 
-**IMPORTANT**: `scripts/...`로 줄이지 말고 위 전체 경로를 사용하세요.
+**IMPORTANT**: 상대경로만 쓰지 말고, 스킬 디렉터리의 **절대경로**로 실행하세요.
+예: `python3 /Users/ksdyb/.cursor/skills/my-vaults/scripts/read_vault.py tree`
+agentic-work application CWD에서는 `skills/my-vaults/scripts/...`도 동일합니다.
 
 ## Critical Rules
 

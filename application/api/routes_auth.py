@@ -324,6 +324,7 @@ def set_session(body: SessionRequest, request: Request, response: Response) -> S
         try:
             utils.ensure_user_graph_dir(user_id)
             utils.ensure_user_wiki_dir(user_id)
+            utils.ensure_user_documents_dir(user_id)
         except Exception:
             logger.exception("Failed to ensure graph dir for %s", user_id)
         _kick_graph_job(user_id)
@@ -363,6 +364,7 @@ def set_session(body: SessionRequest, request: Request, response: Response) -> S
         try:
             utils.ensure_user_graph_dir(user_id)
             utils.ensure_user_wiki_dir(user_id)
+            utils.ensure_user_documents_dir(user_id)
         except Exception:
             logger.exception("Failed to ensure graph dir for %s", user_id)
         _kick_graph_job(user_id)
@@ -412,6 +414,7 @@ def get_session(request: Request, response: Response) -> SessionResponse | None:
     try:
         utils.ensure_user_graph_dir(user_id)
         utils.ensure_user_wiki_dir(user_id)
+        utils.ensure_user_documents_dir(user_id)
     except Exception:
         logger.exception("Failed to ensure graph dir for %s", user_id)
     # Session restore (e.g. after server restart): start extract when fingerprint

@@ -267,6 +267,27 @@ export function useFileUpload({
     setLoadedFiles((prev) => prev.filter((item) => item.path !== path));
   }, []);
 
+  const attachExistingFile = useCallback(
+    (file: LoadedFile) => {
+      if (disabled) return;
+      const path = (file.path || "").trim();
+      const name = (file.name || "").trim();
+      if (!path || !name) return;
+      setLoadedFiles((prev) => {
+        const next = prev.filter((item) => item.path !== path);
+        return [
+          ...next,
+          {
+            path,
+            name,
+            size: Number.isFinite(file.size) && file.size > 0 ? file.size : 0,
+          },
+        ];
+      });
+    },
+    [disabled],
+  );
+
   const clearAttachments = useCallback(() => {
     setAttachments((prev) => {
       for (const item of prev) {
@@ -336,6 +357,7 @@ export function useFileUpload({
     loadWorkspaceFiles,
     uploadRagFiles,
     uploadWikiFiles,
+    attachExistingFile,
     removeAttachment,
     removeLoadedFile,
     clearAttachments,

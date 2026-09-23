@@ -34,7 +34,7 @@ import {
   setSidebarWidth as persistSidebarWidth,
 } from "./sidebarSettings";
 
-type DrawerKind = "skill" | "mcp" | "model" | "appearance" | "wiki" | "knowledge" | null;
+type DrawerKind = "skill" | "mcp" | "model" | "appearance" | "wiki" | "knowledge" | "documents" | null;
 
 type QueuedMessage = {
   id: string;

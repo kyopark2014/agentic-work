@@ -18,6 +18,7 @@ from application.api.routes_admin import router as admin_router
 from application.api.routes_allowlist import router as allowlist_router
 from application.api.routes_graph import router as graph_router
 from application.api.routes_wiki import router as wiki_router
+from application.api.routes_documents import router as documents_router
 from application.api.routes_schedules import router as schedules_router
 from application.security_headers import SecurityHeadersMiddleware
 from application.task_store import init_db
@@ -113,6 +114,7 @@ app.include_router(admin_router)
 app.include_router(allowlist_router)
 app.include_router(graph_router)
 app.include_router(wiki_router)
+app.include_router(documents_router)
 app.include_router(schedules_router)
 
 

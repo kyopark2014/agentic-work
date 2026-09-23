@@ -13,7 +13,12 @@ import {
   isImageFile,
   collectClipboardImages,
   useFileUpload,
+  type LoadedFile,
 } from "../hooks/useFileUpload";
+import {
+  consumePendingLoadFile,
+  DOCUMENTS_ATTACH_FILE_EVENT,
+} from "../pendingLoadFile";
 
 interface QueuedMessage {
   id: string;
@@ -100,6 +105,7 @@ export function ChatInput({
     loadWorkspaceFiles,
     uploadRagFiles,
     uploadWikiFiles,
+    attachExistingFile,
     removeAttachment,
     removeLoadedFile,
     clearAttachments,
@@ -108,6 +114,19 @@ export function ChatInput({
     onDragLeave,
     onDrop,
   } = useFileUpload({ disabled, syncModel });
+
+  // Documents 「복사」 → attach md chip immediately.
+  useEffect(() => {
+    function onDocumentsAttachFile(e: Event) {
+      const detail = (e as CustomEvent<LoadedFile>).detail;
+      if (!detail?.path) return;
+      attachExistingFile(detail);
+    }
+    window.addEventListener(DOCUMENTS_ATTACH_FILE_EVENT, onDocumentsAttachFile);
+    return () => {
+      window.removeEventListener(DOCUMENTS_ATTACH_FILE_EVENT, onDocumentsAttachFile);
+    };
+  }, [attachExistingFile]);
 
   function adjustInputHeight() {
     const el = textareaRef.current;
@@ -233,6 +252,11 @@ export function ChatInput({
   function openLoadFiles() {
     setMenuOpen(false);
     clearUploadError();
+    const pending = consumePendingLoadFile();
+    if (pending) {
+      attachExistingFile(pending);
+      return;
+    }
     loadInputRef.current?.click();
   }
 
