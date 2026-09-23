@@ -766,6 +766,16 @@ def create_bedrock_agentcore_policy(config):
                 "Resource": "*"
             },
             {
+                # Kimi K3 (and other bedrock-runtime OpenAI-compatible APIs) use
+                # bearer tokens against bedrock-runtime.…/openai/v1 — not Mantle.
+                "Sid": "BedrockRuntimeBearerToken",
+                "Effect": "Allow",
+                "Action": [
+                    "bedrock:CallWithBearerToken"
+                ],
+                "Resource": "*"
+            },
+            {
                 "Sid": "SecretsManagerRead",
                 "Effect": "Allow",
                 "Action": [

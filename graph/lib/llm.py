@@ -44,6 +44,7 @@ _MODEL_ALIASES: dict[str, str] = {
     "OpenAI GPT 5.6 Sol": "gpt-5.6-sol",
     "OpenAI GPT 5.6 Terra": "gpt-5.6-terra",
     "OpenAI GPT 5.6 Luna": "gpt-5.6-luna",
+    "Kimi K3": "kimi-k3",
 }
 
 # Gateway / short ids → Bedrock inference profile ids (langgraph info.py).
@@ -64,6 +65,7 @@ _BEDROCK_MODEL_IDS: dict[str, str] = {
     "gpt-5.6-sol": "us.openai.gpt-5.6-sol",
     "gpt-5.6-terra": "us.openai.gpt-5.6-terra",
     "gpt-5.6-luna": "us.openai.gpt-5.6-luna",
+    "kimi-k3": "us.moonshotai.kimi-k3",
 }
 
 
@@ -91,10 +93,13 @@ def resolve_bedrock_model_id(model: str) -> str:
         raw.startswith("us.")
         or raw.startswith("eu.")
         or raw.startswith("apac.")
+        or raw.startswith("global.")
         or ".anthropic." in raw
         or raw.startswith("anthropic.")
         or raw.startswith("amazon.")
         or raw.startswith("openai.")
+        or raw.startswith("moonshotai.")
+        or ".moonshotai." in raw
     ):
         return raw
     gateway_id = resolve_model_id(raw)
@@ -140,6 +145,8 @@ def _model_family(model: str) -> str:
         return "mistral"
     if "nova" in m or m.startswith("amazon"):
         return "amazon"
+    if "kimi" in m or "moonshot" in m:
+        return "kimi"
     return "other"
 
 

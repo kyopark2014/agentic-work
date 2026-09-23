@@ -636,6 +636,27 @@ def _build_openai_chat(profile: dict, max_output_tokens: int):
     return converse_chat
 
 
+def _build_kimi_chat(profile: dict, max_output_tokens: int):
+    """Kimi K3 via Bedrock OpenAI-compatible Chat Completions.
+
+    AWS recommends Chat Completions over Converse for this model (LangChain
+    multi-turn can hit InternalServerException when reasoning blocks are
+    replayed). See model card: moonshot-ai-kimi-k3.
+    """
+    bedrock_region = profile["bedrock_region"]
+    model_id = profile["model_id"]
+
+    def bearer_token_provider() -> str:
+        return bedrock_data_retention.get_bedrock_bearer_token(bedrock_region)
+
+    return ChatOpenAI(
+        model=model_id,
+        api_key=bearer_token_provider,
+        base_url=f"https://bedrock-runtime.{bedrock_region}.amazonaws.com/openai/v1",
+        max_tokens=max_output_tokens,
+    )
+
+
 def _build_llm_gateway_chat(profile: dict, max_output_tokens: int):
     """Build chat model via LiteLLM gateway (ChatAnthropic / ChatOpenAI)."""
     settings = _llm_gateway_settings()
@@ -698,6 +719,8 @@ def get_chat():
     bedrock_region = profile['bedrock_region']
     if model_type == 'claude':
         maxOutputTokens = get_max_output_tokens(modelId)
+    elif model_type == 'kimi':
+        maxOutputTokens = 16384
     else:
         maxOutputTokens = 5120 # 5k
 
@@ -716,6 +739,9 @@ def get_chat():
 
     if profile["model_type"] == "openai":
         return _build_openai_chat(profile, maxOutputTokens)
+
+    if profile["model_type"] == "kimi":
+        return _build_kimi_chat(profile, maxOutputTokens)
 
     guardrail_cfg = _guardrail_config()
     if guardrail_cfg and profile["model_type"] in ("claude", "nova"):

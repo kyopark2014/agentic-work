@@ -81,6 +81,26 @@ def _build_openai_chat(profile: dict, max_output_tokens: int):
     converse_chat.streaming = False
     return converse_chat
 
+def _build_kimi_chat(profile: dict, max_output_tokens: int):
+    """Kimi K3 via Bedrock OpenAI-compatible Chat Completions.
+
+    AWS recommends Chat Completions over Converse for this model (LangChain
+    multi-turn can hit InternalServerException when reasoning blocks are
+    replayed). See model card: moonshot-ai-kimi-k3.
+    """
+    bedrock_region = profile["bedrock_region"]
+    model_id = profile["model_id"]
+
+    def bearer_token_provider() -> str:
+        return bedrock_data_retention.get_bedrock_bearer_token(bedrock_region)
+
+    return ChatOpenAI(
+        model=model_id,
+        api_key=bearer_token_provider,
+        base_url=f"https://bedrock-runtime.{bedrock_region}.amazonaws.com/openai/v1",
+        max_tokens=max_output_tokens,
+    )
+
 def get_chat(extended_thinking=None):
     # Set default value if not provided or invalid
     if extended_thinking is None or extended_thinking not in ['Enable', 'Disable']:
@@ -92,10 +112,15 @@ def get_chat(extended_thinking=None):
     modelId = profile['model_id']
     model_type = profile['model_type']
     maxOutputTokens = 4096 # 4k
+    if model_type == "kimi":
+        maxOutputTokens = 16384
     logger.info(f"LLM: bedrock_region: {bedrock_region}, modelId: {modelId}, model_type: {model_type}")
 
     if profile["model_type"] == "openai":
         return _build_openai_chat(profile, maxOutputTokens)
+
+    if profile["model_type"] == "kimi":
+        return _build_kimi_chat(profile, maxOutputTokens)
 
     if profile['model_type'] == 'nova':
         STOP_SEQUENCE = '"\n\n<thinking>", "\n<thinking>", " <thinking>"'
