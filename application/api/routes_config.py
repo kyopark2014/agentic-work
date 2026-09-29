@@ -193,7 +193,7 @@ def get_config(request: Request):
     if not session_user:
         return public
 
-    # Sync skills.list from builtins + S3 agentcore-sessions/{user}/skills/.
+    # Sync skills.list from builtins + S3 {user}/skills/ on the bucket root.
     skills_path = utils.ensure_user_skills_list(session_user)
     skill_options = load_capability_list_from_path(skills_path)
     logger.info("Loaded skills from %s (%d)", skills_path, len(skill_options))

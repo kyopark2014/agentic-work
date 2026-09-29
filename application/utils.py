@@ -21,8 +21,7 @@ logger = logging.getLogger("utils")
 script_dir = os.path.dirname(os.path.abspath(__file__))
 config_path = os.path.join(script_dir, "config.json")
 favorite_tools_path = os.path.join(script_dir, "favorite_tools.json")
-# ECS: /mnt/app-data (prefix app-data/) for tasks.db, graph, settings.
-# Runtime: /mnt/workspace (prefix agentcore-sessions/) for skills/artifacts/checkpoints.
+# ECS /mnt/app-data and Runtime /mnt/workspace both mount the S3 bucket root.
 def _default_session_storage_dir() -> str:
     """Prefer ECS app-data mount, then Runtime workspace, then local fallback."""
     for candidate in ("/mnt/app-data", "/mnt/workspace"):
@@ -33,8 +32,41 @@ def _default_session_storage_dir() -> str:
 
 SESSION_STORAGE_DIR = os.environ.get("SESSION_STORAGE_DIR") or _default_session_storage_dir()
 
-# S3 Files FS prefix for Runtime workspace → s3://{bucket}/agentcore-sessions/
-S3_FILES_SESSION_PREFIX = "agentcore-sessions"
+# Empty: workspace objects live at the bucket root, matching the S3 Files mount.
+S3_FILES_SESSION_PREFIX = ""
+
+
+def _on_shared_s3files_mount(path: str) -> bool:
+    """True when path is already on the bucket-root NFS mount.
+
+    Re-uploading those bytes with the S3 API races S3 Files export.
+    """
+    if (S3_FILES_SESSION_PREFIX or "").strip("/"):
+        return False
+    try:
+        real = os.path.realpath(path)
+    except OSError:
+        return False
+    for mount in ("/mnt/app-data", "/mnt/workspace"):
+        if not os.path.isdir(mount):
+            continue
+        root = os.path.realpath(mount)
+        if real == root or real.startswith(root + os.sep):
+            return True
+    return False
+
+
+def session_object_key(*parts: str) -> str:
+    """Join a session object key, prefixing only when a legacy prefix is set."""
+    cleaned: list[str] = []
+    prefix = (S3_FILES_SESSION_PREFIX or "").strip("/")
+    if prefix:
+        cleaned.append(prefix)
+    for part in parts:
+        text = str(part or "").strip("/")
+        if text:
+            cleaned.append(text)
+    return "/".join(cleaned)
 
 
 def sanitize_user_path_segment(user_id: str | None) -> str | None:
@@ -73,7 +105,7 @@ def get_user_skills_dir(user_id: str | None) -> str:
     """Logical path for user skills (Runtime /mnt/workspace only).
 
     Web UI discovers skill-creator skills via S3
-    (``agentcore-sessions/{user}/skills/``), not under app-data.
+    (``{user}/skills/`` on the bucket root), not a separate prefix.
     """
     segment = sanitize_user_path_segment(user_id) or "default"
     root = "/mnt/workspace" if os.path.isdir("/mnt/workspace") else SESSION_STORAGE_DIR
@@ -994,13 +1026,11 @@ def _without_env_proxies():
 
 
 def sync_user_graph_to_runtime_storage(user_id: str | None) -> dict[str, int]:
-    """Mirror ECS/local graph → S3 agentcore-sessions for AgentCore Runtime.
+    """Mirror ECS/local graph onto the shared bucket root for AgentCore Runtime.
 
-    Knowledge graphs live on app-data (``SESSION_STORAGE_DIR`` / ``app-data/``).
-    AgentCore Runtime only mounts ``agentcore-sessions/`` at ``/mnt/workspace``,
-    so ``recall_graph_memory`` cannot see app-data. After each successful
+    Runtime mounts the bucket root at ``/mnt/workspace``. After each successful
     pipeline/publish, upload ``{user}/graph/`` to
-    ``s3://{bucket}/agentcore-sessions/{user}/graph/`` so Runtime can read
+    ``s3://{bucket}/{user}/graph/`` so Runtime can read
     ``/mnt/workspace/{user}/graph/out/graph.json``.
 
     Returns counts: ``{"uploaded": N, "deleted": M}``. Missing graph or S3
@@ -1011,6 +1041,9 @@ def sync_user_graph_to_runtime_storage(user_id: str | None) -> dict[str, int]:
         return {"uploaded": 0, "deleted": 0}
 
     graph_root = get_user_graph_dir(user_id)
+    if _on_shared_s3files_mount(graph_root):
+        logger.info("skip graph→runtime mirror: %s is on the shared bucket-root mount", graph_root)
+        return {"uploaded": 0, "deleted": 0}
     graph_json = os.path.join(graph_root, "out", "graph.json")
     if not os.path.isfile(graph_json):
         logger.info(
@@ -1030,7 +1063,7 @@ def sync_user_graph_to_runtime_storage(user_id: str | None) -> dict[str, int]:
         logger.warning("skip graph→runtime mirror: s3_bucket not configured")
         return {"uploaded": 0, "deleted": 0}
 
-    dest_prefix = f"{S3_FILES_SESSION_PREFIX}/{segment}/graph/"
+    dest_prefix = session_object_key(segment, "graph") + "/"
     local_files: dict[str, str] = {}
     for dirpath, dirnames, filenames in os.walk(graph_root):
         dirnames[:] = [d for d in dirnames if d not in _GRAPH_MIRROR_SKIP_DIR_NAMES]
@@ -1109,6 +1142,8 @@ def mirror_wiki_sync_status_to_runtime(user_id: str | None) -> bool:
     status_local = os.path.join(wiki_graphify_out_dir(user_id), WIKI_SYNC_STATUS_FILENAME)
     if not os.path.isfile(status_local):
         return False
+    if _on_shared_s3files_mount(status_local):
+        return True
 
     try:
         cfg = load_config()
@@ -1120,9 +1155,8 @@ def mirror_wiki_sync_status_to_runtime(user_id: str | None) -> bool:
         logger.warning("skip wiki sync status mirror: s3_bucket not configured")
         return False
 
-    key = (
-        f"{S3_FILES_SESSION_PREFIX}/{segment}/wiki/graphify-out/"
-        f"{WIKI_SYNC_STATUS_FILENAME}"
+    key = session_object_key(
+        segment, "wiki", "graphify-out", WIKI_SYNC_STATUS_FILENAME
     )
     with _without_env_proxies():
         s3 = boto3.client("s3", region_name=region)
@@ -1136,16 +1170,19 @@ def mirror_wiki_sync_status_to_runtime(user_id: str | None) -> bool:
 
 
 def sync_user_wiki_to_runtime_storage(user_id: str | None) -> dict[str, int]:
-    """Mirror local wiki → S3 agentcore-sessions for AgentCore Runtime ``recall_wiki``.
+    """Mirror local wiki onto the bucket root for AgentCore Runtime ``recall_wiki``.
 
     Uploads ``{user}/wiki/`` (including ``graphify-out/``) to
-    ``s3://{bucket}/agentcore-sessions/{user}/wiki/``.
+    ``s3://{bucket}/{user}/wiki/``.
     """
     segment = sanitize_user_path_segment(user_id)
     if not segment:
         return {"uploaded": 0, "deleted": 0}
 
     wiki_root = get_user_wiki_dir(user_id)
+    if _on_shared_s3files_mount(wiki_root):
+        logger.info("skip wiki→runtime mirror: %s is on the shared bucket-root mount", wiki_root)
+        return {"uploaded": 0, "deleted": 0}
     graph_json = wiki_graph_json_path(user_id)
     if not os.path.isfile(graph_json):
         logger.info(
@@ -1165,7 +1202,7 @@ def sync_user_wiki_to_runtime_storage(user_id: str | None) -> dict[str, int]:
         logger.warning("skip wiki→runtime mirror: s3_bucket not configured")
         return {"uploaded": 0, "deleted": 0}
 
-    dest_prefix = f"{S3_FILES_SESSION_PREFIX}/{segment}/wiki/"
+    dest_prefix = session_object_key(segment, "wiki") + "/"
     local_files: dict[str, str] = {}
     for dirpath, dirnames, filenames in os.walk(wiki_root):
         dirnames[:] = [d for d in dirnames if d not in _WIKI_MIRROR_SKIP_DIR_NAMES]
@@ -1447,9 +1484,9 @@ def _list_skill_dir_names(skills_dir: str) -> list[str]:
 
 
 def _list_user_skill_names_from_s3(user_id: str | None) -> list[str]:
-    """List skill-creator skill dirs under s3://{bucket}/agentcore-sessions/{user}/skills/.
+    """List skill-creator skill dirs under s3://{bucket}/{user}/skills/.
 
-    ECS mounts app-data only; user skills always come from this S3 prefix.
+    ECS and Runtime share the bucket root; user skills live at this key.
     Only directories that contain SKILL.md are included.
     """
     if not user_id:
@@ -1471,7 +1508,7 @@ def _list_user_skill_names_from_s3(user_id: str | None) -> list[str]:
         # Fall back to local workspace mount when present (local/runtime).
         return _list_skill_dir_names(get_user_skills_dir(user_id))
 
-    prefix = f"{S3_FILES_SESSION_PREFIX}/{segment}/skills/"
+    prefix = session_object_key(segment, "skills") + "/"
     try:
         s3 = boto3.client("s3", region_name=region)
         paginator = s3.get_paginator("list_objects_v2")
@@ -1548,10 +1585,10 @@ def update_user_skills_list(user_id: str | None) -> str:
 
 
 def ensure_user_skills_list(user_id: str | None) -> str:
-    """Sync skills.list to builtins + S3 agentcore-sessions/{user}/skills/.
+    """Sync skills.list to builtins + S3 ``{user}/skills/`` on the bucket root.
 
-    ECS mounts app-data only; user-created skills are listed via S3 API, not the
-    local mount. Builtin names come from ``application/skills.list``.
+    User-created skills are listed via S3 API. Builtin names come from
+    ``application/skills.list``.
     """
     path = get_user_skills_list_path(user_id)
     desired = _seed_skill_names(user_id)
@@ -1961,10 +1998,10 @@ def _s3_client_for_presign():
 
 
 def session_upload_s3_key(file_name: str, user_id: str | None = None) -> str:
-    """Build ``agentcore-sessions/{user}/upload/{file}`` object key."""
+    """Build ``{user}/upload/{file}`` object key on the bucket root."""
     segment = _sanitize_s3_user_segment(user_id) or "default"
     safe_name = os.path.basename(file_name or "").strip() or "upload.bin"
-    return f"{S3_FILES_SESSION_PREFIX}/{segment}/upload/{safe_name}"
+    return session_object_key(segment, "upload", safe_name)
 
 
 def _session_upload_content_type(file_name: str) -> str:
@@ -1980,9 +2017,9 @@ def upload_to_session_upload(
     file_name: str,
     user_id: str | None = None,
 ) -> dict | None:
-    """Upload a chat Load-files attachment under agentcore-sessions/{user}/upload/.
+    """Upload a chat Load-files attachment under ``{user}/upload/``.
 
-    AgentCore Runtime mounts ``agentcore-sessions/`` at ``/mnt/workspace``, so the
+    AgentCore Runtime mounts the bucket root at ``/mnt/workspace``, so the
     object is visible to the agent as
     ``/mnt/workspace/{user}/upload/{file_name}``.
     """
@@ -2082,14 +2119,14 @@ def generate_session_upload_presigned_put(
 
 
 def wiki_raw_upload_s3_key(file_name: str, user_id: str | None = None) -> str:
-    """Build ``agentcore-sessions/{user}/wiki-upload/{file}`` staging key.
+    """Build ``{user}/wiki-upload/{file}`` staging key on the bucket root.
 
     Browser PUTs land here; ``/api/wiki/raw/complete`` copies into local
     ``{user}/wiki/raw/`` for Sync. Separate from the post-sync ``wiki/`` mirror.
     """
     segment = _sanitize_s3_user_segment(user_id) or "default"
     safe_name = os.path.basename(file_name or "").strip() or "upload.bin"
-    return f"{S3_FILES_SESSION_PREFIX}/{segment}/wiki-upload/{safe_name}"
+    return session_object_key(segment, "wiki-upload", safe_name)
 
 
 def generate_wiki_raw_presigned_put(
@@ -2658,7 +2695,7 @@ def documents_md_runtime_workspace_s3_key(
     safe_name = os.path.basename(file_name or "").strip() or "document.md"
     if not safe_name.lower().endswith(".md"):
         safe_name = f"{os.path.splitext(safe_name)[0]}.md"
-    return f"{S3_FILES_SESSION_PREFIX}/{segment}/artifacts/md/{safe_name}"
+    return session_object_key(segment, "artifacts", "md", safe_name)
 
 
 def documents_md_artifacts_public_url(

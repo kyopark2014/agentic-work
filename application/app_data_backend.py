@@ -1,7 +1,7 @@
 """Shared application data backend: S3 Files mount, or direct S3 when local.
 
-ECS mounts a dedicated S3 Files filesystem at /mnt/app-data (prefix app-data/).
-Runtime mounts agentcore-sessions/ at /mnt/workspace separately.
+ECS mounts the bucket root at /mnt/app-data.
+Runtime mounts the same bucket root at /mnt/workspace.
 Locally that mount is usually absent; with s3_bucket the S3 API can share
 tasks.db / virtual_key.json with production — but that path is **opt-in**
 (``APP_DATA_S3_ENABLE=1``). Default local mode stays disk-only.
@@ -22,7 +22,8 @@ logger = logging.getLogger("app_data_backend")
 _APPLICATION_DIR = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_WORKING_DIR = os.path.join(_APPLICATION_DIR, "data")
 _DEFAULT_MOUNT = "/mnt/app-data"
-S3_FILES_PREFIX = "app-data/"
+# Bucket root. ECS mount /mnt/app-data/<path> is s3://<bucket>/<path>.
+S3_FILES_PREFIX = ""
 
 
 def working_dir() -> str:
@@ -106,9 +107,13 @@ def backend_mode() -> str:
 
 
 def s3_key(*parts: str) -> str:
-    """Build an object key under app-data/."""
+    """Build an object key at the bucket root (same namespace as the mount)."""
     cleaned = [p.strip("/").replace("\\", "/") for p in parts if p and str(p).strip()]
-    return S3_FILES_PREFIX + "/".join(cleaned)
+    suffix = "/".join(cleaned)
+    prefix = (S3_FILES_PREFIX or "").strip("/")
+    if prefix:
+        return f"{prefix}/{suffix}" if suffix else prefix
+    return suffix
 
 
 def tasks_db_s3_key() -> str:

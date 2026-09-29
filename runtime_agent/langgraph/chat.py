@@ -1157,7 +1157,7 @@ def _s3_key_from_file_ref(file_ref: str, *, default_prefix: str = s3_image_prefi
 
 
 def _workspace_ref_to_s3_key(file_ref: str) -> str | None:
-    """Map /mnt/workspace/{user}/upload/x → agentcore-sessions/{user}/upload/x."""
+    """Map /mnt/workspace/{user}/upload/x to the bucket-root key {user}/upload/x."""
     path = (file_ref or "").strip()
     marker = "/mnt/workspace/"
     if not path.startswith(marker):
@@ -1165,7 +1165,8 @@ def _workspace_ref_to_s3_key(file_ref: str) -> str | None:
     rel = path[len(marker) :].lstrip("/")
     if not rel or ".." in rel.split("/"):
         return None
-    return f"agentcore-sessions/{rel}"
+    prefix = (getattr(utils, "S3_FILES_SESSION_PREFIX", "") or "").strip("/")
+    return f"{prefix}/{rel}" if prefix else rel
 
 
 def _wait_for_workspace_mount_file(
@@ -1494,7 +1495,7 @@ def get_summary_of_uploaded_file(file_ref: str, prompt: str = "") -> str:
     file_type = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
     logger.info(f"get_summary_of_uploaded_file: file_name={file_name}, file_type={file_type}")
 
-    # Load-files: agentcore-sessions → /mnt/workspace/{user}/upload/{name}
+    # Load-files: bucket root → /mnt/workspace/{user}/upload/{name}
     local_path = (file_ref or "").strip()
     if local_path.startswith("/mnt/workspace/"):
         data, source = _load_workspace_file_bytes(local_path)
@@ -2354,7 +2355,7 @@ async def create_agent(
 
     app = langgraph_agent.buildChatAgentWithHistory(tools)
     agent_config = {
-        "recursion_limit": 100,
+        "recursion_limit": 500,
         "configurable": {
             "thread_id": thread_id,
             "tools": tools,

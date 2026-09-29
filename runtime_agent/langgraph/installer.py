@@ -66,6 +66,7 @@ def _merge_application_config(config: dict) -> dict:
     for key in (
         "s3_files_access_point_arn",
         "s3_files_file_system_id",
+        "s3_session_bucket",
         "agent_runtime_vpc_subnets",
         "agent_runtime_security_groups",
         "use_vault_mcp_url",
@@ -348,44 +349,26 @@ def agent_runtime_name(project_name: str) -> str:
 def _project_agent_runtime_resource_arns(config) -> list:
     """IAM Resource ARNs limited to this project's AgentCore runtime (+ endpoints).
 
-    Use name + wildcard only (exact runtime id is covered by ``{name}-*``) to
-    stay under the managed-policy 6144-byte PolicySize quota.
+    ``{name}*`` covers the unsuffixed name and ``{name}-{id}``. Endpoint ARNs
+    stay separate because IAM ``*`` does not need to span the slash. This keeps
+    the managed policy under the 6144-byte PolicySize quota.
     Also includes ob-note use-vault MCP Runtime when configured.
     """
     region = config["region"]
     account_id = config["accountId"]
     project_name = config.get("projectName", "agentcore")
     runtime_name = agent_runtime_name(project_name)
-    arns = [
-        f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/{runtime_name}",
-        f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/{runtime_name}-*",
-        (
-            f"arn:aws:bedrock-agentcore:{region}:{account_id}:"
-            f"runtime/{runtime_name}/runtime-endpoint/*"
-        ),
-        (
-            f"arn:aws:bedrock-agentcore:{region}:{account_id}:"
-            f"runtime/{runtime_name}-*/runtime-endpoint/*"
-        ),
-    ]
+
+    def _runtime_arns(name: str) -> list[str]:
+        base = f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/{name}"
+        return [f"{base}*", f"{base}*/runtime-endpoint/*"]
+
+    arns = _runtime_arns(runtime_name)
 
     # Remote use-vault MCP (ob-note AgentCore Runtime; legacy ob-docs also allowed)
     vault_arn = (config.get("use_vault_mcp_runtime_arn") or "").strip()
     for vault_name in ("use_vault_of_ob_note", "use_vault_of_ob_docs"):
-        arns.extend(
-            [
-                f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/{vault_name}",
-                f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/{vault_name}-*",
-                (
-                    f"arn:aws:bedrock-agentcore:{region}:{account_id}:"
-                    f"runtime/{vault_name}/runtime-endpoint/*"
-                ),
-                (
-                    f"arn:aws:bedrock-agentcore:{region}:{account_id}:"
-                    f"runtime/{vault_name}-*/runtime-endpoint/*"
-                ),
-            ]
-        )
+        arns.extend(_runtime_arns(vault_name))
     if vault_arn and vault_arn not in arns:
         arns.append(vault_arn)
         endpoint = f"{vault_arn}/runtime-endpoint/*"
@@ -485,14 +468,19 @@ def _upsert_managed_policy(
 
 
 # Runtime tools only touch CF-shared prefixes (upload/read artifacts, images, docs).
-# App data (tasks.db, litellm, graph, settings) lives under app-data/ on a
-# separate S3 Files FS that Runtime must never mount or read via S3 API.
-RUNTIME_S3_OBJECT_PREFIXES = ("artifacts/", "images/", "docs/")
+# tasks.db and virtual keys now live at the bucket root because both mounts
+# use S3 /. Deny the S3 API paths anyway; NFS mount is a separate control.
+RUNTIME_S3_OBJECT_PREFIXES = ("artifacts/", "*/artifacts/", "images/", "docs/")
 
 # S3 API Deny even if Allow is later widened.
-# - app-data/: ECS tasks.db / litellm / graph / settings (separate FS; never grant)
-# - agentcore-sessions/: checkpoints/skills use s3files: mount, not S3 API
-RUNTIME_S3_DENY_OBJECT_PREFIXES = ("app-data/", "agentcore-sessions/")
+RUNTIME_S3_DENY_OBJECT_PREFIXES = (
+    "app-data/",
+    "sessions/",
+    "agentcore-sessions/",
+    "application-database/",
+    "litellm/",
+    "migration-backup/",
+)
 
 
 def _project_s3_resource_arns(config) -> tuple:
@@ -526,6 +514,9 @@ def _project_s3_resource_arns(config) -> tuple:
     deny_object_arns = [
         f"{bucket_arn}/{prefix}*" for prefix in RUNTIME_S3_DENY_OBJECT_PREFIXES
     ]
+    session_bucket = (config.get("s3_session_bucket") or "").strip()
+    if session_bucket and session_bucket != s3_bucket:
+        object_arns.append(f"arn:aws:s3:::{session_bucket}/*")
     return [bucket_arn], object_arns, list_prefixes, deny_object_arns
 
 
@@ -922,6 +913,17 @@ def create_bedrock_agentcore_storage_policy(config):
             "Resource": deny_object_arns,
         },
     ]
+
+    session_bucket = (config.get("s3_session_bucket") or "").strip()
+    if session_bucket:
+        statements.append(
+            {
+                "Sid": "ProjectS3SessionBucketList",
+                "Effect": "Allow",
+                "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+                "Resource": [f"arn:aws:s3:::{session_bucket}"],
+            }
+        )
 
     file_system_id = config.get("s3_files_file_system_id")
     access_point_arn = config.get("s3_files_access_point_arn")

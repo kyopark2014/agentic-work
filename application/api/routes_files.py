@@ -83,7 +83,7 @@ async def load_file_complete(request: Request, body: LoadFileCompleteRequest):
 
 @router.post("/load")
 async def load_file(request: Request, file: UploadFile = File(...)):
-    """Upload a Load-files attachment under agentcore-sessions/{user}/upload/.
+    """Upload a Load-files attachment under {user}/upload/ on the bucket root.
 
     Returns ``workspace_path`` (``/mnt/workspace/{user}/upload/{name}``) for the
     agent payload — not a CloudFront URL.
@@ -109,7 +109,7 @@ def view_loaded_file(
 ):
     """Open a Load-files attachment in a new browser tab (viewer or inline).
 
-    Reads from ``agentcore-sessions/{user}/upload/{filename}``. PDF/images stream
+    Reads from ``{user}/upload/{filename}`` on the bucket root. PDF/images stream
     inline; text/markdown/json/csv render in an HTML viewer; other types download.
 
     Viewer HTML is CSP-safe (no inline scripts / CDN) so it works under the app

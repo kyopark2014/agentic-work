@@ -110,7 +110,7 @@ def sanitize_load_filename(filename: str) -> str:
 
 
 def workspace_upload_path(user_id: str | None, file_name: str) -> str:
-    """Runtime path mapped from agentcore-sessions/{user}/upload/{file}."""
+    """Runtime path mapped from {user}/upload/{file} on the bucket root."""
     segment = utils.sanitize_user_path_segment(user_id) or "default"
     safe_name = os.path.basename(file_name)
     return f"{WORKSPACE_MOUNT_PATH}/{segment}/{UPLOAD_SUBDIR}/{safe_name}"
@@ -284,9 +284,9 @@ def upload_load_file(
     file_name: str,
     user_id: str | None = None,
 ) -> dict[str, Any]:
-    """Upload a Load-files attachment under agentcore-sessions/{user}/upload/.
+    """Upload a Load-files attachment under {user}/upload/ on the bucket root.
 
-    AgentCore Runtime mounts that prefix at /mnt/workspace, so the agent receives
+    AgentCore Runtime mounts that root at /mnt/workspace, so the agent receives
     ``/mnt/workspace/{user}/upload/{file_name}``.
 
     When ``/mnt/workspace`` is mounted in this process, waits until the object is
