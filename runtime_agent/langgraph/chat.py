@@ -10,6 +10,7 @@ import uuid
 import base64
 import info 
 import utils
+import unicode_paths
 import bedrock_data_retention
 import langgraph_agent
 import mcp_config
@@ -1169,81 +1170,143 @@ def _workspace_ref_to_s3_key(file_ref: str) -> str | None:
     return f"{prefix}/{rel}" if prefix else rel
 
 
+def _workspace_path_for_s3_key(s3_key: str) -> str | None:
+    """Map a bucket-root key back onto /mnt/workspace without changing spelling."""
+    prefix = (getattr(utils, "S3_FILES_SESSION_PREFIX", "") or "").strip("/")
+    rel = (s3_key or "").lstrip("/")
+    if prefix:
+        head = prefix + "/"
+        if not rel.startswith(head):
+            return None
+        rel = rel[len(head) :]
+    if not rel or ".." in rel.split("/"):
+        return None
+    return "/mnt/workspace/" + rel
+
+
+def _cache_workspace_object(s3_key: str, data: bytes) -> None:
+    """Write bytes onto the mount path of the key that actually existed.
+
+    The path keeps that key's Hangul spelling, so a later sync does not upload
+    a second NFC object next to an NFD one.
+    """
+    cache_path = _workspace_path_for_s3_key(s3_key)
+    if not cache_path or os.path.isfile(cache_path):
+        return
+    try:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, "wb") as f:
+            f.write(data)
+    except Exception as cache_err:
+        logger.warning(f"could not cache S3 file onto mount {cache_path}: {cache_err}")
+
+
+def _workspace_s3_keys(file_ref: str) -> list[str]:
+    """S3 keys for the original, NFC, and NFD spellings of a workspace path."""
+    keys: list[str] = []
+    for form in unicode_paths.path_spellings(file_ref):
+        key = _workspace_ref_to_s3_key(form)
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _mounted_workspace_file(path: str, *, nonempty: bool = False) -> str | None:
+    """Return the spelling that exists on the mount, if any."""
+    if not path.startswith("/mnt/workspace/"):
+        return path if os.path.isfile(path) else None
+
+    def _usable(candidate: str) -> bool:
+        if not os.path.isfile(candidate):
+            return False
+        return not nonempty or os.path.getsize(candidate) > 0
+
+    resolved = unicode_paths.resolve_existing_path(path)
+    if resolved and _usable(resolved):
+        return resolved
+    for cand in unicode_paths.path_spellings(path):
+        if _usable(cand):
+            return cand
+    return None
+
+
 def _wait_for_workspace_mount_file(
     path: str,
     *,
     timeout_sec: float = 90.0,
     interval_sec: float = 1.0,
-) -> bool:
-    """Poll until ``path`` appears under /mnt/workspace (S3 Files lag)."""
+) -> str | None:
+    """Poll until ``path`` (NFC or NFD) appears under /mnt/workspace."""
     import time
 
     if not path.startswith("/mnt/workspace/"):
-        return False
+        return None
     deadline = time.monotonic() + max(0.0, timeout_sec)
     while True:
-        if os.path.isfile(path) and os.path.getsize(path) > 0:
-            logger.info(f"workspace mount file ready: {path}")
-            return True
+        found = _mounted_workspace_file(path, nonempty=True)
+        if found:
+            logger.info(f"workspace mount file ready: {found}")
+            return found
         if time.monotonic() >= deadline:
             logger.warning(
                 f"workspace mount file not visible after {timeout_sec:.0f}s: {path}"
             )
-            return False
+            return None
         time.sleep(max(0.1, interval_sec))
 
 
 def _load_workspace_file_bytes(file_ref: str) -> tuple[bytes | None, str]:
     """Load Load-files bytes from /mnt/workspace, waiting for mount if needed.
 
-    Falls back to S3 API only if the mount never shows the file.
+    Falls back to S3 API only if the mount never shows the file. An object
+    placed from macOS (NFD) is found when the lookup path is NFC.
     """
     path = (file_ref or "").strip()
-    if path.startswith("/mnt/workspace/") and os.path.isfile(path):
-        with open(path, "rb") as f:
+    mounted = _mounted_workspace_file(path) if path.startswith("/mnt/workspace/") else None
+    if mounted:
+        with open(mounted, "rb") as f:
             data = f.read()
-        logger.info(f"loaded workspace file from mount ({len(data)} bytes): {path}")
-        return data, path
+        logger.info(f"loaded workspace file from mount ({len(data)} bytes): {mounted}")
+        return data, mounted
 
     if path.startswith("/mnt/workspace/"):
         logger.info(f"waiting for workspace mount file: {path}")
-        if _wait_for_workspace_mount_file(path, timeout_sec=90.0, interval_sec=1.0):
-            with open(path, "rb") as f:
+        found = _wait_for_workspace_mount_file(path, timeout_sec=90.0, interval_sec=1.0)
+        if found:
+            with open(found, "rb") as f:
                 data = f.read()
             logger.info(
-                f"loaded workspace file after wait ({len(data)} bytes): {path}"
+                f"loaded workspace file after wait ({len(data)} bytes): {found}"
             )
-            return data, path
+            return data, found
 
-    s3_key = _workspace_ref_to_s3_key(path)
-    if not s3_key or not s3_bucket:
+    s3_keys = _workspace_s3_keys(path)
+    if not s3_keys or not s3_bucket:
         logger.warning(
-            "workspace file unavailable on mount and no S3 key/bucket: path=%s key=%s",
+            "workspace file unavailable on mount and no S3 key/bucket: path=%s keys=%s",
             path,
-            s3_key,
+            s3_keys,
         )
         return None, path
 
-    try:
-        s3_client = boto3.client(service_name="s3", region_name=bedrock_region)
-        logger.info(f"loading workspace file from s3://{s3_bucket}/{s3_key}")
-        obj = s3_client.get_object(Bucket=s3_bucket, Key=s3_key)
-        data = obj["Body"].read()
-        logger.info(f"loaded workspace file from S3 ({len(data)} bytes): {s3_key}")
+    s3_client = boto3.client(service_name="s3", region_name=bedrock_region)
+    last_error = ""
+    for s3_key in s3_keys:
         try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "wb") as f:
-                f.write(data)
-        except Exception as cache_err:
-            logger.warning(f"could not cache S3 file onto mount {path}: {cache_err}")
-        return data, f"s3://{s3_bucket}/{s3_key}"
-    except Exception:
-        logger.error(
-            "Failed to load workspace file from S3 key=%s: %s",
-            s3_key,
-            traceback.format_exc(),
-        )
-        return None, path
+            logger.info(f"loading workspace file from s3://{s3_bucket}/{s3_key}")
+            obj = s3_client.get_object(Bucket=s3_bucket, Key=s3_key)
+            data = obj["Body"].read()
+            logger.info(f"loaded workspace file from S3 ({len(data)} bytes): {s3_key}")
+            _cache_workspace_object(s3_key, data)
+            return data, f"s3://{s3_bucket}/{s3_key}"
+        except Exception:
+            last_error = traceback.format_exc()
+    logger.error(
+        "Failed to load workspace file from S3 keys=%s: %s",
+        s3_keys,
+        last_error,
+    )
+    return None, path
 
 
 def _extract_text_from_docx_bytes(data: bytes) -> str:

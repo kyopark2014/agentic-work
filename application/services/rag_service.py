@@ -48,7 +48,7 @@ class RagServiceError(Exception):
 
 def validate_rag_filename(filename: str) -> str:
     """Validate extension and return a safe basename."""
-    name = os.path.basename(filename or "").strip()
+    name = utils.nfc_filename(filename)
     if not name:
         raise RagServiceError(400, "File name is required")
     ext = os.path.splitext(name)[1].lower()
@@ -296,7 +296,7 @@ def complete_rag_upload(
 
     expected_key = utils.rag_docs_s3_key(safe_name, user_id=user_id)
     key = (s3_key or "").strip()
-    if key != expected_key:
+    if utils.nfc_text(key) != utils.nfc_text(expected_key):
         raise RagServiceError(400, "Invalid upload target")
 
     head = utils.head_session_upload_object(key)

@@ -3,6 +3,7 @@ import sys
 import json
 import traceback
 import re
+import unicodedata
 import boto3
 import os
 from contextlib import contextmanager
@@ -17,6 +18,33 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("utils")
+
+
+def _load_unicode_paths():
+    """Import the app-local Hangul path helper in either layout."""
+    try:
+        from application import unicode_paths
+    except ImportError:
+        import unicode_paths
+    return unicode_paths
+
+
+def nfc_text(value: str | None) -> str:
+    """Compose Hangul so an NFD upload and an NFC lookup share one spelling."""
+    return unicodedata.normalize("NFC", value or "")
+
+
+def nfc_filename(filename: str | None, *, default: str = "") -> str:
+    """Return a basename in NFC.
+
+    macOS file pickers send decomposed Hangul (NFD). Linux paths and the
+    agent look up composed Hangul (NFC), so store and address one spelling.
+    """
+    name = nfc_text(os.path.basename(filename or "").strip())
+    name = name.replace("\x00", "")
+    if name in {".", ".."}:
+        return default
+    return name or default
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 config_path = os.path.join(script_dir, "config.json")
@@ -298,8 +326,7 @@ def documents_drawings_list_path(user_id: str | None = None) -> str:
 
 def _documents_docs_dest_path(docs_dir: str, filename: str) -> tuple[str, str, str]:
     """Return ``(dest_path, sanitized_name, original_basename)``."""
-    original = os.path.basename((filename or "").strip()) or "upload.bin"
-    original = original.replace("\x00", "_") or "upload.bin"
+    original = nfc_filename(filename, default="upload.bin").replace("\x00", "_") or "upload.bin"
     try:
         _ensure_documents_on_path()
         from doc_list import sanitize_documents_filename
@@ -822,7 +849,7 @@ def _wiki_raw_dest_path(raw_dir: "Path", filename: str) -> "Path":
     from pathlib import Path
 
     raw_dir = Path(raw_dir)
-    name = Path(str(filename or "").strip() or "upload.bin").name
+    name = nfc_filename(filename, default="upload.bin")
     # Block path traversal in uploaded names.
     name = name.replace("\x00", "").replace("/", "_").replace("\\", "_")
     if not name or name in (".", ".."):
@@ -898,10 +925,10 @@ def save_wiki_raw_from_s3(
     """
     from pathlib import Path
 
-    safe_name = os.path.basename(file_name or "").strip() or "upload.bin"
+    safe_name = nfc_filename(file_name, default="upload.bin")
     expected_key = wiki_raw_upload_s3_key(safe_name, user_id=user_id)
     key = (s3_key or "").strip()
-    if key != expected_key:
+    if nfc_text(key) != nfc_text(expected_key):
         raise ValueError("Invalid upload target")
 
     head = head_session_upload_object(key)
@@ -1849,6 +1876,8 @@ def upload_to_s3(
         logger.error("s3_bucket is not configured")
         return None
 
+    file_name = nfc_filename(file_name, default="upload.bin")
+
     try:
         s3_client = boto3.client(service_name="s3", region_name=bedrock_region)
         content_type = get_contents_type(file_name)
@@ -1899,7 +1928,7 @@ def upload_to_s3(
 
 def rag_docs_s3_key(file_name: str, user_id: str | None = None) -> str:
     """Build ``docs/{user}/{file}`` key used by Knowledge Base ingest."""
-    safe_name = os.path.basename(file_name or "").strip() or "upload.bin"
+    safe_name = nfc_filename(file_name, default="upload.bin")
     user_segment = _sanitize_s3_user_segment(user_id)
     if user_segment:
         return f"{s3_prefix}/{user_segment}/{safe_name}"
@@ -1910,7 +1939,7 @@ def rag_docs_public_url(file_name: str, user_id: str | None = None) -> str | Non
     """CloudFront/sharing URL for a docs/ object, if configured."""
     if not sharing_url:
         return None
-    safe_name = os.path.basename(file_name or "").strip() or "upload.bin"
+    safe_name = nfc_filename(file_name, default="upload.bin")
     user_segment = _sanitize_s3_user_segment(user_id)
     if user_segment:
         relative = f"{s3_prefix}/{parse.quote(user_segment)}/{parse.quote(safe_name)}"
@@ -1934,7 +1963,7 @@ def generate_rag_upload_presigned_put(
         logger.error("s3_bucket is not configured")
         return None
 
-    safe_name = os.path.basename(file_name or "").strip() or "upload.bin"
+    safe_name = nfc_filename(file_name, default="upload.bin")
     s3_key = rag_docs_s3_key(safe_name, user_id=user_id)
     content_type = _session_upload_content_type(safe_name)
     headers = {"Content-Type": content_type}
@@ -2000,7 +2029,7 @@ def _s3_client_for_presign():
 def session_upload_s3_key(file_name: str, user_id: str | None = None) -> str:
     """Build ``{user}/upload/{file}`` object key on the bucket root."""
     segment = _sanitize_s3_user_segment(user_id) or "default"
-    safe_name = os.path.basename(file_name or "").strip() or "upload.bin"
+    safe_name = nfc_filename(file_name, default="upload.bin")
     return session_object_key(segment, "upload", safe_name)
 
 
@@ -2027,7 +2056,7 @@ def upload_to_session_upload(
         logger.error("s3_bucket is not configured")
         return None
 
-    safe_name = os.path.basename(file_name or "").strip() or "upload.bin"
+    safe_name = nfc_filename(file_name, default="upload.bin")
     s3_key = session_upload_s3_key(safe_name, user_id=user_id)
     content_type = _session_upload_content_type(safe_name)
 
@@ -2079,7 +2108,7 @@ def generate_session_upload_presigned_put(
         logger.error("s3_bucket is not configured")
         return None
 
-    safe_name = os.path.basename(file_name or "").strip() or "upload.bin"
+    safe_name = nfc_filename(file_name, default="upload.bin")
     s3_key = session_upload_s3_key(safe_name, user_id=user_id)
     content_type = _session_upload_content_type(safe_name)
     headers = {"Content-Type": content_type}
@@ -2125,7 +2154,7 @@ def wiki_raw_upload_s3_key(file_name: str, user_id: str | None = None) -> str:
     ``{user}/wiki/raw/`` for Sync. Separate from the post-sync ``wiki/`` mirror.
     """
     segment = _sanitize_s3_user_segment(user_id) or "default"
-    safe_name = os.path.basename(file_name or "").strip() or "upload.bin"
+    safe_name = nfc_filename(file_name, default="upload.bin")
     return session_object_key(segment, "wiki-upload", safe_name)
 
 
@@ -2140,7 +2169,7 @@ def generate_wiki_raw_presigned_put(
         logger.error("s3_bucket is not configured")
         return None
 
-    safe_name = os.path.basename(file_name or "").strip() or "upload.bin"
+    safe_name = nfc_filename(file_name, default="upload.bin")
     s3_key = wiki_raw_upload_s3_key(safe_name, user_id=user_id)
     content_type = _session_upload_content_type(safe_name)
     headers = {"Content-Type": content_type}
@@ -2195,20 +2224,29 @@ def download_s3_object_to_path(s3_key: str, dest_path: str) -> int:
 
 
 def head_session_upload_object(s3_key: str) -> dict | None:
-    """HEAD an object; return ``{content_length, content_type}`` or None."""
+    """HEAD an object; return ``{content_length, content_type}`` or None.
+
+    Tries the NFC and NFD spellings so a Mac-placed object is found from an
+    NFC key.
+    """
     if not s3_bucket or not s3_key:
         return None
-    try:
-        with _without_env_proxies():
-            s3_client = _s3_client_for_presign()
-            response = s3_client.head_object(Bucket=s3_bucket, Key=s3_key)
-        return {
-            "content_length": int(response.get("ContentLength") or 0),
-            "content_type": response.get("ContentType"),
-        }
-    except Exception:
-        logger.error("Error head_object key=%s: %s", s3_key, traceback.format_exc())
-        return None
+    unicode_paths = _load_unicode_paths()
+    keys = unicode_paths.path_spellings(s3_key)
+    last_error = ""
+    for key in keys:
+        try:
+            with _without_env_proxies():
+                s3_client = _s3_client_for_presign()
+                response = s3_client.head_object(Bucket=s3_bucket, Key=key)
+            return {
+                "content_length": int(response.get("ContentLength") or 0),
+                "content_type": response.get("ContentType"),
+            }
+        except Exception:
+            last_error = traceback.format_exc()
+    logger.error("Error head_object keys=%s: %s", keys, last_error)
+    return None
 
 
 def wait_for_workspace_file(
@@ -2237,22 +2275,27 @@ def wait_for_workspace_file(
         )
         return False
 
+    unicode_paths = _load_unicode_paths()
+    candidates = unicode_paths.path_spellings(path) or [path]
     deadline = time.monotonic() + max(0.0, timeout_sec)
     last_size: int | None = None
     while True:
-        try:
-            if os.path.isfile(path):
-                size = os.path.getsize(path)
+        for cand in candidates:
+            try:
+                found = unicode_paths.resolve_existing_path(cand)
+                if not os.path.isfile(found):
+                    continue
+                size = os.path.getsize(found)
                 last_size = size
                 if expected_size is None or size == expected_size:
                     logger.info(
                         "workspace file ready: %s (%s bytes)",
-                        path,
+                        found,
                         size,
                     )
                     return True
-        except OSError:
-            pass
+            except OSError:
+                pass
 
         if time.monotonic() >= deadline:
             logger.warning(
@@ -2351,7 +2394,7 @@ MAX_DOCUMENTS_DOC_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 def documents_projects_s3_key(file_name: str, user_id: str | None = None) -> str:
     """Build ``session-uploads/{user}/documents/projects/{file}`` staging key."""
     segment = sanitize_user_path_segment(user_id) or "default"
-    safe_name = os.path.basename(file_name or "").strip() or "upload.bin"
+    safe_name = nfc_filename(file_name, default="upload.bin")
     return f"{DOCUMENTS_S3_PREFIX}/{segment}/documents/projects/{safe_name}"
 
 
@@ -2365,7 +2408,7 @@ def generate_documents_projects_presigned_put(
         logger.error("s3_bucket is not configured")
         return None
 
-    original = os.path.basename(file_name or "").strip() or "upload.bin"
+    original = nfc_filename(file_name, default="upload.bin")
     try:
         _ensure_documents_on_path()
         from doc_list import sanitize_documents_filename
@@ -2422,17 +2465,14 @@ def materialize_documents_projects_from_s3(
     if not s3_bucket or not s3_key:
         return None
 
-    original = (
-        os.path.basename(original_filename or file_name or "").strip()
-        or "upload.bin"
-    )
+    original = nfc_filename(original_filename or file_name, default="upload.bin")
     try:
         _ensure_documents_on_path()
         from doc_list import PROJECTS, sanitize_documents_filename, upsert_document
 
         safe_name = sanitize_documents_filename(file_name or original)
     except Exception:
-        safe_name = os.path.basename(file_name or original) or "upload.bin"
+        safe_name = nfc_filename(file_name or original, default="upload.bin")
         upsert_document = None  # type: ignore[assignment]
         PROJECTS = None  # type: ignore[assignment]
 
@@ -2500,7 +2540,7 @@ def materialize_documents_projects_from_s3(
 
 def documents_drawings_s3_key(file_name: str, user_id: str | None = None) -> str:
     segment = sanitize_user_path_segment(user_id) or "default"
-    safe_name = os.path.basename(file_name or "").strip() or "upload.bin"
+    safe_name = nfc_filename(file_name, default="upload.bin")
     return f"{DOCUMENTS_S3_PREFIX}/{segment}/documents/drawings/{safe_name}"
 
 
@@ -2514,7 +2554,7 @@ def generate_documents_drawings_presigned_put(
         logger.error("s3_bucket is not configured")
         return None
 
-    original = os.path.basename(file_name or "").strip() or "upload.bin"
+    original = nfc_filename(file_name, default="upload.bin")
     try:
         _ensure_documents_on_path()
         from doc_list import sanitize_documents_filename
@@ -2571,17 +2611,14 @@ def materialize_documents_drawings_from_s3(
     if not s3_bucket or not s3_key:
         return None
 
-    original = (
-        os.path.basename(original_filename or file_name or "").strip()
-        or "upload.bin"
-    )
+    original = nfc_filename(original_filename or file_name, default="upload.bin")
     try:
         _ensure_documents_on_path()
         from doc_list import DRAWINGS, sanitize_documents_filename, upsert_document
 
         safe_name = sanitize_documents_filename(file_name or original)
     except Exception:
-        safe_name = os.path.basename(file_name or original) or "upload.bin"
+        safe_name = nfc_filename(file_name or original, default="upload.bin")
         upsert_document = None  # type: ignore[assignment]
         DRAWINGS = None  # type: ignore[assignment]
 
@@ -2652,7 +2689,7 @@ def documents_project_pdf_public_url(
 ) -> str | None:
     if not sharing_url:
         return None
-    safe_name = os.path.basename(file_name or "").strip()
+    safe_name = nfc_filename(file_name)
     if not safe_name:
         return None
     segment = sanitize_user_path_segment(user_id) or "default"
@@ -2668,7 +2705,7 @@ def documents_drawing_pdf_public_url(
 ) -> str | None:
     if not sharing_url:
         return None
-    safe_name = os.path.basename(file_name or "").strip()
+    safe_name = nfc_filename(file_name)
     if not safe_name:
         return None
     segment = sanitize_user_path_segment(user_id) or "default"
@@ -2681,7 +2718,7 @@ def documents_drawing_pdf_public_url(
 
 def documents_md_artifacts_s3_key(file_name: str, user_id: str | None = None) -> str:
     segment = sanitize_user_path_segment(user_id) or "default"
-    safe_name = os.path.basename(file_name or "").strip() or "document.md"
+    safe_name = nfc_filename(file_name, default="document.md")
     if not safe_name.lower().endswith(".md"):
         safe_name = f"{os.path.splitext(safe_name)[0]}.md"
     project = (projectName or "default").strip().strip("/") or "default"
@@ -2692,7 +2729,7 @@ def documents_md_runtime_workspace_s3_key(
     file_name: str, user_id: str | None = None
 ) -> str:
     segment = sanitize_user_path_segment(user_id) or "default"
-    safe_name = os.path.basename(file_name or "").strip() or "document.md"
+    safe_name = nfc_filename(file_name, default="document.md")
     if not safe_name.lower().endswith(".md"):
         safe_name = f"{os.path.splitext(safe_name)[0]}.md"
     return session_object_key(segment, "artifacts", "md", safe_name)
@@ -2714,7 +2751,7 @@ def documents_md_local_artifacts_path(
     artifacts = ensure_user_artifacts_dir(user_id)
     md_dir = os.path.join(artifacts, "md")
     os.makedirs(md_dir, exist_ok=True)
-    safe_name = os.path.basename(file_name or "").strip() or "document.md"
+    safe_name = nfc_filename(file_name, default="document.md")
     if not safe_name.lower().endswith(".md"):
         safe_name = f"{os.path.splitext(safe_name)[0]}.md"
     return os.path.join(md_dir, safe_name)
@@ -2748,7 +2785,7 @@ def publish_documents_markdown_to_artifacts(
         logger.warning("Documents md publish skipped; missing file: %s", src)
         return None
 
-    name = os.path.basename(file_name or src.name)
+    name = nfc_filename(file_name or src.name, default="document.md")
     if not name.lower().endswith(".md"):
         name = f"{os.path.splitext(name)[0]}.md"
 
@@ -2868,7 +2905,7 @@ def documents_pdf_s3_key_for_kind(
     *,
     kind: str = "project",
 ) -> str | None:
-    safe_name = os.path.basename(file_name or "").strip()
+    safe_name = nfc_filename(file_name)
     if not safe_name:
         return None
     if kind == "drawing":
@@ -2901,7 +2938,7 @@ def stream_documents_pdf_from_s3(
     key = documents_pdf_s3_key_for_kind(file_name, user_id=user_id, kind=kind)
     if not s3_bucket or not key:
         return None
-    safe_name = os.path.basename(file_name or "").strip() or "document.pdf"
+    safe_name = nfc_filename(file_name, default="document.pdf")
     try:
         s3_client = boto3.client(service_name="s3", region_name=bedrock_region)
         obj = s3_client.get_object(Bucket=s3_bucket, Key=key)
@@ -3093,7 +3130,7 @@ def delete_documents_document(
     import shutil
     from pathlib import Path as _Path
 
-    name = os.path.basename(filename or "").strip()
+    name = nfc_filename(filename)
     if not name or name in {".", ".."}:
         raise ValueError("Invalid document name")
 
