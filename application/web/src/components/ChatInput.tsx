@@ -37,6 +37,8 @@ interface Props {
   onResumeQueue?: () => void;
   onStop?: () => void;
   onSend: (text: string, files?: string[]) => void;
+  /** Task whose uploads stay attached across screen changes. */
+  taskId?: string | null;
   onRagUploadComplete?: (message: string) => void;
   onWikiUploadComplete?: (message: string) => void;
   syncModel?: string;
@@ -70,6 +72,7 @@ export function ChatInput({
   onResumeQueue,
   onStop,
   onSend,
+  taskId = null,
   onRagUploadComplete,
   onWikiUploadComplete,
   syncModel,
@@ -113,7 +116,7 @@ export function ChatInput({
     onDragOver,
     onDragLeave,
     onDrop,
-  } = useFileUpload({ disabled, syncModel });
+  } = useFileUpload({ disabled, syncModel, taskId });
 
   // Documents 「복사」 → attach md chip immediately.
   useEffect(() => {

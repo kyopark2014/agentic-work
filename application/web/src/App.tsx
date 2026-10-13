@@ -864,6 +864,7 @@ export default function App() {
                 onResumeQueue={handleResumeQueue}
                 onStop={handleStop}
                 onSend={handleSend}
+                taskId={activeTaskId}
                 onRagUploadComplete={handleRagUploadComplete}
                 onWikiUploadComplete={handleWikiUploadComplete}
                 syncModel={activeTask?.model_name}
