@@ -380,7 +380,10 @@ async def agent_langgraph(payload):
             return {"value": parsed}
 
         # call_model이 chain.astream을 쓰므로 LLM 토큰/청크가 그래프로 전달됨 (langgraph_agent.call_model)
-        async for stream in app.astream(inputs, config, stream_mode="messages"):
+        # "custom" carries bash keepalive pings while a long shell command is quiet.
+        async for stream in app.astream(
+            inputs, config, stream_mode=["messages", "custom"]
+        ):
             if runtime_session_id and run_cancel.is_cancelled(runtime_session_id):
                 cancelled = True
                 logger.info(
@@ -388,6 +391,17 @@ async def agent_langgraph(payload):
                     runtime_session_id,
                 )
                 break
+            if (
+                isinstance(stream, tuple)
+                and len(stream) == 2
+                and stream[0] in ("messages", "custom")
+            ):
+                mode, payload = stream
+                if mode == "custom":
+                    if isinstance(payload, dict) and payload.get("ping"):
+                        yield {"ping": True}
+                    continue
+                stream = payload
             chunk = stream[0] if isinstance(stream, (list, tuple)) and stream else stream
 
             if isinstance(chunk, AIMessageChunk):

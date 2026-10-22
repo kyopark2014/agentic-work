@@ -245,6 +245,9 @@ class ChatStreamService:
         event_type = event.get("type")
         data = event.get("data", "")
 
+        if event_type == "ping":
+            return None
+
         if event_type == "markdown":
             return {"type": "token", "data": data}
 

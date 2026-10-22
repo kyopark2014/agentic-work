@@ -1078,6 +1078,44 @@ def upload_file_to_s3(filepath: str) -> str:
     except Exception as e:
         return f"Upload failed: {str(e)}"
 
+BASH_TIMEOUT_SECONDS = 300
+# Keep the app↔agent SSE / ALB idle timer alive during long silent commands.
+BASH_HEARTBEAT_SECONDS = 60
+
+
+def _bash_stream_writer():
+    """LangGraph custom stream writer, or None outside a graph run."""
+    try:
+        from langgraph.config import get_stream_writer
+
+        return get_stream_writer()
+    except Exception:
+        return None
+
+
+def _bash_kill_process_group(pid: int) -> None:
+    if pid <= 1:
+        return
+    import signal
+
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            break
+
+
+def _bash_format_result(stdout: str, stderr: str, returncode: int | None) -> str:
+    parts = []
+    if stdout:
+        parts.append(f"STDOUT:\n{stdout}")
+    if stderr:
+        parts.append(f"STDERR:\n{stderr}")
+    if returncode not in (0, None):
+        parts.append(f"Return code: {returncode}")
+    return "\n".join(parts) if parts else "(no output)"
+
+
 @tool
 def bash(command: str) -> str:
     """Execute a bash command and return the result.
@@ -1092,27 +1130,97 @@ def bash(command: str) -> str:
     $SKILL_DIR. Prefix each engine call, e.g.
     SKILL_DIR="$SKILLS_DIR/last30days" "${SKILL_DIR}/scripts/last30days.py" ...
     Or use the absolute SKILL_DIR=... from get_skill_instructions on that call only.
+    While the command is quiet, a keepalive ping is emitted every 60 seconds.
     """
+    import select
+    import time
+
     command = unicode_paths.rewrite_command_unicode_paths(command)
     logger.info(f"###### bash: {command} ######")
     _ensure_cli_scripts_on_path()
     _ensure_user_site_on_sys_path()
     _ensure_node_path()
-    result = subprocess.run(
-        command, shell=True, capture_output=True, text=True,
-        cwd=WORKING_DIR, timeout=300,
-        env=os.environ,
-    )
+    writer = _bash_stream_writer()
+    try:
+        # Own process group so timeout kills the shell and its children together.
+        proc = subprocess.Popen(  # nosec B602 — agent bash tool; shell features required
+            command,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=WORKING_DIR,
+            env=os.environ,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        return "Error: shell or command not found"
+    except PermissionError:
+        return "Error: permission denied"
+    except OSError as e:
+        return f"Error: OS error ({type(e).__name__})"
+
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    deadline = time.monotonic() + BASH_TIMEOUT_SECONDS
+    last_emit = time.monotonic()
+    timed_out = False
+    try:
+        assert proc.stdout is not None and proc.stderr is not None
+        streams = [proc.stdout, proc.stderr]
+        while streams:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            ready, _, _ = select.select(streams, [], [], min(0.25, remaining))
+            now = time.monotonic()
+            if writer is not None and now - last_emit >= BASH_HEARTBEAT_SECONDS:
+                last_emit = now
+                try:
+                    writer({"ping": True})
+                except Exception:
+                    logger.debug("bash keepalive write failed", exc_info=True)
+            for stream in ready:
+                line = stream.readline()
+                if line:
+                    if stream is proc.stdout:
+                        stdout_parts.append(line)
+                    else:
+                        stderr_parts.append(line)
+                    continue
+                streams.remove(stream)
+            if proc.poll() is not None and not ready:
+                # Process exited; drain any remaining buffered lines.
+                for stream in list(streams):
+                    rest = stream.read()
+                    if rest:
+                        if stream is proc.stdout:
+                            stdout_parts.append(rest)
+                        else:
+                            stderr_parts.append(rest)
+                    streams.remove(stream)
+                break
+        if timed_out:
+            logger.warning(
+                "bash timed out after %ss: %s", BASH_TIMEOUT_SECONDS, command[:200]
+            )
+            _bash_kill_process_group(proc.pid)
+            proc.wait()
+            return f"Error: command timed out after {BASH_TIMEOUT_SECONDS}s"
+        returncode = proc.wait()
+    except Exception:
+        _bash_kill_process_group(proc.pid)
+        raise
+    finally:
+        if proc.poll() is None:
+            _bash_kill_process_group(proc.pid)
+
     # pip install may have just created ~/.local/.../site-packages
     _ensure_user_site_on_sys_path()
-    parts = []
-    if result.stdout:
-        parts.append(f"STDOUT:\n{result.stdout}")
-    if result.stderr:
-        parts.append(f"STDERR:\n{result.stderr}")
-    if result.returncode != 0:
-        parts.append(f"Return code: {result.returncode}")
-    return "\n".join(parts) if parts else "(no output)"
+    return _bash_format_result(
+        "".join(stdout_parts), "".join(stderr_parts), returncode
+    )
 
 _VIEW_IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif"})
 _VIEW_MAX_SIDE = 8000

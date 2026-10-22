@@ -197,7 +197,18 @@ def _process_tool_events(data_json: dict, notification_queue, stream_state: dict
             )
 
 
+def _handle_stream_ping(notification_queue) -> None:
+    # Long bash with no stdout still needs queue activity for idle timers
+    # and bytes on the wire for ALB idle timeout.
+    if notification_queue is not None and hasattr(notification_queue, "ping"):
+        notification_queue.ping()
+
+
 def _process_strands_sse_event(data_json: dict, notification_queue, stream_state: dict) -> None:
+    if data_json.get("ping"):
+        _handle_stream_ping(notification_queue)
+        return
+
     if "data" in data_json:
         text = normalize_bedrock_message_content(data_json["data"])
         logger.info("[data] %s", _truncate_text(text, _LOG_TRUNCATE_CHARS))
@@ -217,6 +228,10 @@ def _process_strands_sse_event(data_json: dict, notification_queue, stream_state
 
 
 def _process_langgraph_sse_event(data_json: dict, notification_queue, stream_state: dict) -> None:
+    if data_json.get("ping"):
+        _handle_stream_ping(notification_queue)
+        return
+
     if "data" in data_json:
         text = normalize_bedrock_message_content(data_json["data"])
         logger.info("[data] %s", _truncate_text(text, _LOG_TRUNCATE_CHARS))

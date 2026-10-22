@@ -22,6 +22,7 @@ from application import run_registry
 from application import task_store
 from application import utils
 from application.task_store_persistence import flush_persist
+from application.tool_events_slim import slim_tool_events
 
 logger = logging.getLogger("run_state")
 
@@ -364,19 +365,74 @@ def _hydrate_assistant_if_needed(
     return True
 
 
+def summarize_tool_events(events: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """Compact counts for status APIs and scheduler logs."""
+    events = list(events or [])
+    by_tool: dict[str, int] = {}
+    tool_count = 0
+    result_count = 0
+    text_count = 0
+    for event in events:
+        kind = event.get("type")
+        if kind == "tool":
+            tool_count += 1
+            name = str(event.get("tool") or "unknown")
+            by_tool[name] = by_tool.get(name, 0) + 1
+        elif kind == "tool_result":
+            result_count += 1
+        elif kind == "text":
+            text_count += 1
+    return {
+        "total": len(events),
+        "tool_count": tool_count,
+        "result_count": result_count,
+        "text_count": text_count,
+        "by_tool": by_tool,
+    }
+
+
+def _run_response(
+    *,
+    task_id: str,
+    status: str,
+    content: str = "",
+    images: list[str] | None = None,
+    error: Any = None,
+    source: str | None = None,
+    hydrated: bool = False,
+    tool_events: list[dict[str, Any]] | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    events = list(tool_events or [])
+    payload: dict[str, Any] = {
+        "task_id": task_id,
+        "status": status,
+        "content": content or "",
+        "images": list(images or []),
+        "error": error,
+        "source": source,
+        "hydrated": hydrated,
+        # Summary uses full events; wire payload is capped for the browser.
+        "tool_events": slim_tool_events(events),
+        "tool_summary": summarize_tool_events(events),
+    }
+    payload.update(extra)
+    return payload
+
+
 def query_task_run(task_id: str, user_id: str) -> dict[str, Any]:
-    """Return run status for a task (query API surface for UI / future runtime)."""
+    """Return run status for a task (query API surface for UI / future runtime).
+
+    Always includes ``tool_events`` and ``tool_summary`` so callers see tool
+    use from scheduler drains and live chat — not only final text.
+    """
     task = task_store.get_task_refreshing(task_id, user_id)
     if not task:
-        return {
-            "task_id": task_id,
-            "status": "missing",
-            "content": "",
-            "images": [],
-            "error": "Task not found",
-            "source": None,
-            "hydrated": False,
-        }
+        return _run_response(
+            task_id=task_id,
+            status="missing",
+            error="Task not found",
+        )
 
     session_id = task.get("runtime_session_id") or task_id
     messages = task_store.list_messages(task_id, user_id)
@@ -389,7 +445,7 @@ def query_task_run(task_id: str, user_id: str) -> dict[str, Any]:
     # decide whether the agent is still running.
     if last_role == "assistant" and not last_streaming:
         last = messages[-1]
-        existing_events = last.get("tool_events") or []
+        existing_events = list(last.get("tool_events") or [])
         hydrated = False
         if not existing_events:
             tool_events = _resolve_tool_events_for_hydrate(session_id=session_id)
@@ -403,30 +459,33 @@ def query_task_run(task_id: str, user_id: str) -> dict[str, Any]:
                 )
                 if hydrated:
                     last = task_store.list_messages(task_id, user_id)[-1]
-        return {
-            "task_id": task_id,
-            "status": "idle",
-            "content": last.get("content") or "",
-            "images": last.get("images") or [],
-            "error": None,
-            "source": "messages",
-            "hydrated": hydrated,
-        }
+                    existing_events = list(last.get("tool_events") or [])
+        return _run_response(
+            task_id=task_id,
+            status="idle",
+            content=last.get("content") or "",
+            images=last.get("images") or [],
+            source="messages",
+            hydrated=hydrated,
+            tool_events=existing_events,
+        )
 
     # 2) In-process registry (browser refresh while same process still runs)
     reg = run_registry.get(task_id)
     if reg and reg.get("status") == "running":
         draft_content = (last.get("content") or "") if last_streaming and last else ""
         draft_images = list(last.get("images") or []) if last_streaming and last else []
-        return {
-            "task_id": task_id,
-            "status": "running",
-            "content": draft_content,
-            "images": draft_images,
-            "error": None,
-            "source": "registry" if not last_streaming else "messages",
-            "hydrated": False,
-        }
+        live_events = list(reg.get("tool_events") or [])
+        if not live_events and last_streaming and last:
+            live_events = list(last.get("tool_events") or [])
+        return _run_response(
+            task_id=task_id,
+            status="running",
+            content=draft_content,
+            images=draft_images,
+            source="registry" if not last_streaming else "messages",
+            tool_events=live_events,
+        )
 
     if reg and reg.get("status") in ("done", "error"):
         content = (reg.get("content") or "").strip()
@@ -447,78 +506,73 @@ def query_task_run(task_id: str, user_id: str) -> dict[str, Any]:
                 images=images,
                 tool_events=tool_events,
             )
-        return {
-            "task_id": task_id,
-            "status": "error" if error and not (reg.get("content") or "").strip() else "done",
-            "content": content,
-            "images": images,
-            "error": error,
-            "source": "registry",
-            "hydrated": hydrated,
-        }
+            if hydrated:
+                last_msg = task_store.list_messages(task_id, user_id)[-1]
+                tool_events = list(last_msg.get("tool_events") or tool_events)
+        return _run_response(
+            task_id=task_id,
+            status="error"
+            if error and not (reg.get("content") or "").strip()
+            else "done",
+            content=content,
+            images=images,
+            error=error,
+            source="registry",
+            hydrated=hydrated,
+            tool_events=tool_events,
+        )
 
     # Empty conversation
     if not messages:
-        return {
-            "task_id": task_id,
-            "status": "idle",
-            "content": "",
-            "images": [],
-            "error": None,
-            "source": "messages",
-            "hydrated": False,
-        }
+        return _run_response(
+            task_id=task_id,
+            status="idle",
+            source="messages",
+        )
 
     # 3) Checkpoint query (last message is user; recover finished answer)
     cp_messages = _read_checkpoint_messages(session_id)
     if cp_messages is not None:
         classified = _classify_checkpoint_messages(cp_messages)
+        tool_events = list(classified.get("tool_events") or [])
         if classified["status"] == "done" and classified.get("content"):
-            tool_events = classified.get("tool_events") or []
             hydrated = _hydrate_assistant_if_needed(
                 task_id=task_id,
                 user_id=user_id,
                 content=classified["content"],
                 tool_events=tool_events,
             )
-            return {
-                "task_id": task_id,
-                "status": "done",
-                "content": classified["content"],
-                "images": [],
-                "error": None,
-                "source": "checkpoint",
-                "hydrated": hydrated,
-            }
-        return {
-            "task_id": task_id,
-            "status": "pending",
-            "content": "",
-            "images": [],
-            "error": None,
-            "source": "checkpoint",
-            "hydrated": False,
-        }
+            if hydrated:
+                last_msg = task_store.list_messages(task_id, user_id)[-1]
+                tool_events = list(last_msg.get("tool_events") or tool_events)
+            return _run_response(
+                task_id=task_id,
+                status="done",
+                content=classified["content"],
+                source="checkpoint",
+                hydrated=hydrated,
+                tool_events=tool_events,
+            )
+        return _run_response(
+            task_id=task_id,
+            status="pending",
+            source="checkpoint",
+            tool_events=tool_events,
+        )
 
     # Stream died after a draft was saved. Keep that row on screen.
     if last_streaming and last:
-        return {
-            "task_id": task_id,
-            "status": "idle",
-            "content": last.get("content") or "",
-            "images": last.get("images") or [],
-            "error": None,
-            "source": "messages",
-            "hydrated": False,
-        }
+        return _run_response(
+            task_id=task_id,
+            status="idle",
+            content=last.get("content") or "",
+            images=last.get("images") or [],
+            source="messages",
+            tool_events=list(last.get("tool_events") or []),
+        )
 
     # No registry, no checkpoint — waiting / abandoned
-    return {
-        "task_id": task_id,
-        "status": "pending",
-        "content": "",
-        "images": [],
-        "error": None,
-        "source": None,
-        "hydrated": False,
-    }
+    return _run_response(
+        task_id=task_id,
+        status="pending",
+    )
