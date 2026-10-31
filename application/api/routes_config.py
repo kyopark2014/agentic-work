@@ -8,14 +8,23 @@ from pydantic import BaseModel
 
 try:
     from application import utils
-    from application.api.routes_auth import get_optional_user_id, local_auth_bypass_enabled
-    from application.api.routes_admin import is_admin_user, require_admin
+    from application.api.routes_auth import (
+        get_optional_user_id,
+        local_auth_bypass_enabled,
+        require_user_id,
+    )
+    from application.api.routes_admin import is_admin_user
     from application.llm_gateway_models import ui_models_for_gateway_ids
 except ImportError:
     import utils
-    from routes_auth import get_optional_user_id, local_auth_bypass_enabled  # type: ignore
-    from routes_admin import is_admin_user, require_admin  # type: ignore
+    from routes_auth import (  # type: ignore
+        get_optional_user_id,
+        local_auth_bypass_enabled,
+        require_user_id,
+    )
+    from routes_admin import is_admin_user  # type: ignore
     from llm_gateway_models import ui_models_for_gateway_ids  # type: ignore
+
 
 logger = logging.getLogger("routes_config")
 
@@ -216,7 +225,9 @@ def get_config(request: Request):
     )
     return {
         **public,
-        "is_admin": is_admin_user(session_user),
+        "is_admin": is_admin_user(session_user)
+        or local_auth_bypass_enabled(request),
+
         "skills": skill_options,
         "mcp_servers": mcp_options,
         "models": MODELS,
@@ -230,8 +241,8 @@ def get_config(request: Request):
 
 
 @router.get("/llm-gateway")
-def get_llm_gateway(_admin: str = Depends(require_admin)):
-    """Admin-only. Never returns the secret key to the browser."""
+def get_llm_gateway(_user_id: str = Depends(require_user_id)):
+    """Any logged-in user. Never returns the secret key to the browser."""
     url, key = _llm_gateway_from_config()
     return {
         "url": url,
@@ -243,13 +254,14 @@ def get_llm_gateway(_admin: str = Depends(require_admin)):
 @router.post("/llm-gateway/verify")
 def verify_llm_gateway(
     body: LlmGatewaySettings | None = None,
-    _admin: str = Depends(require_admin),
+    _user_id: str = Depends(require_user_id),
 ):
-    """Admin-only. Probe LiteLLM /v1/models; save on success.
+    """Any logged-in user. Probe gateway /v1/models; save on success.
 
     Empty ``key`` in the body keeps the existing stored / env key.
     The key is never included in the response.
     """
+
     stored_url, stored_key = _llm_gateway_from_config()
     if body is not None:
         url = (body.url or "").strip().rstrip("/") or stored_url

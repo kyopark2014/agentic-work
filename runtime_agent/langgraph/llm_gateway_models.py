@@ -16,7 +16,7 @@ LLM_GATEWAY_MODEL_MAP: dict[str, str] = {
     "Claude 4.7 Opus": "claude-opus-4-7",
     "Claude 4.6 Opus": "claude-opus-4-6",
     "Claude 4.5 Opus": "claude-opus-4-5",
-    "Claude 4.5 Haiku": "claude-haiku-4-5",
+    "Claude 4.5 Haiku": "claude-haiku-4-5-20251001",
     "OpenAI GPT 5.5": "gpt-5.5",
     "OpenAI GPT 5.4": "gpt-5.4",
     "OpenAI GPT 6 Astra": "gpt-6-astra",

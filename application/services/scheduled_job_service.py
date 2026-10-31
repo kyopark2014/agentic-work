@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 from application import schedule_store
 from application import task_store
+from application.run_state import summarize_tool_events
 from application.services.chat_stream_service import ChatStreamService
 from application.task_store_persistence import flush_persist
 
@@ -97,7 +98,20 @@ def run_scheduled_job(job_id: str) -> dict[str, Any]:
         )
         schedule_store.mark_run(job_id, status="error", error=str(error)[:500])
         flush_persist(user_id)
-        return {"ok": False, "status": "error", "error": error}
+        summary = summarize_tool_events(events)
+        logger.warning(
+            "Scheduled job %s error for task %s tool_summary=%s error=%s",
+            job_id,
+            task_id,
+            summary,
+            error,
+        )
+        return {
+            "ok": False,
+            "status": "error",
+            "error": error,
+            "tool_summary": summary,
+        }
 
     content, images, tool_events = service._build_final_payload(
         result_holder=result_holder,
@@ -114,8 +128,20 @@ def run_scheduled_job(job_id: str) -> dict[str, Any]:
     )
     flush_persist(user_id)
     schedule_store.mark_run(job_id, status="ok")
-    logger.info("Scheduled job %s completed for task %s", job_id, task_id)
-    return {"ok": True, "status": "ok", "job_id": job_id, "task_id": task_id}
+    summary = summarize_tool_events(tool_events)
+    logger.info(
+        "Scheduled job %s completed for task %s tool_summary=%s",
+        job_id,
+        task_id,
+        summary,
+    )
+    return {
+        "ok": True,
+        "status": "ok",
+        "job_id": job_id,
+        "task_id": task_id,
+        "tool_summary": summary,
+    }
 
 
 def start_scheduled_job_async(job_id: str) -> None:

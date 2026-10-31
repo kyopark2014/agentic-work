@@ -6,32 +6,24 @@ interface Props {
   enabled: boolean;
   isAdmin: boolean;
   gatewayConfigured: boolean;
-  onConfirmEnable: (uiModels?: string[]) => Promise<void> | void;
-  onDisable: () => Promise<void> | void;
+  /** URL/Key 검증·저장 후 호출 (태스크 On/Off는 사이드바 체크박스). */
+  onSaved: (uiModels?: string[]) => Promise<void> | void;
   onClose: () => void;
 }
 
 export function LlmGatewayModal({
-  enabled,
-  isAdmin,
-  gatewayConfigured,
-  onConfirmEnable,
-  onDisable,
+  onSaved,
   onClose,
 }: Props) {
   const [url, setUrl] = useState("");
   const [key, setKey] = useState("");
   const [keyConfigured, setKeyConfigured] = useState(false);
-  const [loading, setLoading] = useState(isAdmin);
+  const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!isAdmin) {
-      setLoading(false);
-      return;
-    }
     let cancelled = false;
     (async () => {
       setLoading(true);
@@ -41,12 +33,15 @@ export function LlmGatewayModal({
         if (!cancelled) {
           setUrl(data.url || "");
           setKeyConfigured(Boolean(data.key_configured || data.configured));
-          // Never prefill the secret; empty means keep existing.
           setKey("");
         }
       } catch (err) {
         if (!cancelled) {
-          setError(err instanceof Error ? err.message : String(err));
+          // 조회 실패해도 URL/Key 입력 폼은 유지 (신규 설정)
+          const msg = err instanceof Error ? err.message : String(err);
+          if (!/403|admin|forbidden/i.test(msg)) {
+            setError(msg);
+          }
         }
       } finally {
         if (!cancelled) setLoading(false);
@@ -55,7 +50,7 @@ export function LlmGatewayModal({
     return () => {
       cancelled = true;
     };
-  }, [isAdmin]);
+  }, []);
 
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
@@ -68,24 +63,6 @@ export function LlmGatewayModal({
   async function handleConfirm() {
     setError(null);
     setSuccess(null);
-
-    if (!isAdmin) {
-      setBusy(true);
-      setError(null);
-      try {
-        if (!gatewayConfigured) {
-          setError("관리자가 LLM Gateway를 먼저 설정해야 합니다.");
-          return;
-        }
-        await onConfirmEnable();
-        onClose();
-      } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
-      } finally {
-        setBusy(false);
-      }
-      return;
-    }
 
     const nextUrl = url.trim();
     const nextKey = key.trim();
@@ -108,10 +85,13 @@ export function LlmGatewayModal({
         setError(result.message || "LLM Gateway 모델 확인에 실패했습니다.");
         return;
       }
-      setSuccess(result.message || "모델 확인 성공");
+      setSuccess(
+        result.message ||
+          "저장되었습니다. Settings의 LLM Gateway 체크박스로 이 태스크에서 켜세요.",
+      );
       setKeyConfigured(true);
       setKey("");
-      await onConfirmEnable(result.ui_models);
+      await onSaved(result.ui_models);
       onClose();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -119,25 +99,6 @@ export function LlmGatewayModal({
       setBusy(false);
     }
   }
-
-  async function handleDisable() {
-    setBusy(true);
-    setError(null);
-    try {
-      await onDisable();
-      onClose();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  const description = isAdmin
-    ? "URL을 확인하고, Key는 변경할 때만 입력하세요(비우면 기존 키 유지). 모델 목록 조회에 성공하면 저장·활성화합니다."
-    : gatewayConfigured
-      ? "이 태스크에서 LLM Gateway 사용을 켜거나 끕니다. 공용 API 키는 서버에만 보관됩니다."
-      : "LLM Gateway가 아직 설정되지 않았습니다. 관리자에게 설정을 요청하세요.";
 
   return createPortal(
     <div
@@ -152,58 +113,50 @@ export function LlmGatewayModal({
       <div className="modal llm-gateway-modal">
         <h2 id="llm-gateway-title">LLM Gateway</h2>
         <p>
-          {description}
-          {enabled ? " (현재 사용 중)" : ""}
+          URL을 확인하고, Key는 변경할 때만 입력하세요(비우면 기존 키 유지).
+          모델 목록 조회에 성공하면 저장합니다. 이 태스크에서 쓰려면 Settings의
+          LLM Gateway 체크박스를 켜세요.
         </p>
 
-        {isAdmin &&
-          (loading ? (
-            <p className="llm-gateway-muted">설정 불러오는 중…</p>
-          ) : (
-            <form
-              className="llm-gateway-fields"
-              onSubmit={(e) => {
-                e.preventDefault();
-                if (!busy && !loading) void handleConfirm();
-              }}
-            >
-              <label className="llm-gateway-field">
-                <span>URL</span>
-                <input
-                  type="text"
-                  value={url}
-                  disabled={busy}
-                  autoComplete="off"
-                  placeholder="https://gateway.example.com"
-                  onChange={(e) => setUrl(e.target.value)}
-                />
-              </label>
-              <label className="llm-gateway-field">
-                <span>
-                  Key
-                  {keyConfigured ? " (저장된 키 있음 — 변경 시에만 입력)" : ""}
-                </span>
-                <input
-                  type="password"
-                  value={key}
-                  disabled={busy}
-                  autoComplete="new-password"
-                  placeholder={
-                    keyConfigured ? "비워두면 기존 키 유지" : "sk-..."
-                  }
-                  onChange={(e) => setKey(e.target.value)}
-                />
-              </label>
-              <button type="submit" hidden aria-hidden="true" tabIndex={-1} />
-            </form>
-          ))}
-
-        {!isAdmin && (
-          <p className="llm-gateway-muted">
-            {gatewayConfigured
-              ? "서버에 Gateway가 구성되어 있습니다."
-              : "Gateway 미구성 — 활성화할 수 없습니다."}
-          </p>
+        {loading ? (
+          <p className="llm-gateway-muted">설정 불러오는 중…</p>
+        ) : (
+          <form
+            className="llm-gateway-fields"
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (!busy && !loading) void handleConfirm();
+            }}
+          >
+            <label className="llm-gateway-field">
+              <span>URL</span>
+              <input
+                type="text"
+                value={url}
+                disabled={busy}
+                autoComplete="off"
+                placeholder="https://gateway.example.com"
+                onChange={(e) => setUrl(e.target.value)}
+              />
+            </label>
+            <label className="llm-gateway-field">
+              <span>
+                Key
+                {keyConfigured ? " (저장된 키 있음 — 변경 시에만 입력)" : ""}
+              </span>
+              <input
+                type="password"
+                value={key}
+                disabled={busy}
+                autoComplete="new-password"
+                placeholder={
+                  keyConfigured ? "비워두면 기존 키 유지" : "vk-..."
+                }
+                onChange={(e) => setKey(e.target.value)}
+              />
+            </label>
+            <button type="submit" hidden aria-hidden="true" tabIndex={-1} />
+          </form>
         )}
 
         {error && (
@@ -222,25 +175,13 @@ export function LlmGatewayModal({
           >
             취소
           </button>
-          {enabled && (
-            <button
-              type="button"
-              className="modal-btn-secondary"
-              disabled={busy || loading}
-              onClick={handleDisable}
-            >
-              끄기
-            </button>
-          )}
           <button
             type="button"
             className="send-btn"
-            disabled={
-              busy || loading || (!isAdmin && !gatewayConfigured && !enabled)
-            }
+            disabled={busy || loading}
             onClick={handleConfirm}
           >
-            {busy ? "확인 중…" : isAdmin ? "확인" : "켜기"}
+            {busy ? "확인 중…" : "확인"}
           </button>
         </div>
       </div>

@@ -8,9 +8,21 @@ description: ob-note(Obsidian형 vault)에 저장된 마크다운 노트를 조�
 standalone **ob-note** (`https://vault.my-agentic-ai.click`) vault를 API로 읽고 씁니다.  
 노트는 `.md`가 Source of Truth입니다. 임의 HTTP를 새로 짜지 말고 아래 스크립트를 실행하세요.
 
-계정(`USER_ID` / email / `ACTOR_ID`)마다 vault가 `vault/{userId}/…`로 분리됩니다.  
+계정(`USER_ID` / email / `ACTOR_ID`)마다 vault가 `{userId}/vault/…`로 분리됩니다.  
 스크립트가 보내는 userId의 vault만 보이며, 노트 경로는 항상 **그 계정 vault 기준 상대경로**입니다
 (예: `Meeting/Note.md` — path에 email을 넣지 마세요).
+
+### 접속 계정 (필수)
+
+이 Cursor 스킬 설치의 **기본 vault 소유자**는 다음입니다.
+
+```text
+kyopark2014@gmail.com
+```
+
+- `config.json`의 `user_id`에 고정되어 있으며, env/`--user-id`가 없을 때 이 값으로 접속합니다.
+- Agent는 vault 조회·쓰기 시 **반드시** 이 계정을 사용하세요. `local-dev`로 떨어지지 않게 하세요.
+- 다른 계정이 필요하면 사용자가 명시한 경우에만 `--user-id` / `USER_ID`로 덮어씁니다.
 
 ## When to Use
 
@@ -46,6 +58,17 @@ standalone **ob-note** (`https://vault.my-agentic-ai.click`) vault를 API로 읽
 7. **새 노트는 vault 루트에 두지 마세요.** 주제 폴더 아래(`Category/Note.md`)에만 저장합니다.
 8. **결과는 가능한 하나의 마크다운에 모으세요.** 같은 주제 산출물을 작은 `.md` 여러 개로 쪼개지 마세요. 분량이 많으면 제목 아래 **목차(TOC)** 를 넣으세요.
 9. **이미지는 CloudFront/외부 URL을 그대로 넣지 마세요.** `/artifacts/*` 는 signed cookie가 필요해 vault에서 깨집니다. 노트 작성 시 `--embed-images`로 같은 폴더에 업로드하고 **상대경로**로 링크하세요. (아래 [Images](#images))
+10. **한국어 문체(합니다체)**: vault에 쓰는 노트 본문은 항상 **합니다체(존댓말)** 로 작성하세요. 한다체·이다체·다 종결을 쓰지 마세요.
+
+| 금지 (한다체) | 사용 (합니다체) |
+| --- | --- |
+| 맞다 / ~이다 / ~다 | 맞습니다 / ~입니다 |
+| 추가한다 / 설정한다 | 추가합니다 / 설정합니다 |
+| 상태이다 / 필요하다 | 상태입니다 / 필요합니다 |
+| ~할 수 있다 / ~된다 | ~할 수 있습니다 / ~됩니다 |
+| ~한다. / ~이다. | ~합니다. / ~입니다. |
+
+제목·표 헤더·코드 블록·고유명사는 예외입니다. 서술 문장·결론·권고는 반드시 합니다체로 끝내세요.
 
 ```markdown
 # Claude Tag
@@ -261,11 +284,11 @@ API는 ob-note 사이트 루트의 `/api/...` 입니다.
 | 변수 | 기본 | 설명 |
 | --- | --- | --- |
 | `OB_DOCS_URL` / `VAULT_API_URL` | `https://vault.my-agentic-ai.click` | vault base URL (cde-pilot `SHARING_URL` 사용 금지) |
-| `USER_ID` / `ACTOR_ID` | (세션) | vault 소유자 — **프로덕션에서는 로그인 email** |
+| `USER_ID` / `ACTOR_ID` | `config.json` → **`kyopark2014@gmail.com`** | vault 소유자 email. env 미설정 시 config `user_id` 사용 |
 | `VAULT_AGENT_TOKEN` | Secrets Manager `{project}/vault-agent-token` 또는 `ob-note/vault-agent-token` (legacy `ob-docs/…`) | Agent HMAC |
 | `OB_DOCS_VAULT_AGENT_SECRET` | (없음) | 토큰 시크릿 이름 강제 지정 |
 
-`skills/my-vaults/config.json`의 `ob_docs_url` / `project_name`이 env 미설정 시 fallback입니다.
+`skills/my-vaults/config.json`의 `ob_docs_url` / `project_name` / **`user_id`(`kyopark2014@gmail.com`)** 이 env 미설정 시 fallback입니다.
 
 ## Note deep links
 

@@ -694,12 +694,15 @@ def _build_llm_gateway_chat(profile: dict, max_output_tokens: int):
         )
 
     if model_kind == "claude":
-        # Do not pass temperature: newer Claude models reject it via LiteLLM.
+        # Gateway auth expects Authorization: Bearer (VK). Anthropic SDK alone
+        # only sends x-api-key, which the gateway ignores → 401.
+        # Do not pass temperature: newer Claude models reject it via gateway.
         return ChatAnthropic(
             model=gw_model,
             api_key=gateway_key,
             base_url=gateway_url,
             max_tokens=max_output_tokens,
+            default_headers={"Authorization": f"Bearer {gateway_key}"},
         )
 
     logger.warning(

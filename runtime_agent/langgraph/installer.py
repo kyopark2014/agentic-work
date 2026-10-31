@@ -1048,6 +1048,78 @@ def create_bedrock_agentcore_storage_policy(config):
         policy_document,
         f"S3/S3 Files and deny rules for AgentCore Runtime ({project_name})",
     )
+def create_bedrock_agentcore_ops_readonly_policy(config):
+    """Read-only AWS access for the qa-adviser skill (ECS / ELB / Logs / CloudFront).
+
+    Separate managed policy so the core and storage policies stay under the
+    6144-byte PolicySize quota. Read/describe only: no mutating actions.
+    Secrets remain blocked by the explicit Deny in the storage policy.
+    """
+    account_id = config["accountId"]
+    project_name = config.get("projectName", "agentcore")
+
+    policy_document = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "QaAdviserEcsRead",
+                "Effect": "Allow",
+                "Action": [
+                    "ecs:DescribeClusters",
+                    "ecs:DescribeServices",
+                    "ecs:DescribeTasks",
+                    "ecs:DescribeTaskDefinition",
+                    "ecs:ListClusters",
+                    "ecs:ListServices",
+                    "ecs:ListTasks",
+                ],
+                "Resource": "*",
+            },
+            {
+                "Sid": "QaAdviserElbRead",
+                "Effect": "Allow",
+                "Action": [
+                    "elasticloadbalancing:DescribeLoadBalancers",
+                    "elasticloadbalancing:DescribeTargetGroups",
+                    "elasticloadbalancing:DescribeTargetHealth",
+                    "elasticloadbalancing:DescribeListeners",
+                ],
+                "Resource": "*",
+            },
+            {
+                "Sid": "QaAdviserLogsRead",
+                "Effect": "Allow",
+                "Action": [
+                    "logs:DescribeLogGroups",
+                    "logs:DescribeLogStreams",
+                    "logs:FilterLogEvents",
+                    "logs:GetLogEvents",
+                    "logs:StartLiveTail",
+                ],
+                "Resource": "*",
+            },
+            {
+                "Sid": "QaAdviserDeployInfoRead",
+                "Effect": "Allow",
+                "Action": [
+                    "cloudfront:GetDistribution",
+                    "cloudfront:ListDistributions",
+                    "ecr:DescribeRepositories",
+                    "ecr:DescribeImages",
+                    "ecr:ListImages",
+                ],
+                "Resource": "*",
+            },
+        ],
+    }
+    return _upsert_managed_policy(
+        account_id,
+        f"AmazonBedrockAgentCoreRuntimeOpsReadFor{project_name}",
+        policy_document,
+        f"Read-only ECS/ELB/Logs/CloudFront for qa-adviser ({project_name})",
+    )
+
+
 def attach_policy_to_role(role_name, policy_arn):
     """Attach policy to IAM role"""
     try:
@@ -1119,10 +1191,15 @@ def create_bedrock_agentcore_role(config):
     if not storage_policy_arn:
         print("Role creation aborted due to storage policy creation failure")
         return None
-    
+
+    ops_policy_arn = create_bedrock_agentcore_ops_readonly_policy(config)
+    if not ops_policy_arn:
+        print("Role creation aborted due to ops read-only policy creation failure")
+        return None
+
     try:
         iam_client = boto3.client('iam')
-        
+
         # Check if role already exists
         try:
             existing_role = iam_client.get_role(RoleName=role_name)
@@ -1139,7 +1216,8 @@ def create_bedrock_agentcore_role(config):
             # Attach policies (core + storage split for PolicySize quota)
             attach_policy_to_role(role_name, policy_arn)
             attach_policy_to_role(role_name, storage_policy_arn)
-            
+            attach_policy_to_role(role_name, ops_policy_arn)
+
             return existing_role['Role']['Arn']
             
         except iam_client.exceptions.NoSuchEntityException:
@@ -1155,7 +1233,8 @@ def create_bedrock_agentcore_role(config):
             
             attach_policy_to_role(role_name, policy_arn)
             attach_policy_to_role(role_name, storage_policy_arn)
-            
+            attach_policy_to_role(role_name, ops_policy_arn)
+
             return response['Role']['Arn']
             
     except Exception as e:

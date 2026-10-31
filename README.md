@@ -799,7 +799,7 @@ runtime_agent/langgraph/
 
 **MCP 목록 (`mcp.list`)**: knowledge base, aws documentation, trade info, websearch, web_fetch, image generation, tavily, notion, aws-drawio, memory
 
-**Skill 목록 (`skills.list`)**: docx, pdf, pptx, xlsx, skill-creator, seoul-subway, korea-weather, my-schedule, my-vaults, myslide, …
+**Skill 목록 (`skills.list`)**: docx, pdf, pptx, xlsx, skill-creator, seoul-subway, korea-weather, my-schedule, my-vaults, myslide, qa-adviser, …
 
 > OpenAI GPT 5.4/5.5는 Bedrock Mantle Responses API(`mantle_api: "responses"`)를 사용합니다. Runtime IAM 정책(`installer.py`의 `BedrockMantleAccess`)에 모델이 호출하는 Mantle 리전(예: `us-east-2`)이 포함되어야 합니다.
 

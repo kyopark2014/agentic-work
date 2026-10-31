@@ -6,7 +6,7 @@ import os
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from application.api.routes_auth import require_user_id
+from application.api.routes_auth import local_auth_bypass_enabled, require_user_id
 from application import task_store, utils
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -37,9 +37,12 @@ def is_admin_user(user_id: str) -> bool:
 
 def require_admin(request: Request) -> str:
     user_id = require_user_id(request)
-    if not is_admin_user(user_id):
-        raise HTTPException(status_code=403, detail="Admin access required")
-    return user_id
+    # Local bypass (./run_local.sh / localhost): allow gateway·admin APIs without
+    # forcing the local id into ADMIN_EMAILS.
+    if is_admin_user(user_id) or local_auth_bypass_enabled(request):
+        return user_id
+    raise HTTPException(status_code=403, detail="Admin access required")
+
 
 
 @router.get("/dashboard")

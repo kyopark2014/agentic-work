@@ -197,14 +197,24 @@ def attach_note_urls(payload: Any) -> Any:
 
 
 def resolve_user_id(cli_user_id: Optional[str] = None) -> str:
+    """Resolve vault owner email / userId.
+
+    Priority: CLI ``--user-id`` → env (USER_ID / CURRENT_USER_ID / AGENT_USER_ID /
+    ACTOR_ID) → ``config.json`` ``user_id`` → ``local-dev``.
+
+    This Cursor skill install defaults ``config.json`` ``user_id`` to
+    ``kyopark2014@gmail.com`` so agents do not accidentally write to ``local-dev``.
+    """
+    skill_cfg = load_skill_config()
     for candidate in (
         cli_user_id,
         os.environ.get("USER_ID"),
         os.environ.get("CURRENT_USER_ID"),
         os.environ.get("AGENT_USER_ID"),
         os.environ.get("ACTOR_ID"),
+        skill_cfg.get("user_id"),
     ):
-        value = (candidate or "").strip()
+        value = (candidate or "").strip() if isinstance(candidate, str) or candidate is None else str(candidate).strip()
         if value:
             return value
     return "local-dev"

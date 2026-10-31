@@ -18,7 +18,7 @@ DEFAULT_OUT = HERE / "out"
 # Extract artifacts (graph.json, cache/) and published HTML share out/.
 DEFAULT_GRAPHIFY_OUT = DEFAULT_OUT
 DEFAULT_APP_CONFIG = AGENTIC_WORK / "application" / "config.json"
-DEFAULT_LLM_MODEL = "claude-haiku-4-5"
+DEFAULT_LLM_MODEL = "claude-haiku-4-5-20251001"
 
 
 def load_env() -> None:

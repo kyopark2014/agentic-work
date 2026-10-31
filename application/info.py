@@ -147,17 +147,17 @@ claude_5_5_opus_models = [   # Opus 5.5
     {
         "bedrock_region": "us-west-2", # Oregon
         "model_type": "claude",
-        "model_id": "us.anthropic.claude-opus-5-5"
+        "model_id": "global.anthropic.claude-opus-5-5"
     },
     {
         "bedrock_region": "us-east-1", # N.Virginia
         "model_type": "claude",
-        "model_id": "us.anthropic.claude-opus-5-5"
+        "model_id": "global.anthropic.claude-opus-5-5"
     },
     {
         "bedrock_region": "us-east-2", # Ohio
         "model_type": "claude",
-        "model_id": "us.anthropic.claude-opus-5-5"
+        "model_id": "global.anthropic.claude-opus-5-5"
     }
 ]
 

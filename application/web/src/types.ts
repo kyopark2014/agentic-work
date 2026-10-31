@@ -140,6 +140,14 @@ export type TaskRunStatus =
   | "error"
   | "missing";
 
+export interface ToolSummary {
+  total: number;
+  tool_count: number;
+  result_count: number;
+  text_count: number;
+  by_tool: Record<string, number>;
+}
+
 export interface TaskRun {
   task_id: string;
   status: TaskRunStatus;
@@ -148,4 +156,6 @@ export interface TaskRun {
   error?: string | null;
   source?: "messages" | "registry" | "checkpoint" | null;
   hydrated: boolean;
+  tool_events?: ToolEvent[];
+  tool_summary?: ToolSummary;
 }

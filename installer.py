@@ -68,6 +68,14 @@ SCHEDULER_INVOKE_ROLE_NAME = f"role-scheduler-invoke-for-{project_name}-{region}
 SCHEDULE_GROUP_NAME = f"schedule-group-{project_name}"
 # RSA private key + CloudFront public key / key group ids for signed cookies.
 CLOUDFRONT_SIGNING_KEY_SECRET_NAME = f"{project_name}/cloudfront-signing-key"
+# Account-wide CloudFront keys. ECS stacks share ecs-signing-key;
+# runtime stacks share runtime-signing-key. Do not create per-project keys.
+SHARED_ECS_SIGNING_KEY_NAME = "ecs-signing-key"
+SHARED_RUNTIME_SIGNING_KEY_NAME = "runtime-signing-key"
+SHARED_CLOUDFRONT_SIGNING_KEY_NAMES = (
+    SHARED_ECS_SIGNING_KEY_NAME,
+    SHARED_RUNTIME_SIGNING_KEY_NAME,
+)
 # Shared LLM Gateway fallback key (stripped from APP_CONFIG_JSON; ECS secrets inject).
 LLM_GATEWAY_KEY_SECRET_NAME = f"{project_name}/llm-gateway-key"
 CLOUDFRONT_S3_SIGNED_PATHS = ("/images/*", "/docs/*", "/artifacts/*", "/*/artifacts/*")
@@ -640,94 +648,80 @@ def _find_cloudfront_key_group_id(name: str) -> Optional[str]:
         marker = listing.get("NextMarker")
 
 
-def get_or_create_cloudfront_signing_material(*, rotate: bool = False) -> Dict[str, str]:
-    """
-    Ensure CloudFront RSA signing material exists.
+def _pem_body(pem: str) -> str:
+    """Compare PEM material without header, footer, or line-ending differences."""
+    lines = []
+    for line in (pem or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = line.strip()
+        if not line or line.startswith("-----"):
+            continue
+        lines.append(line)
+    return "".join(lines)
 
-    Stores private PEM + public_key_id + key_group_id in Secrets Manager.
-    Creates CloudFront PublicKey + KeyGroup when missing.
-    """
-    secret_name = CLOUDFRONT_SIGNING_KEY_SECRET_NAME
-    public_key_name = f"{project_name}-signing-key"
-    key_group_name = f"{project_name}-signing-key-group"
 
-    material: Dict[str, str] = {}
+def _sync_cloudfront_public_key(
+    public_key_id: str, public_pem: str, public_key_name: str
+) -> str:
+    """Return a CloudFront public key ID whose material matches ``public_pem``.
+
+    Encoded key material cannot be changed after creation. When the stored private
+    key no longer matches the uploaded public key, publish a new public key and
+    return its ID so the key group and secret stop signing with the stale ID.
+    """
+    current = cloudfront_client.get_public_key(Id=public_key_id)
+    config = current["PublicKey"]["PublicKeyConfig"]
+    if _pem_body(config.get("EncodedKey") or "") == _pem_body(public_pem):
+        logger.info(f"  ✓ Reusing CloudFront public key: {public_key_id}")
+        return public_key_id
+    encoded = public_pem if public_pem.endswith("\n") else public_pem + "\n"
+    response = cloudfront_client.create_public_key(
+        PublicKeyConfig={
+            "CallerReference": f"{project_name}-cf-pk-{int(time.time())}",
+            "Name": f"{public_key_name}-{int(time.time())}",
+            "EncodedKey": encoded,
+            "Comment": f"Signed cookies public key for {project_name}",
+        }
+    )
+    new_id = response["PublicKey"]["Id"]
+    logger.info(
+        f"  ✓ Created CloudFront public key {new_id} "
+        f"(existing {public_key_id} material is immutable and does not match)"
+    )
+    return new_id
+
+
+def _shared_cloudfront_signing_secret_name(key_name: str) -> str:
+    return f"shared/cloudfront/{key_name}"
+
+
+def _read_signing_secret(secret_name: str) -> Dict[str, str]:
     try:
         existing = secretsmanager_client.get_secret_value(SecretId=secret_name)
-        raw = (existing.get("SecretString") or "").strip()
-        if raw.startswith("{"):
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                material = {
-                    "private_key_pem": (parsed.get("private_key_pem") or "").strip(),
-                    "public_key_pem": (parsed.get("public_key_pem") or "").strip(),
-                    "public_key_id": (parsed.get("public_key_id") or "").strip(),
-                    "key_group_id": (parsed.get("key_group_id") or "").strip(),
-                }
     except ClientError as e:
-        if e.response["Error"]["Code"] != "ResourceNotFoundException":
-            raise
+        if e.response["Error"]["Code"] == "ResourceNotFoundException":
+            return {}
+        raise
+    raw = (existing.get("SecretString") or "").strip()
+    if not raw.startswith("{"):
+        return {}
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        return {}
+    return {
+        "private_key_pem": (parsed.get("private_key_pem") or "").strip(),
+        "public_key_pem": (parsed.get("public_key_pem") or "").strip(),
+        "public_key_id": (parsed.get("public_key_id") or "").strip(),
+        "key_group_id": (parsed.get("key_group_id") or "").strip(),
+    }
 
-    if rotate or not material.get("private_key_pem") or not material.get("public_key_pem"):
-        private_pem, public_pem = _generate_cloudfront_rsa_keypair()
-        material["private_key_pem"] = private_pem
-        material["public_key_pem"] = public_pem
-        material["public_key_id"] = ""
-        material["key_group_id"] = ""
-        logger.info("  Generated new CloudFront RSA signing key pair")
 
-    public_key_id = material.get("public_key_id") or ""
-    if not public_key_id:
-        public_key_id = _find_cloudfront_public_key_id(public_key_name) or ""
-    if not public_key_id:
-        response = cloudfront_client.create_public_key(
-            PublicKeyConfig={
-                "CallerReference": f"{project_name}-cf-pk-{int(time.time())}",
-                "Name": public_key_name,
-                "EncodedKey": material["public_key_pem"],
-                "Comment": f"Signed cookies public key for {project_name}",
-            }
-        )
-        public_key_id = response["PublicKey"]["Id"]
-        logger.info(f"  ✓ Created CloudFront public key: {public_key_id}")
-    else:
-        logger.info(f"  ✓ Reusing CloudFront public key: {public_key_id}")
-    material["public_key_id"] = public_key_id
-
-    key_group_id = material.get("key_group_id") or ""
-    if not key_group_id:
-        key_group_id = _find_cloudfront_key_group_id(key_group_name) or ""
-    if not key_group_id:
-        response = cloudfront_client.create_key_group(
-            KeyGroupConfig={
-                "Name": key_group_name,
-                "Items": [public_key_id],
-                "Comment": f"Signed cookies key group for {project_name}",
-            }
-        )
-        key_group_id = response["KeyGroup"]["Id"]
-        logger.info(f"  ✓ Created CloudFront key group: {key_group_id}")
-    else:
-        # Ensure the key group still references our public key.
-        try:
-            kg = cloudfront_client.get_key_group(Id=key_group_id)
-            etag = kg["ETag"]
-            config = kg["KeyGroup"]["KeyGroupConfig"]
-            items = list(config.get("Items") or [])
-            if public_key_id not in items:
-                config["Items"] = [public_key_id]
-                cloudfront_client.update_key_group(
-                    Id=key_group_id,
-                    KeyGroupConfig=config,
-                    IfMatch=etag,
-                )
-                logger.info(f"  ✓ Updated CloudFront key group items: {key_group_id}")
-            else:
-                logger.info(f"  ✓ Reusing CloudFront key group: {key_group_id}")
-        except ClientError as e:
-            logger.warning(f"  Could not verify key group {key_group_id}: {e}")
-    material["key_group_id"] = key_group_id
-
+def _write_signing_secret(
+    secret_name: str,
+    material: Dict[str, str],
+    *,
+    description: str,
+    tags: List[Dict[str, str]],
+) -> None:
     secret_body = json.dumps(
         {
             "private_key_pem": material["private_key_pem"],
@@ -747,15 +741,134 @@ def get_or_create_cloudfront_signing_material(*, rotate: bool = False) -> Dict[s
             raise
         secretsmanager_client.create_secret(
             Name=secret_name,
-            Description=f"CloudFront signed-cookie RSA key material for {project_name}",
+            Description=description,
             SecretString=secret_body,
-            Tags=[
-                {"Key": "Name", "Value": secret_name},
-                {"Key": "Project", "Value": project_name},
-            ],
+            Tags=tags,
         )
         logger.info(f"  ✓ Created CloudFront signing secret: {secret_name}")
 
+
+def _ensure_shared_cloudfront_signing_key(key_name: str) -> Dict[str, str]:
+    """Get or create one account-wide CloudFront public key and key group."""
+    secret_name = _shared_cloudfront_signing_secret_name(key_name)
+    key_group_name = f"{key_name}-group"
+    material = _read_signing_secret(secret_name)
+    public_key_id = _find_cloudfront_public_key_id(key_name) or ""
+
+    if public_key_id and not material.get("private_key_pem"):
+        raise RuntimeError(
+            f"CloudFront public key {key_name} ({public_key_id}) exists but "
+            f"shared secret {secret_name} has no private key. "
+            "Refusing to create a second key pair."
+        )
+
+    if not material.get("private_key_pem") or not material.get("public_key_pem"):
+        private_pem, public_pem = _generate_cloudfront_rsa_keypair()
+        material = {
+            "private_key_pem": private_pem,
+            "public_key_pem": public_pem,
+            "public_key_id": "",
+            "key_group_id": "",
+        }
+        logger.info(f"  Generated shared CloudFront RSA key pair: {key_name}")
+
+    if not public_key_id:
+        response = cloudfront_client.create_public_key(
+            PublicKeyConfig={
+                "CallerReference": f"{key_name}-{int(time.time())}",
+                "Name": key_name,
+                "EncodedKey": material["public_key_pem"],
+                "Comment": f"Shared signed-cookie public key ({key_name})",
+            }
+        )
+        public_key_id = response["PublicKey"]["Id"]
+        logger.info(f"  ✓ Created shared CloudFront public key {key_name}: {public_key_id}")
+    else:
+        logger.info(f"  ✓ Reusing shared CloudFront public key {key_name}: {public_key_id}")
+    material["public_key_id"] = public_key_id
+
+    key_group_id = material.get("key_group_id") or ""
+    if key_group_id:
+        try:
+            cloudfront_client.get_key_group(Id=key_group_id)
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "NoSuchKeyGroup":
+                raise
+            key_group_id = ""
+    if not key_group_id:
+        key_group_id = _find_cloudfront_key_group_id(key_group_name) or ""
+    if not key_group_id:
+        response = cloudfront_client.create_key_group(
+            KeyGroupConfig={
+                "Name": key_group_name,
+                "Items": [public_key_id],
+                "Comment": f"Shared signed-cookie key group ({key_name})",
+            }
+        )
+        key_group_id = response["KeyGroup"]["Id"]
+        logger.info(f"  ✓ Created shared CloudFront key group {key_group_name}: {key_group_id}")
+    else:
+        kg = cloudfront_client.get_key_group(Id=key_group_id)
+        config = kg["KeyGroup"]["KeyGroupConfig"]
+        items = list(config.get("Items") or [])
+        if public_key_id not in items:
+            config["Items"] = [public_key_id]
+            cloudfront_client.update_key_group(
+                Id=key_group_id,
+                KeyGroupConfig=config,
+                IfMatch=kg["ETag"],
+            )
+            logger.info(f"  ✓ Updated shared CloudFront key group {key_group_name}")
+        else:
+            logger.info(f"  ✓ Reusing shared CloudFront key group {key_group_name}: {key_group_id}")
+    material["key_group_id"] = key_group_id
+
+    _write_signing_secret(
+        secret_name,
+        material,
+        description=f"Shared CloudFront signed-cookie key ({key_name})",
+        tags=[
+            {"Key": "Name", "Value": secret_name},
+            {"Key": "SharedCloudFrontSigningKey", "Value": key_name},
+        ],
+    )
+    return material
+
+
+def ensure_shared_cloudfront_signing_keys() -> Dict[str, Dict[str, str]]:
+    """Create ecs-signing-key and runtime-signing-key when they are missing."""
+    return {
+        key_name: _ensure_shared_cloudfront_signing_key(key_name)
+        for key_name in SHARED_CLOUDFRONT_SIGNING_KEY_NAMES
+    }
+
+
+def get_or_create_cloudfront_signing_material(*, rotate: bool = False) -> Dict[str, str]:
+    """Reuse the shared ECS CloudFront key and copy it into this project's secret.
+
+    ``runtime-signing-key`` is created alongside ``ecs-signing-key`` so runtime
+    stacks can share one key. This ECS distribution trusts ``ecs-signing-key``.
+    ``rotate`` is ignored: replacing a shared key would break other stacks.
+    """
+    if rotate:
+        logger.warning(
+            "  Ignoring CloudFront signing key rotation; shared keys are reused"
+        )
+    shared = ensure_shared_cloudfront_signing_keys()
+    material = shared[SHARED_ECS_SIGNING_KEY_NAME]
+    _write_signing_secret(
+        CLOUDFRONT_SIGNING_KEY_SECRET_NAME,
+        material,
+        description=(
+            f"CloudFront signed-cookie key for {project_name} "
+            f"(shared {SHARED_ECS_SIGNING_KEY_NAME})"
+        ),
+        tags=[
+            {"Key": "Name", "Value": CLOUDFRONT_SIGNING_KEY_SECRET_NAME},
+            {"Key": "Project", "Value": project_name},
+            {"Key": "SharedCloudFrontSigningKey", "Value": SHARED_ECS_SIGNING_KEY_NAME},
+        ],
+    )
     return material
 
 
@@ -5586,6 +5699,28 @@ def _list_all_cloudfront_distributions() -> List[Dict]:
     return items
 
 
+def _distribution_aliases(dist: Dict) -> List[str]:
+    aliases = dist.get("Aliases") or {}
+    items = aliases.get("Items") or []
+    return [item.strip() for item in items if isinstance(item, str) and item.strip()]
+
+
+def _viewer_domain(dist: Dict) -> str:
+    """Hostname viewers use. Prefer a custom alias over *.cloudfront.net."""
+    aliases = _distribution_aliases(dist)
+    if aliases:
+        return aliases[0]
+    return (dist.get("DomainName") or "").strip()
+
+
+def _distribution_hostnames(dist: Dict) -> set:
+    names = set(_distribution_aliases(dist))
+    domain = (dist.get("DomainName") or "").strip()
+    if domain:
+        names.add(domain)
+    return names
+
+
 def _find_existing_cloudfront_distribution() -> Optional[Dict]:
     """Find an existing project CloudFront distribution to reuse."""
     comment = _cloudfront_distribution_comment()
@@ -5612,7 +5747,7 @@ def _find_existing_cloudfront_distribution() -> Optional[Dict]:
 
     if preferred_domain:
         for dist in matches:
-            if dist.get("DomainName") == preferred_domain:
+            if preferred_domain in _distribution_hostnames(dist):
                 logger.info(f"  Reusing CloudFront from application/config.json sharing_url: {preferred_domain}")
                 return dist
         logger.warning(
@@ -5629,7 +5764,7 @@ def _reuse_cloudfront_distribution(
 ) -> Dict[str, str]:
     """Reuse an existing CloudFront distribution and ensure required cache behaviors."""
     dist_id = dist["Id"]
-    domain = dist["DomainName"]
+    domain = _viewer_domain(dist)
     logger.info(f"Reusing existing CloudFront distribution: {domain} (Id: {dist_id})")
 
     if not dist.get("Enabled"):
@@ -6399,6 +6534,18 @@ def write_application_config(config_data: Dict, *, merge_existing: bool = True) 
                 for key in preserve_keys
                 if isinstance(existing.get(key), str) and existing.get(key).strip()
             }
+            # A manually attached CloudFront alias should replace the default
+            # *.cloudfront.net sharing_url. Other custom values stay put.
+            existing_sharing = preserved.get("sharing_url") or ""
+            incoming_sharing = (data.get("sharing_url") or "").strip()
+            existing_host = (urlparse(existing_sharing).hostname or "").lower()
+            incoming_host = (urlparse(incoming_sharing).hostname or "").lower()
+            if (
+                existing_host.endswith(".cloudfront.net")
+                and incoming_host
+                and not incoming_host.endswith(".cloudfront.net")
+            ):
+                preserved.pop("sharing_url", None)
             for key in preserve_list_keys:
                 value = existing.get(key)
                 if isinstance(value, list) and value:

@@ -494,10 +494,54 @@ export default function App() {
   }
 
   async function handlePatchTask(taskId: string, patch: Partial<Task>) {
+    const globalFields: Partial<
+      Pick<
+        Task,
+        | "model_name"
+        | "guardrail_enabled"
+        | "memory_enabled"
+        | "llm_gateway_enabled"
+      >
+    > = {};
+    if (patch.model_name !== undefined) {
+      globalFields.model_name = patch.model_name;
+    }
+    if (patch.guardrail_enabled !== undefined) {
+      globalFields.guardrail_enabled = patch.guardrail_enabled;
+    }
+    if (patch.memory_enabled !== undefined) {
+      globalFields.memory_enabled = patch.memory_enabled;
+    }
+    if (patch.llm_gateway_enabled !== undefined) {
+      globalFields.llm_gateway_enabled = patch.llm_gateway_enabled;
+    }
+    const applyGlobal = Object.keys(globalFields).length > 0;
+
+    // Optimistic update: checkbox is controlled by task state, so without this
+    // the UI snaps back to the old value until the PATCH round-trip finishes
+    // (looks like LLM Gateway "didn't stick" when reopening Settings / switching tasks).
+    setTasks((prev) =>
+      sortTasks(
+        prev.map((t) => {
+          if (t.id === taskId) {
+            return { ...t, ...patch, ...(applyGlobal ? globalFields : {}) };
+          }
+          return applyGlobal ? { ...t, ...globalFields } : t;
+        }),
+      ),
+    );
+
     try {
       const updated = await appDataService.patchTask(taskId, patch);
       setTasks((prev) =>
-        sortTasks(prev.map((t) => (t.id === updated.id ? updated : t))),
+        sortTasks(
+          prev.map((t) => {
+            if (t.id === updated.id) {
+              return applyGlobal ? { ...updated, ...globalFields } : updated;
+            }
+            return applyGlobal ? { ...t, ...globalFields } : t;
+          }),
+        ),
       );
       // Keep config defaults in sync with settings.json (server persists on patch).
       if (patch.skills !== undefined || patch.mcp_servers !== undefined) {
@@ -517,6 +561,11 @@ export default function App() {
       }
     } catch (err) {
       uiError("task:patch failed", err);
+      try {
+        await refreshTasks();
+      } catch (refreshErr) {
+        uiError("task:refresh after patch failed", refreshErr);
+      }
       const message =
         err instanceof Error && err.message
           ? err.message

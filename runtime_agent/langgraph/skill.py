@@ -319,6 +319,7 @@ SKILL_SYSTEM_PROMPT = (
     "1. 사용자 입력을 받는다\n"
     "2. 요청에 맞는 skill이 있으면 get_skill_instructions 도구로 상세 지침을 로드한다\n"
     "3. skill 지침에 따라 execute_code, write_file 등의 도구를 사용하여 작업을 수행한다\n"
+    "이미지는 read_file로 읽지 않는다. view_image(filepath, prompt)가 base64 PNG와 prompt로 보고 텍스트를 돌려준다. 이미지를 보려고 upload_file_to_s3를 호출하지 않는다.\n"
     "4. 결과 파일이 있으면 upload_file_to_s3로 업로드하여 URL을 제공한다 "
     "(filepath는 'artifacts/파일명' 또는 ARTIFACTS_DIR 절대경로; "
     "S3 키는 artifacts/{user_id}/... 로 저장된다)\n"

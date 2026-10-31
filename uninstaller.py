@@ -2281,8 +2281,14 @@ def delete_session_signing_key_secret() -> None:
 
 
 def delete_cloudfront_signing_key_secret() -> None:
-    """Delete CloudFront signed-cookie RSA key material from Secrets Manager."""
+    """Delete this project's copy of the CloudFront signing secret.
+
+    Shared keys ``ecs-signing-key`` and ``runtime-signing-key`` stay in place.
+    """
     logger.info("Deleting CloudFront signing key secret")
+    logger.info(
+        "  Keeping shared CloudFront keys ecs-signing-key and runtime-signing-key"
+    )
     secret_name = CLOUDFRONT_SIGNING_KEY_SECRET_NAME
     try:
         secretsmanager_client.delete_secret(

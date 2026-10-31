@@ -36,9 +36,6 @@ import {
 
 type DrawerKind = "skill" | "mcp" | "model" | "appearance" | "wiki" | "knowledge" | "documents" | null;
 
-const LLM_GATEWAY_NOT_CONFIGURED =
-  "LLM Gateway가 설정되어 있지 않아 활성화할 수 없습니다. 관리자에게 설정을 요청하세요.";
-
 const THEME_OPTIONS = ["Light", "Dark"] as const;
 const WIKI_OPTIONS = ["Sync", "Rebuild", "Graph", "Configure"] as const;
 const DOCUMENTS_OPTIONS = ["Projects", "Drawings", "Configure"] as const;
@@ -758,17 +755,47 @@ export function Sidebar({
                   }}
                 />
               </label>
-              <button
-                type="button"
-                className={`sidebar-menu-btn${llmGatewayOpen ? " is-active" : ""}`}
-                disabled={!activeTask}
-                onClick={() => setLlmGatewayOpen(true)}
-              >
-                <LlmGatewayIcon className="sidebar-icon" />
-                <span>
-                  LLM Gateway{llmGatewayEnabled ? " (On)" : ""}
-                </span>
-              </button>
+              <div className="sidebar-menu-btn settings-toggle">
+                <button
+                  type="button"
+                  className="sidebar-llm-gateway-open"
+                  disabled={!activeTask}
+                  title="LLM Gateway URL/Key 설정"
+                  onClick={() => setLlmGatewayOpen(true)}
+                >
+                  <LlmGatewayIcon className="sidebar-icon" />
+                  <span>LLM Gateway</span>
+                </button>
+                <input
+                  type="checkbox"
+                  checked={llmGatewayEnabled}
+                  disabled={
+                    !activeTask ||
+                    (!llmGatewayEnabled &&
+                      !Boolean(config?.llm_gateway_configured))
+                  }
+                  title={
+                    llmGatewayEnabled
+                      ? "이 태스크에서 LLM Gateway 끄기"
+                      : Boolean(config?.llm_gateway_configured)
+                        ? "이 태스크에서 LLM Gateway 켜기"
+                        : "먼저 LLM Gateway 이름으로 설정을 여세요"
+                  }
+                  onChange={(e) => {
+                    if (!activeTask) return;
+                    const next = e.target.checked;
+                    if (next && !Boolean(config?.llm_gateway_configured)) {
+                      e.preventDefault();
+                      setLlmGatewayOpen(true);
+                      return;
+                    }
+                    void onPatchTask(activeTask.id, {
+                      llm_gateway_enabled: next,
+                    });
+                    handleSettingApplied();
+                  }}
+                />
+              </div>
               <button
                 type="button"
                 className={`sidebar-menu-btn${scheduleListOpen ? " is-active" : ""}`}
@@ -901,38 +928,9 @@ export function Sidebar({
           enabled={llmGatewayEnabled}
           isAdmin={Boolean(config?.is_admin)}
           gatewayConfigured={Boolean(config?.llm_gateway_configured)}
-          onConfirmEnable={async (uiModels) => {
-            const refreshed = await onRefreshConfig?.();
-            const configured = Boolean(
-              refreshed && "llm_gateway_configured" in refreshed
-                ? refreshed.llm_gateway_configured
-                : config?.llm_gateway_configured,
-            );
-            if (!configured) {
-              throw new Error(LLM_GATEWAY_NOT_CONFIGURED);
-            }
-            const gatewayList =
-              uiModels && uiModels.length > 0
-                ? uiModels
-                : refreshed && "gateway_models" in refreshed
-                  ? (refreshed.gateway_models ?? [])
-                  : (config?.gateway_models ?? []);
-            const defaultGw =
-              refreshed && "default_gateway_model" in refreshed
-                ? refreshed.default_gateway_model
-                : config?.default_gateway_model;
-            const patch: Partial<Task> = { llm_gateway_enabled: true };
-            if (gatewayList.length > 0 && !gatewayList.includes(modelName)) {
-              patch.model_name =
-                defaultGw && gatewayList.includes(defaultGw)
-                  ? defaultGw
-                  : gatewayList[0];
-            }
-            await onPatchTask(activeTask.id, patch);
+          onSaved={async () => {
+            await onRefreshConfig?.();
           }}
-          onDisable={() =>
-            onPatchTask(activeTask.id, { llm_gateway_enabled: false })
-          }
           onClose={() => {
             setLlmGatewayOpen(false);
             setSettingsExpanded(false);

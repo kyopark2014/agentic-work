@@ -775,6 +775,35 @@ body.is-resizing-sidebar iframe {
   flex-shrink: 0;
 }
 
+.sidebar-llm-gateway-open {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.sidebar-llm-gateway-open:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.sidebar-llm-gateway-open span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .main-panel {
   flex: 1;
   display: flex;

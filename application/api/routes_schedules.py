@@ -111,7 +111,22 @@ def get_schedule(job_id: str, request: Request) -> dict[str, Any]:
     job = schedule_service.get_job_for_user(job_id, user_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    return {"ok": True, "job": _public_job(job)}
+    payload: dict[str, Any] = {"ok": True, "job": _public_job(job)}
+    task_id = str(job.get("task_id") or "").strip()
+    if task_id:
+        from application.run_state import query_task_run
+
+        run = query_task_run(task_id, user_id)
+        if run.get("status") != "missing":
+            payload["run"] = {
+                "task_id": task_id,
+                "status": run.get("status"),
+                "tool_summary": run.get("tool_summary") or {},
+                "tool_events": run.get("tool_events") or [],
+                "content": run.get("content") or "",
+                "error": run.get("error"),
+            }
+    return payload
 
 
 @router.patch("/api/schedules/{job_id}")
