@@ -540,7 +540,28 @@ def uses_adaptive_thinking(model_id: str | None = None) -> bool:
 
 # Content block types that Bedrock Claude/Nova reject on replay (e.g. after
 # OpenAI Responses API turns leave type='reasoning', or signed thinking is gone).
-_BEDROCK_NON_REPLAYABLE_CONTENT_TYPES = frozenset({"thinking", "reasoning"})
+# ``function_call`` is the Responses API's own tool-call block. The same call is already
+# carried in AIMessage.tool_calls, which LangChain re-serialises per provider, so dropping
+# the raw block is lossless — and keeping it makes Bedrock Claude reject the history
+# ("Input tag 'function_call' ... does not match any of the expected tags").
+_BEDROCK_NON_REPLAYABLE_CONTENT_TYPES = frozenset({"thinking", "reasoning", "function_call"})
+
+
+def uses_bedrock_converse_openai() -> bool:
+    """True when the active OpenAI model is served through ChatBedrockConverse.
+
+    That is the non-gateway path of _build_openai_chat for profiles without
+    ``mantle_api == "responses"``. Converse cannot replay the Responses API blocks
+    (``function_call``/``reasoning``) that earlier gateway turns left in the session
+    history, so those must be stripped before the call.
+    """
+    if llm_gateway_enabled or not models:
+        return False
+    profile = models[0]
+    return (
+        profile.get("model_type") == "openai"
+        and profile.get("mantle_api", "chat") != "responses"
+    )
 
 
 def sanitize_adaptive_thinking_messages(messages: list) -> list:
@@ -686,11 +707,21 @@ def _build_llm_gateway_chat(profile: dict, max_output_tokens: int):
     )
 
     if model_kind == "openai":
+        # GPT-6 family (Astra/Sol/Luna) rejects function tools on /v1/chat/completions
+        # ("Function tools with reasoning_effort are not supported ... use /v1/responses"),
+        # so call the Responses API instead.
+        #
+        # The `originator` header is required: awsome-ai-gateway identifies the client from
+        # it and only serves /v1/responses to the `codex` routing profile. Without it the
+        # client is classed "other" and every call fails with
+        # 404 "No Responses backend for this client".
         return ChatOpenAI(
             model=gw_model,
             api_key=gateway_key,
             base_url=f"{gateway_url}/v1",
+            use_responses_api=True,
             max_tokens=max_output_tokens,
+            default_headers={"originator": "codex_cli_rs"},
         )
 
     if model_kind == "claude":
