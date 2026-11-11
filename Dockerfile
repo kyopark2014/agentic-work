@@ -27,6 +27,7 @@ RUN pip install --upgrade "setuptools>=83.0.0" \
     "openai>=2.41.0" \
     aws-bedrock-token-generator \
     requests \
+    beautifulsoup4 \
     "markdown>=3.7"
 
 COPY . .

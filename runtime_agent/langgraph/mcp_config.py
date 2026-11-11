@@ -377,6 +377,18 @@ def load_config(mcp_type):
             }
         }
 
+    elif mcp_type == "weather":
+        return {
+            "mcpServers": {
+                "weather": {
+                    "command": "python",
+                    "args": [
+                        f"{workingDir}/mcp_server_weather.py"
+                    ]
+                }
+            }
+        }
+
 def load_selected_config(mcp_servers: dict):
     logger.info(f"mcp_servers: {mcp_servers}")
     

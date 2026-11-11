@@ -2362,6 +2362,19 @@ def append_tool_guidance_to_prompt(system_prompt: str, mcp_servers: list) -> str
             "경로는 vault 상대경로(예: Meeting/Note.md)이며 YAML frontmatter는 넣지 마세요."
         )
 
+    if "weather" in selected:
+        extras.append(
+            "날씨 조회 시 weather MCP 도구를 우선 사용하세요: "
+            "`get_weather` 또는 `get_short_term_forecast` "
+            "(호환: `get_metropolitan_weather`). "
+            "이 도구들은 기상청 단기예보 종합"
+            "(https://www.weather.go.kr/w/forecast/overall/short-term.do)을 "
+            "지역별로 조회하고 채팅에 인터랙티브 UI(MCP Apps)를 렌더합니다. "
+            "전국/서울/부산/제주/강원 등 권역 예보에는 반드시 위 MCP 도구를 호출하고, "
+            "korea-weather skill/`execute_code`로 대체하지 마세요. "
+            "읍면동 단위 상세 동네예보가 필요할 때만 korea-weather skill을 사용하세요."
+        )
+
     if not extras:
         return system_prompt
 
@@ -2414,6 +2427,9 @@ async def create_agent(
             params["env"] = env
             logger.info(f"{server_name} MCP AGENTCORE_USER_ID={scoped_user_id}")
 
+    import mcp_apps_host
+
+    mcp_apps_host.clear()
     for server_name, params in server_params.items():
         try:
             # One server per adapter so tool names stay unprefixed (MCPConfig
@@ -2421,6 +2437,20 @@ async def create_agent(
             async with MCPAdapter({"mcpServers": {server_name: params}}) as adapter:
                 logger.info(f"MCP client initialized for server: {server_name}")
                 mcp_tools = await adapter.list_tools()
+                try:
+                    n_apps = await mcp_apps_host.cache_apps_from_adapter(
+                        adapter,
+                        mcp_tools,
+                        fallback_server_name=server_name,
+                    )
+                    if n_apps:
+                        logger.info(
+                            f"Cached {n_apps} MCP App UI resource(s) from {server_name}"
+                        )
+                except Exception as app_exc:
+                    logger.warning(
+                        f"MCP Apps cache skipped for {server_name}: {app_exc}"
+                    )
             for tool in wrap_mcp_tools(mcp_tools):
                 logger.info(f"mcp_tool: {tool.name} (from {server_name})")
                 if tool.name not in [t.name for t in tools]:

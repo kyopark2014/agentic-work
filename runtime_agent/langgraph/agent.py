@@ -580,14 +580,23 @@ async def agent_langgraph(payload):
                     payload = yield_tool_args(tool_use_id, tool_name, args_obj)
                     if payload:
                         yield payload
+                import mcp_apps_host
+
+                normalized = mcp_apps_host.normalize_tool_result_text(tool_result_text)
+                mcp_app = mcp_apps_host.build_app_payload(tool_name, normalized)
                 tool_result_payload = {
-                    "toolResult": utils.truncate_for_stream(tool_result_text),
+                    "toolResult": utils.truncate_for_stream(normalized),
                     "toolUseId": tool_use_id,
                     "tool": tool_name,
                 }
-                mcp_server = chat.mcp_tool_servers.get(tool_name)
+                mcp_server = chat.mcp_tool_servers.get(tool_name) or (
+                    (mcp_app or {}).get("mcpServer")
+                )
                 if mcp_server:
                     tool_result_payload["mcpServer"] = mcp_server
+                if mcp_app:
+                    # Keep full HTML outside truncated toolResult text.
+                    tool_result_payload["mcpApp"] = mcp_app
                 if tool_name == "get_skill_instructions":
                     skill_name = (tool_args_by_id.get(tool_use_id) or {}).get("skill_name")
                     if isinstance(skill_name, str) and skill_name.strip():
