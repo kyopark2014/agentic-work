@@ -53,9 +53,15 @@ def _s3_connect_src_hosts() -> str:
 # frame-src includes 'self' so Knowledge/Wiki Graph modals can iframe HTML
 # (without 'self' the graph iframe is blank).
 # connect-src includes S3 so Load-files / Wiki / RAG can PUT directly to presigned URLs.
+#
+# script-src needs 'unsafe-inline' because:
+# - index.html theme boot is an inline script
+# - MCP Apps (weather etc.) render via sandboxed srcdoc iframes that inherit
+#   this document CSP; without 'unsafe-inline' their UI scripts never run and
+#   the widget stays on "불러오는 중…" (agent-skills has no CSP middleware).
 _CONTENT_SECURITY_POLICY = (
     "default-src 'self'; "
-    "script-src 'self' https://accounts.google.com https://apis.google.com; "
+    "script-src 'self' 'unsafe-inline' https://accounts.google.com https://apis.google.com; "
     "style-src 'self' 'unsafe-inline'; "
     "img-src 'self' data: blob: https:; "
     "font-src 'self' data:; "
