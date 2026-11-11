@@ -87,7 +87,7 @@ export function LlmGatewayModal({
       }
       setSuccess(
         result.message ||
-          "저장되었습니다. Settings의 LLM Gateway 체크박스로 이 태스크에서 켜세요.",
+          "저장되었습니다. Settings의 LLM Gateway 체크박스로 모든 태스크에서 켜세요.",
       );
       setKeyConfigured(true);
       setKey("");
@@ -114,7 +114,7 @@ export function LlmGatewayModal({
         <h2 id="llm-gateway-title">LLM Gateway</h2>
         <p>
           URL을 확인하고, Key는 변경할 때만 입력하세요(비우면 기존 키 유지).
-          모델 목록 조회에 성공하면 저장합니다. 이 태스크에서 쓰려면 Settings의
+          모델 목록 조회에 성공하면 저장합니다. 모든 태스크에서 쓰려면 Settings의
           LLM Gateway 체크박스를 켜세요.
         </p>
 

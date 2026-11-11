@@ -83,12 +83,14 @@ def create_task(body: TaskCreate, request: Request):
         if body.memory_enabled is None
         else body.memory_enabled
     )
-    llm_gateway_enabled = (
-        flags["llm_gateway_enabled"]
-        if body.llm_gateway_enabled is None
-        else body.llm_gateway_enabled
-    )
-    _require_gateway_if_enabling(llm_gateway_enabled)
+    gateway_url, gateway_key = _llm_gateway_from_config()
+    gateway_ok = bool(gateway_url and gateway_key)
+    if body.llm_gateway_enabled is None:
+        # Inherit Settings; soft-disable when gateway credentials are missing.
+        llm_gateway_enabled = flags["llm_gateway_enabled"] and gateway_ok
+    else:
+        llm_gateway_enabled = body.llm_gateway_enabled
+        _require_gateway_if_enabling(llm_gateway_enabled)
     skills, mcp_servers = _resolve_tool_defaults(
         user_id, body.skills, body.mcp_servers
     )

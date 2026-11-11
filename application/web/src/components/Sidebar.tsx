@@ -776,9 +776,9 @@ export function Sidebar({
                   }
                   title={
                     llmGatewayEnabled
-                      ? "이 태스크에서 LLM Gateway 끄기"
+                      ? "모든 태스크에서 LLM Gateway 끄기"
                       : Boolean(config?.llm_gateway_configured)
-                        ? "이 태스크에서 LLM Gateway 켜기"
+                        ? "모든 태스크에서 LLM Gateway 켜기"
                         : "먼저 LLM Gateway 이름으로 설정을 여세요"
                   }
                   onChange={(e) => {

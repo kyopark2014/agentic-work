@@ -540,7 +540,8 @@ def update_all_tasks(
             values,
         )
         rowcount = cur.rowcount
-    _after_write(user_id)
+    # Flush immediately so new-task creates / other instances see Settings.
+    flush_persist(user_id)
     return int(rowcount or 0)
 
 

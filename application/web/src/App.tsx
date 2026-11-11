@@ -454,15 +454,10 @@ export default function App() {
   async function handleNewTask() {
     if (!hasAuthenticatedConfig(config)) return;
     try {
-      const defaults = buildNewTaskDefaults(config, activeTask);
-      const canEnableGateway =
-        Boolean(config.llm_gateway_configured) && llmGatewayReady;
-      const task = await appDataService.createTask({
-        ...defaults,
-        llm_gateway_enabled: canEnableGateway
-          ? (activeTask?.llm_gateway_enabled ?? true)
-          : false,
-      });
+      // Use per-user Settings defaults (shared across tasks), not activeTask.
+      const task = await appDataService.createTask(
+        buildNewTaskDefaults(config),
+      );
       setTasks((prev) => [task, ...prev]);
       setActiveTaskId(task.id);
       setMessages([]);
@@ -470,8 +465,12 @@ export default function App() {
         prev
           ? {
               ...prev,
+              default_model: task.model_name,
               default_skills: task.skills,
               default_mcp_servers: task.mcp_servers,
+              default_guardrail_enabled: task.guardrail_enabled,
+              default_memory_enabled: task.memory_enabled,
+              default_llm_gateway_enabled: task.llm_gateway_enabled,
             }
           : prev,
       );
@@ -544,11 +543,33 @@ export default function App() {
         ),
       );
       // Keep config defaults in sync with settings.json (server persists on patch).
-      if (patch.skills !== undefined || patch.mcp_servers !== undefined) {
+      if (
+        applyGlobal ||
+        patch.skills !== undefined ||
+        patch.mcp_servers !== undefined
+      ) {
         setConfig((prev) =>
           prev
             ? {
                 ...prev,
+                ...(globalFields.model_name !== undefined
+                  ? { default_model: globalFields.model_name }
+                  : {}),
+                ...(globalFields.guardrail_enabled !== undefined
+                  ? {
+                      default_guardrail_enabled:
+                        globalFields.guardrail_enabled,
+                    }
+                  : {}),
+                ...(globalFields.memory_enabled !== undefined
+                  ? { default_memory_enabled: globalFields.memory_enabled }
+                  : {}),
+                ...(globalFields.llm_gateway_enabled !== undefined
+                  ? {
+                      default_llm_gateway_enabled:
+                        globalFields.llm_gateway_enabled,
+                    }
+                  : {}),
                 ...(patch.skills !== undefined
                   ? { default_skills: updated.skills }
                   : {}),
@@ -665,11 +686,9 @@ export default function App() {
         return;
       }
       if (!config) return;
-      const task = await appDataService.createTask({
-        ...buildFallbackTaskDefaults(config),
-        llm_gateway_enabled:
-          Boolean(config.llm_gateway_configured) && llmGatewayReady,
-      });
+      const task = await appDataService.createTask(
+        buildFallbackTaskDefaults(config),
+      );
       setTasks([task]);
       setActiveTaskId(task.id);
       setMessages([]);
@@ -677,8 +696,12 @@ export default function App() {
         prev
           ? {
               ...prev,
+              default_model: task.model_name,
               default_skills: task.skills,
               default_mcp_servers: task.mcp_servers,
+              default_guardrail_enabled: task.guardrail_enabled,
+              default_memory_enabled: task.memory_enabled,
+              default_llm_gateway_enabled: task.llm_gateway_enabled,
             }
           : prev,
       );
