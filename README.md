@@ -118,8 +118,8 @@ UI에서 MCP는 `application/mcp.list` 기준으로 선택하고, Skill은 `appl
                               ↓ bedrock-agentcore VPC Endpoint
                     AgentCore Runtime (private subnet, VPC mode)
                               ↓
-              MCP: websearch (us-east-1 Gateway) / web_fetch (npm)
-                              ↓ NAT Gateway (public subnet 경유)
+              MCP: websearch (us-west-2 Gateway) / web_fetch (npm)
+                              ↓ NAT Gateway (public subnet 경유, web_fetch 등)
                          Internet
 ```
 
@@ -152,21 +152,19 @@ Endpoint 는 private subnet 에 배치되며, ECS security group 과 Agent Runti
 
 | 트래픽 | 이유 |
 |--------|------|
-| **Websearch MCP** | Gateway 가 **us-east-1** (`gateway.bedrock-agentcore.us-east-1.amazonaws.com`) 에 있음. us-west-2 VPC Endpoint 로는 **다른 리전 API·Gateway HTTPS** 에 도달 불가 |
-| **Websearch gateway URL 조회** | [runtime_agent/langgraph/mcp_config.py](./runtime_agent/langgraph/mcp_config.py) 가 `bedrock-agentcore-control` **us-east-1** API 호출 (`list_gateways` / `get_gateway`) |
+| **Websearch MCP** | Gateway 는 **us-west-2** (`gateway.bedrock-agentcore.us-west-2.amazonaws.com`). `bedrock-agentcore` VPC Endpoint 로 동일 리전 호출 가능. Endpoint 미구성·DNS 미해결 시 NAT 필요 |
+| **Websearch gateway URL 조회** | [runtime_agent/langgraph/mcp_config.py](./runtime_agent/langgraph/mcp_config.py) 가 `bedrock-agentcore-control` **us-west-2** API 호출 (`list_gateways` / `get_gateway`) — VPC Endpoint 로 가능 |
 | **Web_fetch MCP** | `npx -y mcp-server-fetch-typescript` 가 **npm registry** (`registry.npmjs.org`) 접속 필요 |
 | **외부 URL fetch** | web_fetch·일반 HTTP 도구가 public 인터넷 대상에 접근 |
 
-Websearch gateway 는 installer 가 `AGENTCORE_GATEWAY_REGION = "us-east-1"` 에 생성합니다. Runtime 은 us-west-2 VPC 에 있으므로 gateway 제어·데이터 평면 모두 **NAT egress** 가 필요합니다.
-
-`application/config.json` 에 `agentcore_websearch_gateway_url` 이 있어도, gateway 에 **HTTPS로 연결**할 때는 여전히 NAT 가 필요합니다.
+Websearch gateway 는 installer 가 `AGENTCORE_GATEWAY_REGION = "us-west-2"` 에 `gateway-websearch` 이름으로 생성합니다 (`gw-websearch` 와는 별개).
 
 #### Websearch / Web_fetch 동작 경로
 
 **Websearch** ([runtime_agent/langgraph/mcp_config.py](./runtime_agent/langgraph/mcp_config.py) → `websearch`):
 
-1. (선택) `bedrock-agentcore-control` us-east-1 에서 gateway URL 조회  
-2. `https://gateway-websearch-*.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp` 로 MCP streamable HTTP 연결 (SigV4)
+1. (선택) `bedrock-agentcore-control` us-west-2 에서 gateway URL 조회  
+2. `https://gateway-websearch-*.gateway.bedrock-agentcore.us-west-2.amazonaws.com/mcp` 로 MCP streamable HTTP 연결 (SigV4)
 
 **Web_fetch** (`mcp_config.py` → `web_fetch`):
 
@@ -194,7 +192,7 @@ Websearch gateway 는 installer 가 `AGENTCORE_GATEWAY_REGION = "us-east-1"` 에
 | UI 는 열리나 채팅 무응답 | ECS: `agentcore_client` 이후 로그 없음 | `bedrock-agentcore`, `bedrock-agentcore-control` Endpoint |
 | Runtime cold start 120초 초과 | Runtime: `utils.py` 까지만 반복 | `secretsmanager` Endpoint |
 | MCP 로드 후 멈춤 | Runtime: `mcp_servers: ['websearch', 'web_fetch']` 이후 정지 | **NAT Gateway**, private route `0.0.0.0/0 → NAT` |
-| Websearch 만 실패 | gateway us-east-1 관련 timeout | NAT + IAM(InvokeGateway) |
+| Websearch 만 실패 | gateway us-west-2 관련 timeout | VPC Endpoint / NAT + IAM(InvokeGateway) |
 
 로그 그룹:
 

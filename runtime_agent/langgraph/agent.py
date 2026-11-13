@@ -57,7 +57,7 @@ def patched_init(self, *args, **kwargs):
         # Only sign requests to bedrock-agentcore runtime endpoints in this region.
         if "bedrock-agentcore" not in url_str:
             return
-        # Gateway MCP uses per-connection AgentCoreSigV4Auth (often us-east-1).
+        # Gateway MCP uses per-connection AgentCoreSigV4Auth (same region as gateway).
         if ".gateway.bedrock-agentcore." in url_str:
             return
         if request.headers.get("Authorization"):
