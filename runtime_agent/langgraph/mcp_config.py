@@ -56,8 +56,39 @@ def get_agentcore_gateway_mcp_url(gateway_name: str, gateway_region: str) -> str
     return None
 
 
+_VAULT_RUNTIME_NAMES = ("use_vault_of_ob_note", "use_vault_of_ob_docs")
+
+
+def _find_use_vault_runtime_arn(vault_region: str) -> str | None:
+    """Discover the ob-note use-vault AgentCore Runtime ARN by name prefix."""
+    try:
+        client = boto3.client("bedrock-agentcore-control", region_name=vault_region)
+        token = None
+        while True:
+            kwargs: dict = {"maxResults": 100}
+            if token:
+                kwargs["nextToken"] = token
+            page = client.list_agent_runtimes(**kwargs)
+            for item in page.get("agentRuntimes", []):
+                name = item.get("agentRuntimeName", "")
+                if any(name == n or name.startswith(n) for n in _VAULT_RUNTIME_NAMES):
+                    arn = (item.get("agentRuntimeArn") or "").strip()
+                    if arn:
+                        return arn
+            token = page.get("nextToken")
+            if not token:
+                return None
+    except Exception as e:
+        logger.error(f"Error discovering use-vault AgentCore runtime: {e}")
+        return None
+
+
 def get_use_vault_mcp_url() -> str | None:
-    """Streamable-HTTP URL for ob-note use-vault AgentCore Runtime MCP (IAM SigV4)."""
+    """Streamable-HTTP URL for ob-note use-vault AgentCore Runtime MCP (IAM SigV4).
+
+    Resolution order: config/env URL → config/env ARN → ListAgentRuntimes discovery
+    (same fallback as application/agentcore_mcp.py for ECS MCP Apps).
+    """
     configured = (
         config.get("use_vault_mcp_url")
         or os.environ.get("use_vault_mcp_url")
@@ -67,19 +98,27 @@ def get_use_vault_mcp_url() -> str | None:
     if configured:
         return configured
 
-    arn = (
-        config.get("use_vault_mcp_runtime_arn")
-        or os.environ.get("use_vault_mcp_runtime_arn")
-        or ""
-    ).strip()
-    if not arn:
-        return None
     r = (
         config.get("use_vault_mcp_region")
         or config.get("region")
         or region
         or "us-west-2"
     )
+    arn = (
+        config.get("use_vault_mcp_runtime_arn")
+        or os.environ.get("use_vault_mcp_runtime_arn")
+        or os.environ.get("USE_VAULT_MCP_RUNTIME_ARN")
+        or ""
+    ).strip()
+    if not arn:
+        arn = _find_use_vault_runtime_arn(r) or ""
+        if arn:
+            logger.info(f"Discovered use-vault runtime: {arn}")
+            # Keep process-local config in sync so later loads skip ListAgentRuntimes.
+            config["use_vault_mcp_runtime_arn"] = arn
+            config["use_vault_mcp_region"] = r
+    if not arn:
+        return None
     encoded = arn.replace(":", "%3A").replace("/", "%2F")
     return (
         f"https://bedrock-agentcore.{r}.amazonaws.com/runtimes/"
@@ -261,8 +300,8 @@ def load_config(mcp_type):
         mcp_url = get_use_vault_mcp_url()
         if not mcp_url:
             logger.info(
-                "use-vault MCP skipped: use_vault_mcp_url / "
-                "use_vault_mcp_runtime_arn not configured."
+                "use-vault MCP skipped: could not resolve use_vault_mcp_url "
+                "(config/env ARN/URL missing and ListAgentRuntimes discovery failed)."
             )
             return {}
         auth_region = (

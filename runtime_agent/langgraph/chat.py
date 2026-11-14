@@ -2394,7 +2394,10 @@ def append_tool_guidance_to_prompt(system_prompt: str, mcp_servers: list) -> str
             "vault_write, vault_append 등)를 사용하세요. "
             f'모든 도구 호출에 actor_id="{uid}" 를 반드시 전달하세요 '
             "(계정 로그인 email). 닉네임·표시 이름을 쓰지 마세요. "
-            "경로는 vault 상대경로(예: Meeting/Note.md)이며 YAML frontmatter는 넣지 마세요."
+            "경로는 vault 상대경로(예: Meeting/Note.md)이며 YAML frontmatter는 넣지 마세요. "
+            "vault_search/vault_read/vault_list/vault_tree/vault_graph/vault_backlinks 결과는 "
+            "채팅에 인터랙티브 UI(MCP Apps)로 표시되므로, 같은 내용을 텍스트로 길게 반복하지 말고 "
+            "핵심만 요약하세요."
         )
 
     if "weather" in selected:
@@ -2417,6 +2420,14 @@ def append_tool_guidance_to_prompt(system_prompt: str, mcp_servers: list) -> str
             "read_file_content, download_file_content, create_file, "
             "copy_file, get_file_permissions. "
             "사용자 Drive 권한 범위 안에서만 동작합니다."
+        )
+
+    if selected & {"notion-remote", "notion remote", "notion_remote"}:
+        extras.append(
+            "Notion 작업은 notion-remote MCP 도구를 사용하세요. "
+            "notion-search / notion-fetch / notion-list-*-pages 결과는 채팅에 목록·페이지 UI로 "
+            "표시되므로, 같은 내용을 텍스트로 길게 반복하지 말고 핵심만 요약하세요. "
+            "검색어 입력이나 수정 요청은 사용자의 채팅 메시지로 받습니다."
         )
 
     if "canva" in selected:

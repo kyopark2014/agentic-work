@@ -13,7 +13,13 @@ interface Props {
 }
 
 const MENU_GAP = 8;
-const MENU_MAX_HEIGHT = 320;
+const VIEWPORT_PAD = 8;
+/** Prefer this panel height when the viewport allows it. */
+const MENU_PREFERRED_HEIGHT = 720;
+const MENU_MIN_HEIGHT = 320;
+const MENU_MIN_WIDTH = 280;
+
+type Placement = "right" | "left";
 
 export function ConfigDrawer({
   title,
@@ -31,6 +37,7 @@ export function ConfigDrawer({
     top: number;
     width: number;
     maxHeight: number;
+    placement: Placement;
   } | null>(null);
 
   function toggle(option: string) {
@@ -49,17 +56,42 @@ export function ConfigDrawer({
   function updatePosition() {
     if (!anchorEl) return;
     const rect = anchorEl.getBoundingClientRect();
-    const width = Math.max(rect.width, 240);
-    const left = Math.min(
-      Math.max(8, rect.left),
-      window.innerWidth - width - 8,
+    const preferredWidth = Math.max(rect.width, MENU_MIN_WIDTH);
+    const preferred = Math.min(
+      MENU_PREFERRED_HEIGHT,
+      Math.floor(window.innerHeight - VIEWPORT_PAD * 2),
     );
-    const top = rect.top - MENU_GAP;
-    const maxHeight = Math.min(
-      MENU_MAX_HEIGHT + (footer ? 72 : 0),
-      Math.max(120, top - 8),
-    );
-    setPosition({ left, top, width, maxHeight });
+
+    const spaceRight = Math.max(0, window.innerWidth - rect.right - MENU_GAP - VIEWPORT_PAD);
+    const spaceLeft = Math.max(0, rect.left - MENU_GAP - VIEWPORT_PAD);
+    const placement: Placement =
+      spaceRight >= Math.min(preferredWidth, 200) || spaceRight >= spaceLeft
+        ? "right"
+        : "left";
+    const sideSpace = placement === "right" ? spaceRight : spaceLeft;
+    const width = Math.min(preferredWidth, Math.max(220, sideSpace || preferredWidth));
+
+    const left =
+      placement === "right"
+        ? Math.min(rect.right + MENU_GAP, window.innerWidth - width - VIEWPORT_PAD)
+        : Math.max(VIEWPORT_PAD, rect.left - MENU_GAP - width);
+
+    // Tall side panel: prefer aligning near the anchor, then grow downward
+    // and shift up only as needed so it stays inside the viewport.
+    const maxHeight = Math.max(MENU_MIN_HEIGHT, preferred);
+    let top = Math.min(rect.top, window.innerHeight - VIEWPORT_PAD - maxHeight);
+    top = Math.max(VIEWPORT_PAD, top);
+
+    const available = Math.max(MENU_MIN_HEIGHT, window.innerHeight - top - VIEWPORT_PAD);
+    const resolvedHeight = Math.min(maxHeight, available);
+
+    setPosition({
+      left,
+      top,
+      width,
+      maxHeight: resolvedHeight,
+      placement,
+    });
   }
 
   useLayoutEffect(() => {
@@ -99,7 +131,7 @@ export function ConfigDrawer({
   return createPortal(
     <div
       ref={menuRef}
-      className="config-popover"
+      className={`config-popover is-side is-${position.placement}`}
       role="dialog"
       aria-label={title}
       style={{
@@ -109,7 +141,17 @@ export function ConfigDrawer({
         maxHeight: position.maxHeight,
       }}
     >
-      <div className="config-popover-header">{title}</div>
+      <div className="config-popover-header">
+        <span className="config-popover-title">{title}</span>
+        <button
+          type="button"
+          className="config-popover-close"
+          aria-label="닫기"
+          onClick={onClose}
+        >
+          ×
+        </button>
+      </div>
       <div className="config-popover-list">
         {options.length === 0 ? (
           <div className="config-popover-empty">선택할 항목이 없습니다.</div>

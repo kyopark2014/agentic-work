@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 from typing import Any
 
 logger = logging.getLogger("mcp_apps_host")
@@ -138,11 +139,73 @@ CANVA_IFRAME_TOOLS = frozenset(
 # Names an MCP server declares for itself, as older stored mcpApp payloads carried them.
 _SERVER_ALIASES = {"canva mcp server": "canva"}
 
+# use-vault (ob-note): read tools only. Writes (vault_write/append/delete/...) stay agent-only.
+VAULT_IFRAME_TOOLS = frozenset(
+    {"vault_tree", "vault_list", "vault_read", "vault_search", "vault_graph", "vault_backlinks"}
+)
+
 # server name (as used in the mcpApp payload) -> (auth module, allowed tools)
 _REMOTE_OAUTH_MCPS: dict[str, tuple[str, frozenset[str]]] = {
     "notion-remote": ("notion_auth", NOTION_IFRAME_TOOLS),
     "canva": ("canva_auth", CANVA_IFRAME_TOOLS),
 }
+# Servers reached with the ECS task role (SigV4) instead of a per-user OAuth token.
+_IAM_MCPS: dict[str, frozenset[str]] = {"use-vault": VAULT_IFRAME_TOOLS}
+_ALLOWED_TOOLS: dict[str, frozenset[str]] = {
+    **{k: v[1] for k, v in _REMOTE_OAUTH_MCPS.items()},
+    **_IAM_MCPS,
+}
+
+
+@asynccontextmanager
+async def remote_session(server: str, user_id: str | None):
+    """Open an authenticated MCP ClientSession to a hosted MCP on the user's behalf.
+
+    OAuth servers (Notion/Canva) use the user's own token; the token is refreshed with
+    its refresh token when near expiry (blocking urllib, so it runs in a thread).
+    """
+    import asyncio
+    import importlib
+
+    if server not in _REMOTE_OAUTH_MCPS and server not in _IAM_MCPS:
+        raise ValueError(f"No remote MCP session for server: {server}")
+    if not user_id:
+        raise ValueError("Sign in required")
+
+    if server in _IAM_MCPS:
+        import mcp
+        from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
+
+        from application import agentcore_mcp
+
+        url, region = await asyncio.to_thread(agentcore_mcp.use_vault_endpoint)
+        http = create_mcp_http_client(auth=agentcore_mcp.SigV4Auth(region), timeout=None)
+        async with http:
+            async with streamable_http_client(url, http_client=http) as streams:
+                async with mcp.ClientSession(streams[0], streams[1]) as session:
+                    await session.initialize()
+                    yield session
+        return
+
+    module_name, _allowed = _REMOTE_OAUTH_MCPS[server]
+    try:
+        auth = importlib.import_module(f"application.{module_name}")
+    except ImportError:  # pragma: no cover - flat layout
+        auth = importlib.import_module(module_name)
+
+    token = await asyncio.to_thread(auth.get_access_token, user_id)
+    if not token:
+        raise ValueError(f"{server} is not connected. Connect it from the MCP menu.")
+
+    import mcp
+    from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
+
+    http = create_mcp_http_client(headers={"Authorization": f"Bearer {token}"})
+    async with http:
+        async with streamable_http_client(auth.PROVIDER.mcp_url, http_client=http) as streams:
+            async with mcp.ClientSession(streams[0], streams[1]) as session:
+                await session.initialize()
+                yield session
 
 
 async def _call_remote_oauth_tool(
@@ -152,37 +215,25 @@ async def _call_remote_oauth_tool(
     arguments: dict[str, Any],
 ) -> dict[str, Any]:
     """Call a hosted MCP (Notion/Canva) with the signed-in user's OAuth token."""
-    import asyncio
-    import importlib
-
-    module_name, allowed = _REMOTE_OAUTH_MCPS[server]
+    allowed = _ALLOWED_TOOLS[server]
     if tool_name not in allowed:
         raise ValueError(f"{server} tool not allowed from MCP Apps: {tool_name}")
     if not user_id:
         raise ValueError("Sign in required")
-
-    try:
-        auth = importlib.import_module(f"application.{module_name}")
-    except ImportError:  # pragma: no cover - flat layout
-        auth = importlib.import_module(module_name)
-
-    # Refreshes with the refresh token when near expiry (blocking urllib).
-    token = await asyncio.to_thread(auth.get_access_token, user_id)
-    if not token:
-        raise ValueError(f"{server} is not connected. Connect it from the MCP menu.")
-
-    import mcp
-    from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
-
-    mcp_url = auth.PROVIDER.mcp_url
-    http = create_mcp_http_client(headers={"Authorization": f"Bearer {token}"})
-    async with http:
-        async with streamable_http_client(mcp_url, http_client=http) as streams:
-            async with mcp.ClientSession(streams[0], streams[1]) as session:
-                await session.initialize()
-                result = await session.call_tool(tool_name, arguments)
+    if server == "use-vault":
+        # These tools take the account as an argument. The iframe is untrusted page content,
+        # so never use the caller-supplied value: always act as the signed-in user.
+        arguments = {**arguments, "actor_id": user_id}
+    async with remote_session(server, user_id) as session:
+        result = await session.call_tool(tool_name, arguments)
     # Keep the whole result (structuredContent, image blocks, _meta): UIs read them.
     return result.model_dump(by_alias=True, exclude_none=True, mode="json")
+
+
+def normalize_server(name: str | None) -> str:
+    """Canonical server key (lower-case, declared-name aliases resolved)."""
+    server = (name or "").strip().lower()
+    return _SERVER_ALIASES.get(server, server)
 
 
 async def call_mcp_tool(
@@ -197,16 +248,15 @@ async def call_mcp_tool(
     weather for Apps iframe reloads, so we invoke the Python helpers directly.
     """
     arguments = arguments or {}
-    server = (mcp_server or "").strip().lower()
-    server = _SERVER_ALIASES.get(server, server)
+    server = normalize_server(mcp_server)
     name = (tool_name or "").strip()
 
-    if server in _REMOTE_OAUTH_MCPS:
+    if server in _ALLOWED_TOOLS:
         return await _call_remote_oauth_tool(server, user_id, name, arguments)
 
     if server != "weather":
         raise ValueError(
-            "ECS mcp-apps proxy only supports weather, notion-remote and canva "
+            "ECS mcp-apps proxy only supports weather, notion-remote, canva and use-vault "
             f"(got mcpServer={mcp_server!r})"
         )
 

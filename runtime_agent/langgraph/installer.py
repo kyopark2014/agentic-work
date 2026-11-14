@@ -58,8 +58,39 @@ def load_config():
     return _merge_application_config(config)
 
 
+def _discover_use_vault_runtime(region: str) -> tuple[str, str] | tuple[None, None]:
+    """Return ``(arn, streamable-http url)`` for ob-note use-vault MCP, if present."""
+    names = ("use_vault_of_ob_note", "use_vault_of_ob_docs")
+    try:
+        client = boto3.client("bedrock-agentcore-control", region_name=region)
+        token = None
+        while True:
+            kwargs: dict = {"maxResults": 100}
+            if token:
+                kwargs["nextToken"] = token
+            page = client.list_agent_runtimes(**kwargs)
+            for item in page.get("agentRuntimes", []):
+                name = item.get("agentRuntimeName", "")
+                if any(name == n or name.startswith(n) for n in names):
+                    arn = (item.get("agentRuntimeArn") or "").strip()
+                    if not arn:
+                        continue
+                    encoded = arn.replace(":", "%3A").replace("/", "%2F")
+                    url = (
+                        f"https://bedrock-agentcore.{region}.amazonaws.com/runtimes/"
+                        f"{encoded}/invocations?qualifier=DEFAULT"
+                    )
+                    return arn, url
+            token = page.get("nextToken")
+            if not token:
+                break
+    except Exception as e:
+        print(f"Warning: use-vault runtime discovery failed: {e}")
+    return None, None
+
+
 def _merge_application_config(config: dict) -> dict:
-    """Pull S3 Files session storage keys from application/config.json."""
+    """Pull S3 Files / use-vault keys from application/config.json (discover if missing)."""
     app_config = _load_application_config()
     updated = dict(config)
     changed = False
@@ -78,9 +109,40 @@ def _merge_application_config(config: dict) -> dict:
         if app_value and updated.get(key) != app_value:
             updated[key] = app_value
             changed = True
+
+    # Ensure use-vault MCP endpoint is present for the agent runtime image.
+    if not (updated.get("use_vault_mcp_url") or updated.get("use_vault_mcp_runtime_arn")):
+        vault_region = (
+            updated.get("use_vault_mcp_region")
+            or updated.get("region")
+            or "us-west-2"
+        )
+        arn, url = _discover_use_vault_runtime(vault_region)
+        if arn and url:
+            updated["use_vault_mcp_runtime_arn"] = arn
+            updated["use_vault_mcp_url"] = url
+            updated["use_vault_mcp_region"] = vault_region
+            changed = True
+            print(f"✓ Discovered use-vault MCP runtime: {arn}")
+            # Persist into application/config.json so ECS MCP Apps + future merges share it.
+            try:
+                app_path = os.path.join(_repo_root(), "application", "config.json")
+                if os.path.isfile(app_path):
+                    with open(app_path, "r", encoding="utf-8") as f:
+                        app_data = json.load(f)
+                    app_data["use_vault_mcp_runtime_arn"] = arn
+                    app_data["use_vault_mcp_url"] = url
+                    app_data["use_vault_mcp_region"] = vault_region
+                    with open(app_path, "w", encoding="utf-8") as f:
+                        json.dump(app_data, f, indent=2)
+                        f.write("\n")
+            except Exception as e:
+                print(f"Warning: failed to sync use-vault keys to application/config.json: {e}")
+
     if changed:
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(updated, f, indent=2)
+            f.write("\n")
     return updated
 
 def update_config(key, value):

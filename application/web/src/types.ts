@@ -16,11 +16,15 @@ export interface Task {
 
 export interface McpAppPayload {
   resourceUri: string;
-  html: string;
+  /** Legacy payloads inline the HTML; newer ones omit it and the host reads the resource. */
+  html?: string;
   tool: string;
   mcpServer?: string;
   mimeType?: string;
   csp?: Record<string, unknown>;
+  prefersBorder?: boolean;
+  /** Arguments the model passed to the tool (delivered as ui/notifications/tool-input). */
+  toolInput?: Record<string, unknown>;
   toolResult?: {
     content: Array<{ type: string; text?: string; [key: string]: unknown }>;
     structuredContent?: unknown;

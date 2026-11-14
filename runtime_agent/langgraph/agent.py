@@ -590,10 +590,12 @@ async def agent_langgraph(payload):
                 tool_used = True
                 tool_use_id = chunk.tool_call_id or ""
                 tool_name = chunk.name or tool_name_by_id.get(tool_use_id, "")
+                app_tool_input = None
                 if tool_use_id and tool_name:
                     args_obj = resolved_tool_args(tool_use_id)
                     if not args_obj:
                         args_obj = await args_from_graph_state(tool_use_id)
+                    app_tool_input = args_obj if isinstance(args_obj, dict) else None
                     payload = yield_tool_args(tool_use_id, tool_name, args_obj)
                     if payload:
                         yield payload
@@ -607,7 +609,7 @@ async def agent_langgraph(payload):
                     else None
                 )
                 mcp_app = mcp_apps_host.build_app_payload(
-                    tool_name, normalized, structured
+                    tool_name, normalized, structured, app_tool_input
                 )
                 tool_result_payload = {
                     "toolResult": utils.truncate_for_stream(normalized),

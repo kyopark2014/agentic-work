@@ -14,17 +14,25 @@ def clear() -> None:
     _APP_BY_TOOL.clear()
 
 
+# MCP servers whose `ui://` resources the web host reads itself (GET /api/mcp-apps/resource),
+# like a real MCP Apps host does with resources/read. For these the tool result carries
+# only the resource URI, not the HTML, so a 300KB UI is not repeated in every message.
+HOST_FETCHED_SERVERS = frozenset({"weather", "notion-remote", "canva", "use-vault"})
+
+
 def register_tool_app(
     tool_name: str,
     *,
     resource_uri: str,
-    html: str,
+    html: str | None = None,
     mcp_server: str | None = None,
     csp: dict[str, Any] | None = None,
     mime_type: str | None = None,
 ) -> None:
-    if not tool_name or not resource_uri or not html:
+    if not tool_name or not resource_uri:
         return
+    if not html and (mcp_server or "") not in HOST_FETCHED_SERVERS:
+        return  # nothing the host could render
     _APP_BY_TOOL[tool_name] = {
         "resourceUri": resource_uri,
         "html": html,
@@ -37,7 +45,7 @@ def register_tool_app(
         "Registered MCP App UI for tool=%s uri=%s html_len=%s",
         tool_name,
         resource_uri,
-        len(html),
+        len(html or ""),
     )
 
 
@@ -74,6 +82,7 @@ def build_app_payload(
     tool_name: str | None,
     tool_result_text: str,
     structured_content: Any = None,
+    tool_input: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     app = get_tool_app(tool_name) or (
         _fallback_weather_app(tool_name) if tool_name else None
@@ -86,7 +95,14 @@ def build_app_payload(
     # MCP Apps UIs (e.g. Canva) read the tool's ``structuredContent`` directly.
     if structured_content is not None:
         tool_result["structuredContent"] = structured_content
-    return {**app, "toolResult": tool_result}
+    payload: dict[str, Any] = {**app, "toolResult": tool_result}
+    if payload.get("mcpServer") in HOST_FETCHED_SERVERS:
+        # The web host reads the ui:// resource itself (and applies its _meta.ui.csp).
+        payload.pop("html", None)
+        payload.pop("csp", None)
+    if isinstance(tool_input, dict):
+        payload["toolInput"] = tool_input
+    return payload
 
 
 def extract_ui_resource_uri(tool_metadata: dict[str, Any] | None) -> str | None:
@@ -181,6 +197,16 @@ async def cache_apps_from_adapter(
         metadata = getattr(tool, "metadata", None) or {}
         uri = extract_ui_resource_uri(metadata)
         if not uri:
+            continue
+        if fallback_server_name in HOST_FETCHED_SERVERS:
+            # The web host reads this resource itself; no need to pull the HTML on every
+            # agent start. Only the tool -> resource mapping is needed here.
+            register_tool_app(
+                tool.name,
+                resource_uri=uri,
+                mcp_server=fallback_server_name,
+            )
+            registered += 1
             continue
         try:
             contents = await client.read_resource(uri)

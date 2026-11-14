@@ -90,7 +90,9 @@ export function ToolCallCard({ event }: Props) {
     );
   }
   if (event.type === "tool_result") {
-    const hasApp = Boolean(event.mcpApp?.html);
+    const hasApp = Boolean(
+      event.mcpApp && (event.mcpApp.html || (event.mcpApp.resourceUri && event.mcpApp.mcpServer)),
+    );
     return (
       <div className="tool-card-stack">
         {hasApp && event.mcpApp ? <McpAppFrame app={event.mcpApp} /> : null}

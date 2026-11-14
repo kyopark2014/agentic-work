@@ -34,7 +34,8 @@ iframe 버튼(검색/열기) → POST /api/mcp-apps/call-tool → ECS가 사용�
 | `application/mcp_apps_host.py` | iframe `tools/call` 프록시 (`notion-remote`, **읽기 전용 허용 목록**) |
 | `runtime_agent/langgraph/mcp_config.py` | `notion-remote` MCP 정의 |
 | `runtime_agent/langgraph/notion_bearer_auth.py` | 요청마다 Bearer 주입 |
-| `runtime_agent/langgraph/notion_app.py` | 뷰어 HTML + 도구 등록 |
+| `runtime_agent/langgraph/notion_app.py` | 도구 ↔ 뷰어 URI 등록(HTML 없음) |
+| `application/mcp_app_views/` | 뷰어 소스·빌드(`build.py`)·산출물, ECS가 `/api/mcp-apps/resource`로 서빙 ([호스트 문서](mcp-apps-host.md)) |
 | `application/web/src/notionAuth.ts`, `components/Sidebar.tsx` | 연결 팝업 / 버튼 |
 
 ## 왜 Notion 공식 UI(`ui://notion/page`)를 쓰지 않는가
