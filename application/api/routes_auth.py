@@ -49,11 +49,31 @@ class SessionResponse(BaseModel):
     llm_gateway_ready: bool = False
     knowledge_graph_enabled: bool = True
     graph_pattern: str = "pattern1"
+    google_drive_connected: bool = False
+    google_drive_fresh: bool = False
+    notion_connected: bool = False
+    notion_fresh: bool = False
 
 
 class SessionSettingsPatch(BaseModel):
     knowledge_graph_enabled: bool | None = None
     graph_pattern: str | None = None
+
+
+class GoogleDriveConnectRequest(BaseModel):
+    access_token: str = Field(..., min_length=1, description="Google OAuth access token with Drive scopes")
+    expires_in: int | None = Field(default=None, description="Token lifetime in seconds")
+    scope: str | None = Field(default=None, description="Granted OAuth scopes")
+    token_type: str | None = Field(default=None, description="Usually Bearer")
+
+
+class GoogleDriveStatusResponse(BaseModel):
+    connected: bool
+    fresh: bool
+    expires_at: float | None = None
+    scope: str | None = None
+    scopes: list[str] = Field(default_factory=list)
+    updated_at: str | None = None
 
 
 def _google_client_id() -> str:
@@ -274,6 +294,32 @@ def _ensure_litellm_virtual_key(user_id: str) -> bool:
         return False
 
 
+def _google_drive_status(user_id: str) -> dict:
+    try:
+        try:
+            from application import google_drive_auth
+        except ImportError:
+            import google_drive_auth
+
+        return google_drive_auth.status_for_user(user_id)
+    except Exception:
+        logger.exception("Failed to load Google Drive status for %s", user_id)
+        return {"connected": False, "fresh": False}
+
+
+def _notion_status(user_id: str) -> dict:
+    try:
+        try:
+            from application import notion_auth
+        except ImportError:
+            import notion_auth
+
+        return notion_auth.status_for_user(user_id)
+    except Exception:
+        logger.exception("Failed to load Notion status for %s", user_id)
+        return {"connected": False, "fresh": False}
+
+
 def _session_response(
     user_id: str,
     *,
@@ -282,6 +328,8 @@ def _session_response(
     llm_gateway_ready: bool | None = None,
 ) -> SessionResponse:
     settings = utils.load_user_settings(user_id)
+    drive = _google_drive_status(user_id)
+    notion = _notion_status(user_id)
     return SessionResponse(
         user_id=user_id,
         name=name,
@@ -297,6 +345,10 @@ def _session_response(
         graph_pattern=utils.normalize_graph_pattern(
             settings.get("graph_pattern", utils.DEFAULT_GRAPH_PATTERN)
         ),
+        google_drive_connected=bool(drive.get("connected")),
+        google_drive_fresh=bool(drive.get("fresh")),
+        notion_connected=bool(notion.get("connected")),
+        notion_fresh=bool(notion.get("fresh")),
     )
 
 
@@ -474,6 +526,152 @@ def clear_session(request: Request, response: Response) -> None:
         secure=secure,
     )
     cloudfront_cookies.clear_signed_cookies(response, secure=secure)
+
+
+@router.get("/google-drive", response_model=GoogleDriveStatusResponse)
+def get_google_drive_status(request: Request) -> GoogleDriveStatusResponse:
+    user_id = require_user_id(request)
+    try:
+        from application import google_drive_auth
+    except ImportError:
+        import google_drive_auth
+
+    status = google_drive_auth.status_for_user(user_id)
+    return GoogleDriveStatusResponse(**status)
+
+
+@router.post("/google-drive", response_model=GoogleDriveStatusResponse)
+def connect_google_drive(
+    body: GoogleDriveConnectRequest, request: Request
+) -> GoogleDriveStatusResponse:
+    """Store a Google access token that includes Drive MCP scopes."""
+    user_id = require_user_id(request)
+    access_token = (body.access_token or "").strip()
+    if not access_token:
+        raise HTTPException(status_code=400, detail="access_token is required")
+
+    # Verify the token belongs to our OAuth client (rejects forged tokens).
+    try:
+        verify_google_access_token(access_token, _google_client_id())
+    except ValueError as e:
+        logger.warning("Google Drive connect rejected: %s", e)
+        raise HTTPException(status_code=401, detail="Invalid Google access token") from e
+
+    try:
+        from application import google_drive_auth
+    except ImportError:
+        import google_drive_auth
+
+    status = google_drive_auth.save_access_token(
+        user_id,
+        access_token,
+        expires_in=body.expires_in,
+        scope=body.scope,
+        token_type=body.token_type,
+    )
+    return GoogleDriveStatusResponse(**status)
+
+
+@router.delete("/google-drive", status_code=204)
+def disconnect_google_drive(request: Request) -> None:
+    user_id = require_user_id(request)
+    try:
+        from application import google_drive_auth
+    except ImportError:
+        import google_drive_auth
+
+    google_drive_auth.clear_token(user_id)
+
+
+class NotionStatusResponse(BaseModel):
+    connected: bool
+    fresh: bool
+    expires_at: float | None = None
+    updated_at: str | None = None
+
+
+class NotionAuthorizeResponse(BaseModel):
+    url: str
+
+
+def _notion_auth_module():
+    try:
+        from application import notion_auth
+    except ImportError:
+        import notion_auth
+    return notion_auth
+
+
+def _notion_redirect_uri(request: Request) -> str:
+    """Public callback URL (must be identical for authorize + token exchange)."""
+    if not is_loopback_request(request):
+        # Behind CloudFront -> ALB the Host header is not the viewer's domain;
+        # the configured public URL is the origin the browser actually uses.
+        sharing = (utils.load_config().get("sharing_url") or "").strip().rstrip("/")
+        if sharing.startswith("https://"):
+            return f"{sharing}/api/session/notion/callback"
+    secure = _cookie_secure(request)
+    host = (
+        request.headers.get("x-forwarded-host")
+        or request.headers.get("host")
+        or request.url.netloc
+    )
+    scheme = "https" if secure else "http"
+    return f"{scheme}://{host}/api/session/notion/callback"
+
+
+@router.get("/notion", response_model=NotionStatusResponse)
+def get_notion_status(request: Request) -> NotionStatusResponse:
+    user_id = require_user_id(request)
+    return NotionStatusResponse(**_notion_auth_module().status_for_user(user_id))
+
+
+@router.get("/notion/authorize", response_model=NotionAuthorizeResponse)
+def authorize_notion(request: Request) -> NotionAuthorizeResponse:
+    """Return the Notion OAuth URL; the browser opens it in a popup."""
+    user_id = require_user_id(request)
+    try:
+        url = _notion_auth_module().start(user_id, _notion_redirect_uri(request))
+    except Exception as e:
+        logger.exception("Notion authorize failed")
+        raise HTTPException(status_code=502, detail=f"Notion OAuth start failed: {e}") from e
+    return NotionAuthorizeResponse(url=url)
+
+
+@router.get("/notion/callback")
+def notion_callback(
+    request: Request,
+    code: str | None = None,
+    state: str | None = None,
+    iss: str | None = None,
+    error: str | None = None,
+) -> Response:
+    """OAuth redirect target. Identity comes from ``state`` (single-use, server-side)."""
+    ok = False
+    message = error or "Notion connection failed"
+    if not error and code and state:
+        try:
+            _notion_auth_module().finish(state, code, iss)
+            ok = True
+            message = "connected"
+        except Exception as e:
+            logger.warning("Notion OAuth callback failed: %s", e)
+            message = "Notion 연결에 실패했습니다. 다시 시도하세요."
+    payload = json.dumps({"type": "notion-oauth", "ok": ok, "message": message})
+    title = "Notion 연결됨" if ok else "Notion 연결 실패"
+    html = (
+        "<!doctype html><meta charset=utf-8><title>%s</title>"
+        "<body style=\"font-family:system-ui;padding:2rem\"><p>%s. 이 창은 닫아도 됩니다.</p>"
+        "<script>try{window.opener&&window.opener.postMessage(%s,window.location.origin)}"
+        "catch(e){}window.close()</script></body>"
+    ) % (title, title, payload.replace("<", "\\u003c"))
+    return Response(content=html, media_type="text/html", status_code=200 if ok else 400)
+
+
+@router.delete("/notion", status_code=204)
+def disconnect_notion(request: Request) -> None:
+    user_id = require_user_id(request)
+    _notion_auth_module().clear_token(user_id)
 
 
 def require_user_id(request: Request) -> str:

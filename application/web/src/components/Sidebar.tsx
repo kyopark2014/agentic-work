@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { api } from "../api";
 import { formatBrandTitle } from "../formatBrandTitle";
+import { connectGoogleDrive } from "../googleDriveAuth";
+import { connectNotion } from "../notionAuth";
 import { useTheme } from "../hooks/useTheme";
 import type { Theme } from "../theme";
 import type { AppConfig, Task } from "../types";
@@ -98,6 +100,10 @@ export function Sidebar({
 }: Props) {
   const skillBtnRef = useRef<HTMLButtonElement>(null);
   const mcpBtnRef = useRef<HTMLButtonElement>(null);
+  const [driveBusy, setDriveBusy] = useState(false);
+  const [driveError, setDriveError] = useState<string | null>(null);
+  const [notionBusy, setNotionBusy] = useState(false);
+  const [notionError, setNotionError] = useState<string | null>(null);
   const modelBtnRef = useRef<HTMLButtonElement>(null);
   const appearanceBtnRef = useRef<HTMLButtonElement>(null);
   const wikiBtnRef = useRef<HTMLButtonElement>(null);
@@ -850,8 +856,186 @@ export function Sidebar({
           options={config.mcp_servers}
           selected={mcpServers}
           anchorEl={mcpBtnRef.current}
-          onChange={(next) => activeTask && onPatchTask(activeTask.id, { mcp_servers: next })}
+          onChange={async (next) => {
+            if (!activeTask) return;
+            const enablingDrive =
+              next.includes("drive") && !mcpServers.includes("drive");
+            const enablingNotion =
+              next.includes("notion-remote") &&
+              !mcpServers.includes("notion-remote");
+            await onPatchTask(activeTask.id, { mcp_servers: next });
+            if (
+              enablingNotion &&
+              !(config.notion_connected && config.notion_fresh)
+            ) {
+              setNotionError(null);
+              setNotionBusy(true);
+              try {
+                await connectNotion();
+                if (onRefreshConfig) await onRefreshConfig();
+              } catch (err) {
+                setNotionError(err instanceof Error ? err.message : String(err));
+              } finally {
+                setNotionBusy(false);
+              }
+            }
+            if (
+              enablingDrive &&
+              config.google_client_id &&
+              !(config.google_drive_connected && config.google_drive_fresh)
+            ) {
+              setDriveError(null);
+              setDriveBusy(true);
+              try {
+                const status = await connectGoogleDrive(
+                  config.google_client_id,
+                  config.google_drive_scopes,
+                );
+                if (onRefreshConfig) await onRefreshConfig();
+                else {
+                  // Keep local config in sync if parent refresh is unavailable.
+                  void status;
+                }
+              } catch (err) {
+                setDriveError(err instanceof Error ? err.message : String(err));
+              } finally {
+                setDriveBusy(false);
+              }
+            }
+          }}
           onClose={handleDrawerClose}
+          footer={
+            <>
+            {mcpServers.includes("notion-remote") ? (
+              <div>
+                <div className="config-popover-footer-status">
+                  {config.notion_connected && config.notion_fresh
+                    ? "Notion 연결됨"
+                    : config.notion_connected
+                      ? "Notion 토큰 만료 — 다시 연결하세요"
+                      : "notion-remote MCP 사용 전 Notion 연결 필요"}
+                </div>
+                <div className="config-popover-footer-actions">
+                  <button
+                    type="button"
+                    disabled={notionBusy}
+                    onClick={async () => {
+                      setNotionError(null);
+                      setNotionBusy(true);
+                      try {
+                        await connectNotion();
+                        if (onRefreshConfig) await onRefreshConfig();
+                      } catch (err) {
+                        setNotionError(
+                          err instanceof Error ? err.message : String(err),
+                        );
+                      } finally {
+                        setNotionBusy(false);
+                      }
+                    }}
+                  >
+                    {notionBusy
+                      ? "연결 중…"
+                      : config.notion_connected
+                        ? "다시 연결"
+                        : "Notion 연결"}
+                  </button>
+                  {config.notion_connected ? (
+                    <button
+                      type="button"
+                      disabled={notionBusy}
+                      onClick={async () => {
+                        setNotionError(null);
+                        setNotionBusy(true);
+                        try {
+                          await api.disconnectNotion();
+                          if (onRefreshConfig) await onRefreshConfig();
+                        } catch (err) {
+                          setNotionError(
+                            err instanceof Error ? err.message : String(err),
+                          );
+                        } finally {
+                          setNotionBusy(false);
+                        }
+                      }}
+                    >
+                      연결 해제
+                    </button>
+                  ) : null}
+                </div>
+                {notionError ? (
+                  <div className="config-popover-footer-error">{notionError}</div>
+                ) : null}
+              </div>
+            ) : null}
+            {config.mcp_servers.includes("drive") ? (
+              <div>
+                <div className="config-popover-footer-status">
+                  {config.google_drive_connected && config.google_drive_fresh
+                    ? "Google Drive 연결됨"
+                    : config.google_drive_connected
+                      ? "Google Drive 토큰 만료 — 다시 연결하세요"
+                      : "drive MCP 사용 전 Google Drive 연결 필요"}
+                </div>
+                <div className="config-popover-footer-actions">
+                  <button
+                    type="button"
+                    disabled={driveBusy || !config.google_client_id}
+                    onClick={async () => {
+                      if (!config.google_client_id) return;
+                      setDriveError(null);
+                      setDriveBusy(true);
+                      try {
+                        await connectGoogleDrive(
+                          config.google_client_id,
+                          config.google_drive_scopes,
+                        );
+                        if (onRefreshConfig) await onRefreshConfig();
+                      } catch (err) {
+                        setDriveError(
+                          err instanceof Error ? err.message : String(err),
+                        );
+                      } finally {
+                        setDriveBusy(false);
+                      }
+                    }}
+                  >
+                    {driveBusy
+                      ? "연결 중…"
+                      : config.google_drive_connected
+                        ? "다시 연결"
+                        : "Drive 연결"}
+                  </button>
+                  {config.google_drive_connected ? (
+                    <button
+                      type="button"
+                      disabled={driveBusy}
+                      onClick={async () => {
+                        setDriveError(null);
+                        setDriveBusy(true);
+                        try {
+                          await api.disconnectGoogleDrive();
+                          if (onRefreshConfig) await onRefreshConfig();
+                        } catch (err) {
+                          setDriveError(
+                            err instanceof Error ? err.message : String(err),
+                          );
+                        } finally {
+                          setDriveBusy(false);
+                        }
+                      }}
+                    >
+                      연결 해제
+                    </button>
+                  ) : null}
+                </div>
+                {driveError ? (
+                  <div className="config-popover-footer-error">{driveError}</div>
+                ) : null}
+              </div>
+            ) : null}
+            </>
+          }
         />
       )}
       {drawer === "model" && config && activeTask && (

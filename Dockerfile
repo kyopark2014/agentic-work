@@ -28,7 +28,8 @@ RUN pip install --upgrade "setuptools>=83.0.0" \
     aws-bedrock-token-generator \
     requests \
     beautifulsoup4 \
-    "markdown>=3.7"
+    "markdown>=3.7" \
+    "mcp>=2.1.1"
 
 COPY . .
 COPY --from=frontend /web/dist /app/application/web/dist

@@ -21,6 +21,7 @@ import {
   stabilizeMessageKeys,
 } from "./services/messageService";
 import { api } from "./api";
+import { refreshGoogleDriveIfNeeded } from "./googleDriveAuth";
 import type { AppConfig, Message, Task } from "./types";
 import { hasAuthenticatedConfig } from "./types";
 import { Sidebar } from "./components/Sidebar";
@@ -727,11 +728,33 @@ export default function App() {
     ]);
   }
 
+  async function ensureGoogleDriveToken(taskId: string) {
+    const task = tasks.find((t) => t.id === taskId);
+    const mcp = task?.mcp_servers ?? [];
+    if (!mcp.includes("drive")) return;
+    const clientId = config?.google_client_id?.trim();
+    if (!clientId) return;
+    try {
+      const status = await refreshGoogleDriveIfNeeded(clientId, {
+        connected: Boolean(config?.google_drive_connected),
+        fresh: Boolean(config?.google_drive_fresh),
+        scopes: config?.google_drive_scopes,
+      });
+      if (status && (!config?.google_drive_connected || !config?.google_drive_fresh)) {
+        await refreshConfig();
+      }
+    } catch (err) {
+      uiError("google-drive:refresh failed", err);
+      // Continue; backend may still have a usable stored token.
+    }
+  }
+
   async function dispatchSend(
     taskId: string,
     prompt: string,
     files: string[] = [],
   ) {
+    await ensureGoogleDriveToken(taskId);
     const displayPrompt = buildDisplayPrompt(prompt, files);
     uiLog("chat:handleSend", { taskId, prompt: displayPrompt, files });
     if (activeTaskIdRef.current === taskId) {

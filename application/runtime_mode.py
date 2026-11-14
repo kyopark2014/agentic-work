@@ -91,6 +91,53 @@ def run_agent(
         gateway_url = ""
         gateway_key = ""
 
+    drive_token = None
+    try:
+        try:
+            from application import google_drive_auth
+        except ImportError:
+            import google_drive_auth
+
+        if google_drive_auth.mcp_selected(mcp_servers):
+            drive_token = google_drive_auth.get_access_token(user_id)
+            if not drive_token:
+                # Allow slightly stale token through; Google may still accept it briefly.
+                drive_token = google_drive_auth.get_access_token(
+                    user_id, allow_expired=True
+                )
+                if drive_token:
+                    logger.warning(
+                        "Google Drive token expired/near-expiry for %s; "
+                        "passing stored token (reconnect recommended)",
+                        user_id,
+                    )
+                else:
+                    logger.warning(
+                        "drive MCP selected but no Google Drive token for %s",
+                        user_id,
+                    )
+    except Exception as e:
+        logger.warning("Google Drive token lookup failed: %s", e)
+
+    notion_token = None
+    try:
+        try:
+            from application import notion_auth
+        except ImportError:
+            import notion_auth
+
+        if notion_auth.mcp_selected(mcp_servers):
+            # get_access_token refreshes with the refresh token when near expiry.
+            notion_token = notion_auth.get_access_token(user_id) or notion_auth.get_access_token(
+                user_id, allow_expired=True
+            )
+            if not notion_token:
+                logger.warning(
+                    "notion-remote MCP selected but no Notion token for %s", user_id
+                )
+    except Exception as e:
+        logger.warning("Notion token lookup failed: %s", e)
+
     return agentcore_client.run_agent(
         prompt,
         user_id,
@@ -104,6 +151,8 @@ def run_agent(
         llm_gateway_enabled=effective_enabled,
         llm_gateway_url=gateway_url or None,
         llm_gateway_key=gateway_key or None,
+        google_drive_access_token=drive_token,
+        notion_access_token=notion_token,
         files=files,
         task_id=task_id,
     )

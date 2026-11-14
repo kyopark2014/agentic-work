@@ -142,7 +142,17 @@ async def agent_langgraph(payload):
     """
     Invoke the agent with a payload
     """
-    logger.info(f"payload: {payload}")
+    try:
+        _payload_log = dict(payload) if isinstance(payload, dict) else {}
+        if _payload_log.get("llm_gateway_key"):
+            _payload_log["llm_gateway_key"] = "***"
+        if _payload_log.get("google_drive_access_token"):
+            _payload_log["google_drive_access_token"] = "***"
+        if _payload_log.get("notion_access_token"):
+            _payload_log["notion_access_token"] = "***"
+        logger.info(f"payload: {_payload_log}")
+    except Exception:
+        logger.info("payload: (received)")
     query = payload.get("prompt")
     logger.info(f"query: {query}")
 
@@ -173,6 +183,8 @@ async def agent_langgraph(payload):
         llmGatewayEnabled=payload.get("llm_gateway_enabled"),
         llmGatewayUrl=payload.get("llm_gateway_url"),
         llmGatewayKey=payload.get("llm_gateway_key"),
+        googleDriveAccessToken=payload.get("google_drive_access_token"),
+        notionAccessToken=payload.get("notion_access_token"),
     )
 
     logger.info(f"guardrail_enabled: {chat.guardrail_enabled}")

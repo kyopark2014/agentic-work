@@ -24,12 +24,13 @@ class CallToolRequest(BaseModel):
 @router.post("/call-tool")
 async def call_tool(body: CallToolRequest, request: Request) -> dict[str, Any]:
     """Proxy `tools/call` from an MCP App iframe to the weather helpers."""
-    require_user_id(request)
+    user_id = require_user_id(request)
     try:
         return await mcp_apps_host.call_mcp_tool(
             body.mcpServer,
             body.tool,
             body.arguments,
+            user_id=user_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

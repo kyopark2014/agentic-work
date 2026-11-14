@@ -72,6 +72,11 @@ export interface AppConfig {
   default_memory_enabled?: boolean;
   default_llm_gateway_enabled?: boolean;
   llm_gateway_configured?: boolean;
+  google_drive_connected?: boolean;
+  google_drive_fresh?: boolean;
+  google_drive_scopes?: string[];
+  notion_connected?: boolean;
+  notion_fresh?: boolean;
 }
 
 /** True when /api/config returned authenticated capability catalogs. */

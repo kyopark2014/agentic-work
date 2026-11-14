@@ -230,6 +230,27 @@ def get_config(request: Request):
     default_model = preferred_model or DEFAULT_MODEL
     if default_model not in MODELS and default_model not in gateway_models:
         default_model = DEFAULT_MODEL
+    notion_status = {"connected": False, "fresh": False}
+    try:
+        if session_user:
+            try:
+                from application import notion_auth
+            except ImportError:
+                import notion_auth
+            notion_status = notion_auth.status_for_user(session_user)
+    except Exception:
+        logger.exception("Failed to load Notion status for config")
+    drive_status = {"connected": False, "fresh": False, "scopes": []}
+    try:
+        try:
+            from application import google_drive_auth
+        except ImportError:
+            import google_drive_auth
+
+        drive_status = google_drive_auth.status_for_user(session_user)
+    except Exception:
+        logger.exception("Failed to load Google Drive status for config")
+
     return {
         **public,
         "is_admin": is_admin_user(session_user)
@@ -249,6 +270,11 @@ def get_config(request: Request):
             flags["llm_gateway_enabled"] and gateway_configured
         ),
         "llm_gateway_configured": gateway_configured,
+        "notion_connected": bool(notion_status.get("connected")),
+        "notion_fresh": bool(notion_status.get("fresh")),
+        "google_drive_connected": bool(drive_status.get("connected")),
+        "google_drive_fresh": bool(drive_status.get("fresh")),
+        "google_drive_scopes": list(drive_status.get("scopes") or []),
     }
 
 

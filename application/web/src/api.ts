@@ -309,6 +309,24 @@ export interface SessionInfo {
   llm_gateway_ready?: boolean;
   knowledge_graph_enabled?: boolean;
   graph_pattern?: GraphPattern | string;
+  google_drive_connected?: boolean;
+  google_drive_fresh?: boolean;
+}
+
+export interface NotionStatus {
+  connected: boolean;
+  fresh: boolean;
+  expires_at?: number | null;
+  updated_at?: string | null;
+}
+
+export interface GoogleDriveStatus {
+  connected: boolean;
+  fresh: boolean;
+  expires_at?: number | null;
+  scope?: string | null;
+  scopes?: string[];
+  updated_at?: string | null;
 }
 
 export const api = {
@@ -337,6 +355,25 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify(body),
     }),
+  getGoogleDriveStatus: () =>
+    request<GoogleDriveStatus>("/api/session/google-drive"),
+  connectGoogleDrive: (body: {
+    access_token: string;
+    expires_in?: number;
+    scope?: string;
+    token_type?: string;
+  }) =>
+    request<GoogleDriveStatus>("/api/session/google-drive", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  disconnectGoogleDrive: () =>
+    request<void>("/api/session/google-drive", { method: "DELETE" }),
+  getNotionStatus: () => request<NotionStatus>("/api/session/notion"),
+  getNotionAuthorizeUrl: () =>
+    request<{ url: string }>("/api/session/notion/authorize"),
+  disconnectNotion: () =>
+    request<void>("/api/session/notion", { method: "DELETE" }),
   getGraphStatus: () => request<GraphStatus>("/api/graph/status"),
   rebuildGraph: (force = false) =>
     request<GraphStatus>(`/api/graph/rebuild${force ? "?force=1" : ""}`, {

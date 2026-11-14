@@ -396,6 +396,31 @@ def load_config(mcp_type):
             }
         }
 
+    elif mcp_type in ("notion-remote", "notion remote", "notion_remote"):
+        # Notion hosted MCP (OAuth bearer injected per request; see notion_bearer_auth.py).
+        return {
+            "mcpServers": {
+                "notion-remote": {
+                    "type": "streamable_http",
+                    "url": "https://mcp.notion.com/mcp",
+                    "auth_type": "notion_bearer",
+                }
+            }
+        }
+
+    elif mcp_type in ("drive", "google-drive", "google drive", "google_drive"):
+        # Google remote Drive MCP (OAuth bearer injected at create_agent time).
+        # https://developers.google.com/workspace/drive/api/guides/configure-mcp-server
+        return {
+            "mcpServers": {
+                "drive": {
+                    "type": "streamable_http",
+                    "url": "https://drivemcp.googleapis.com/mcp/v1",
+                    "auth_type": "google_drive_bearer",
+                }
+            }
+        }
+
 def load_selected_config(mcp_servers: dict):
     logger.info(f"mcp_servers: {mcp_servers}")
     

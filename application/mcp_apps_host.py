@@ -105,10 +105,64 @@ def normalize_tool_result_text(content: Any) -> str:
     return str(content)
 
 
+# Read-only Notion tools an MCP App iframe may call on the user's behalf.
+NOTION_IFRAME_TOOLS = frozenset(
+    {
+        "notion-search",
+        "notion-fetch",
+        "notion-list-recent-pages",
+        "notion-list-favorite-pages",
+        "notion-list-private-pages",
+        "notion-list-shared-pages",
+    }
+)
+
+
+async def _call_notion_tool(
+    user_id: str | None,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """Call the hosted Notion MCP with the signed-in user's OAuth token."""
+    import asyncio
+
+    if tool_name not in NOTION_IFRAME_TOOLS:
+        raise ValueError(f"Notion tool not allowed from MCP Apps: {tool_name}")
+    if not user_id:
+        raise ValueError("Sign in required")
+
+    try:
+        from application import notion_auth
+    except ImportError:  # pragma: no cover - flat layout
+        import notion_auth  # type: ignore
+
+    # Refreshes with the refresh token when near expiry (blocking urllib).
+    token = await asyncio.to_thread(notion_auth.get_access_token, user_id)
+    if not token:
+        raise ValueError("Notion is not connected. Connect it from the MCP menu.")
+
+    import mcp
+    from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
+
+    http = create_mcp_http_client(headers={"Authorization": f"Bearer {token}"})
+    async with http:
+        async with streamable_http_client(notion_auth.NOTION_MCP_URL, http_client=http) as streams:
+            async with mcp.ClientSession(streams[0], streams[1]) as session:
+                await session.initialize()
+                result = await session.call_tool(tool_name, arguments)
+    blocks = [
+        {"type": "text", "text": getattr(c, "text", "") or ""}
+        for c in (result.content or [])
+        if getattr(c, "text", None) is not None
+    ]
+    return {"content": blocks, "isError": bool(getattr(result, "is_error", False) or getattr(result, "isError", False))}
+
+
 async def call_mcp_tool(
     mcp_server: str,
     tool_name: str,
     arguments: dict[str, Any] | None = None,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
     """Call weather tools in-process on ECS (iframe refresh).
 
@@ -119,9 +173,13 @@ async def call_mcp_tool(
     server = (mcp_server or "").strip().lower()
     name = (tool_name or "").strip()
 
+    if server == "notion-remote":
+        return await _call_notion_tool(user_id, name, arguments)
+
     if server != "weather":
         raise ValueError(
-            f"ECS mcp-apps proxy only supports weather (got mcpServer={mcp_server!r})"
+            "ECS mcp-apps proxy only supports weather and notion-remote "
+            f"(got mcpServer={mcp_server!r})"
         )
 
     from application.mcp_server_weather import (

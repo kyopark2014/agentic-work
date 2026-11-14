@@ -91,6 +91,8 @@ memory_enabled = False
 llm_gateway_enabled = False
 llm_gateway_url: str | None = None
 llm_gateway_key: str | None = None
+google_drive_access_token: str | None = None
+notion_access_token: str | None = None
 memory_id = None
 actor_id = None
 session_id = None
@@ -104,10 +106,13 @@ def update(
     llmGatewayEnabled=None,
     llmGatewayUrl=None,
     llmGatewayKey=None,
+    googleDriveAccessToken=None,
+    notionAccessToken=None,
 ):
     global model_name, model_id, model_type, debug_mode, reasoning_mode
     global models, user_id, guardrail_enabled, memory_enabled
     global llm_gateway_enabled, llm_gateway_url, llm_gateway_key
+    global google_drive_access_token, notion_access_token
 
     if userId != user_id:
         user_id = userId
@@ -149,6 +154,20 @@ def update(
         llm_gateway_url = (llmGatewayUrl or "").strip().rstrip("/") or None
     if llmGatewayKey is not None:
         llm_gateway_key = (llmGatewayKey or "").strip() or None
+
+    if googleDriveAccessToken is not None:
+        google_drive_access_token = (googleDriveAccessToken or "").strip() or None
+        if google_drive_access_token:
+            os.environ["GOOGLE_DRIVE_ACCESS_TOKEN"] = google_drive_access_token
+        else:
+            os.environ.pop("GOOGLE_DRIVE_ACCESS_TOKEN", None)
+
+    if notionAccessToken is not None:
+        notion_access_token = (notionAccessToken or "").strip() or None
+        if notion_access_token:
+            os.environ["NOTION_REMOTE_ACCESS_TOKEN"] = notion_access_token
+        else:
+            os.environ.pop("NOTION_REMOTE_ACCESS_TOKEN", None)
 
 
 def _llm_gateway_settings() -> tuple[str, str] | None:
@@ -2375,6 +2394,15 @@ def append_tool_guidance_to_prompt(system_prompt: str, mcp_servers: list) -> str
             "읍면동 단위 상세 동네예보가 필요할 때만 korea-weather skill을 사용하세요."
         )
 
+    if selected & {"drive", "google-drive", "google drive", "google_drive"}:
+        extras.append(
+            "Google Drive 작업은 drive MCP 도구를 사용하세요: "
+            "search_files, list_recent_files, get_file_metadata, "
+            "read_file_content, download_file_content, create_file, "
+            "copy_file, get_file_permissions. "
+            "사용자 Drive 권한 범위 안에서만 동작합니다."
+        )
+
     if not extras:
         return system_prompt
 
@@ -2427,6 +2455,25 @@ async def create_agent(
             params["env"] = env
             logger.info(f"{server_name} MCP AGENTCORE_USER_ID={scoped_user_id}")
 
+    # Google Drive remote MCP requires a per-user OAuth access token.
+    drive_token = (google_drive_access_token or os.environ.get("GOOGLE_DRIVE_ACCESS_TOKEN") or "").strip()
+    if "drive" in server_params and not drive_token:
+        logger.warning(
+            "drive MCP skipped: google_drive_access_token missing "
+            "(connect Google Drive in the web UI)"
+        )
+        server_params.pop("drive", None)
+
+    notion_token = (
+        notion_access_token or os.environ.get("NOTION_REMOTE_ACCESS_TOKEN") or ""
+    ).strip()
+    if "notion-remote" in server_params and not notion_token:
+        logger.warning(
+            "notion-remote MCP skipped: notion_access_token missing "
+            "(connect Notion in the web UI)"
+        )
+        server_params.pop("notion-remote", None)
+
     import mcp_apps_host
 
     mcp_apps_host.clear()
@@ -2464,6 +2511,15 @@ async def create_agent(
                 logger.error(f"  cause: {e.__cause__}")
             logger.info(f"Continuing with remaining MCP servers (tools loaded: {len(tools)})")
         
+    if "notion-remote" in server_params:
+        try:
+            import notion_app
+
+            n_notion_apps = notion_app.register_notion_apps()
+            logger.info(f"Registered {n_notion_apps} Notion viewer app(s)")
+        except Exception as notion_app_exc:
+            logger.warning(f"Notion viewer apps skipped: {notion_app_exc}")
+
     tools.extend(skill.get_skill_tools())
 
     skill_info = skill.get_skill_info(skill_list)
@@ -2500,8 +2556,20 @@ active_mcp_servers = []
 active_skills = []
 current_id = None
 _active_agent_session = None
+_active_drive_authed = False
+_active_notion_authed = False
 # tool_name -> MCP server name (populated in create_agent)
 mcp_tool_servers: dict[str, str] = {}
+
+
+def _drive_mcp_requested(mcp_servers: list) -> bool:
+    names = {str(s).strip().lower() for s in (mcp_servers or []) if str(s).strip()}
+    return bool(names & {"drive", "google-drive", "google drive", "google_drive"})
+
+
+def _notion_mcp_requested(mcp_servers: list) -> bool:
+    names = {str(s).strip().lower() for s in (mcp_servers or []) if str(s).strip()}
+    return bool(names & {"notion-remote", "notion remote", "notion_remote"})
 
 
 async def get_or_create_agent(
@@ -2522,9 +2590,18 @@ async def get_or_create_agent(
     microVM's process) and short-circuits to the cached (app, agent_config)
     when nothing relevant changed.
     """
-    global app, agent_config, active_mcp_servers, active_skills, current_id, _active_agent_session
+    global app, agent_config, active_mcp_servers, active_skills, current_id
+    global _active_agent_session, _active_drive_authed, _active_notion_authed
 
     session_id = runtime_session_id or _checkpoint_session_id()
+    drive_authed = bool(
+        (google_drive_access_token or os.environ.get("GOOGLE_DRIVE_ACCESS_TOKEN") or "").strip()
+    )
+    drive_needed = _drive_mcp_requested(mcp_servers)
+    notion_authed = bool(
+        (notion_access_token or os.environ.get("NOTION_REMOTE_ACCESS_TOKEN") or "").strip()
+    )
+    notion_needed = _notion_mcp_requested(mcp_servers)
 
     if (
         app is not None
@@ -2532,6 +2609,8 @@ async def get_or_create_agent(
         and active_skills == skill_list
         and current_id == user_id
         and _active_agent_session == session_id
+        and (not drive_needed or _active_drive_authed == drive_authed)
+        and (not notion_needed or _active_notion_authed == notion_authed)
     ):
         logger.info(
             f"Reusing cached agent/MCP tools (session={session_id}, "
@@ -2541,12 +2620,14 @@ async def get_or_create_agent(
 
     logger.info(
         f"Building new agent/MCP tools (session changed: {_active_agent_session} -> {session_id}, "
-        f"or mcp_servers/skills/user_id changed)"
+        f"or mcp_servers/skills/user_id/drive-auth changed)"
     )
     active_mcp_servers = mcp_servers
     active_skills = skill_list
     current_id = user_id
     _active_agent_session = session_id
+    _active_drive_authed = drive_authed if drive_needed else False
+    _active_notion_authed = notion_authed if notion_needed else False
 
     app, agent_config = await create_agent(mcp_servers, skill_list, runtime_session_id)
     return app, agent_config

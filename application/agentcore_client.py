@@ -111,6 +111,8 @@ class AgentCoreService:
         llm_gateway_enabled=None,
         llm_gateway_url=None,
         llm_gateway_key=None,
+        google_drive_access_token=None,
+        notion_access_token=None,
         files=None,
         task_id=None,
     ) -> str:
@@ -132,6 +134,8 @@ class AgentCoreService:
                 ),
                 "llm_gateway_url": llm_gateway_url or "",
                 "llm_gateway_key": llm_gateway_key or "",
+                "google_drive_access_token": google_drive_access_token or "",
+                "notion_access_token": notion_access_token or "",
                 "runtime_session_id": runtime_session_id,
                 "task_id": task_id or "",
                 "files": files or [],
@@ -204,6 +208,8 @@ class AgentCoreService:
         llm_gateway_enabled=None,
         llm_gateway_url=None,
         llm_gateway_key=None,
+        google_drive_access_token=None,
+        notion_access_token=None,
         files=None,
         task_id=None,
     ):
@@ -230,6 +236,8 @@ class AgentCoreService:
             llm_gateway_enabled=llm_gateway_enabled,
             llm_gateway_url=llm_gateway_url,
             llm_gateway_key=llm_gateway_key,
+            google_drive_access_token=google_drive_access_token,
+            notion_access_token=notion_access_token,
             files=files,
             task_id=task_id,
         )
@@ -237,7 +245,17 @@ class AgentCoreService:
         agent_runtime_arn = self.resolve_runtime_arn()
         print(f"agent_runtime_arn: {agent_runtime_arn}")
         logger.info("agent_runtime_arn: %s", agent_runtime_arn)
-        logger.info("Payload: %s", payload)
+        try:
+            payload_log = json.loads(payload)
+            if payload_log.get("llm_gateway_key"):
+                payload_log["llm_gateway_key"] = "***"
+            if payload_log.get("google_drive_access_token"):
+                payload_log["google_drive_access_token"] = "***"
+            if payload_log.get("notion_access_token"):
+                payload_log["notion_access_token"] = "***"
+            logger.info("Payload: %s", json.dumps(payload_log, ensure_ascii=False))
+        except Exception:
+            logger.info("Payload: (omitted)")
 
         if agent_runtime_arn is None:
             logger.error("agent_runtime_arn is not found")
@@ -308,6 +326,8 @@ def run_agent(
     llm_gateway_enabled=None,
     llm_gateway_url=None,
     llm_gateway_key=None,
+    google_drive_access_token=None,
+    notion_access_token=None,
     files=None,
     task_id=None,
 ):
@@ -324,6 +344,8 @@ def run_agent(
         llm_gateway_enabled=llm_gateway_enabled,
         llm_gateway_url=llm_gateway_url,
         llm_gateway_key=llm_gateway_key,
+        google_drive_access_token=google_drive_access_token,
+        notion_access_token=notion_access_token,
         files=files,
         task_id=task_id,
     )

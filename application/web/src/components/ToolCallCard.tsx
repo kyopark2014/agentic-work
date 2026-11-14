@@ -94,7 +94,7 @@ export function ToolCallCard({ event }: Props) {
     return (
       <div className="tool-card-stack">
         {hasApp && event.mcpApp ? <McpAppFrame app={event.mcpApp} /> : null}
-        <details className="tool-card" open={!hasApp}>
+        <details className="tool-card">
           <summary>
             {formatToolResultLabel(event.tool, event.mcpServer, skillName)}
           </summary>
