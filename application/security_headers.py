@@ -49,6 +49,15 @@ def _s3_connect_src_hosts() -> str:
     return " ".join(hosts)
 
 
+# MCP Apps UIs rendered by third-party MCP servers (srcdoc iframes inherit this CSP).
+# Canva's UI loads its app bundle/CSS/fonts from static.canva.com and talks to its own
+# APIs/media (these mirror the `_meta.ui.csp` its MCP server declares, plus its Sentry).
+_MCP_APPS_STATIC_HOSTS = "https://static.canva.com"
+_MCP_APPS_CONNECT_HOSTS = (
+    "https://*.canva.com https://media.canva.com blob: "
+    "https://o13855.ingest.us.sentry.io"
+)
+
 # Allow Google Identity Services (GSI) while locking down everything else.
 # frame-src includes 'self' so Knowledge/Wiki Graph modals can iframe HTML
 # (without 'self' the graph iframe is blank).
@@ -61,12 +70,12 @@ def _s3_connect_src_hosts() -> str:
 #   the widget stays on "불러오는 중…" (agent-skills has no CSP middleware).
 _CONTENT_SECURITY_POLICY = (
     "default-src 'self'; "
-    "script-src 'self' 'unsafe-inline' https://accounts.google.com https://apis.google.com; "
-    "style-src 'self' 'unsafe-inline'; "
+    f"script-src 'self' 'unsafe-inline' https://accounts.google.com https://apis.google.com {_MCP_APPS_STATIC_HOSTS}; "
+    f"style-src 'self' 'unsafe-inline' {_MCP_APPS_STATIC_HOSTS}; "
     "img-src 'self' data: blob: https:; "
-    "font-src 'self' data:; "
+    f"font-src 'self' data: {_MCP_APPS_STATIC_HOSTS}; "
     "connect-src 'self' https://accounts.google.com https://oauth2.googleapis.com "
-    f"https://www.googleapis.com {_s3_connect_src_hosts()}; "
+    f"https://www.googleapis.com {_s3_connect_src_hosts()} {_MCP_APPS_CONNECT_HOSTS}; "
     "frame-src 'self' https://accounts.google.com; "
     "frame-ancestors 'none'; "
     "base-uri 'self'; "

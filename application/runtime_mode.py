@@ -138,6 +138,24 @@ def run_agent(
     except Exception as e:
         logger.warning("Notion token lookup failed: %s", e)
 
+    mcp_oauth_tokens: dict[str, str] = {}
+    try:
+        try:
+            from application import canva_auth
+        except ImportError:
+            import canva_auth
+
+        if canva_auth.mcp_selected(mcp_servers):
+            canva_token = canva_auth.get_access_token(user_id) or canva_auth.get_access_token(
+                user_id, allow_expired=True
+            )
+            if canva_token:
+                mcp_oauth_tokens["canva"] = canva_token
+            else:
+                logger.warning("canva MCP selected but no Canva token for %s", user_id)
+    except Exception as e:
+        logger.warning("Canva token lookup failed: %s", e)
+
     return agentcore_client.run_agent(
         prompt,
         user_id,
@@ -153,6 +171,7 @@ def run_agent(
         llm_gateway_key=gateway_key or None,
         google_drive_access_token=drive_token,
         notion_access_token=notion_token,
+        mcp_oauth_tokens=mcp_oauth_tokens,
         files=files,
         task_id=task_id,
     )

@@ -1857,6 +1857,12 @@ def load_multiple_mcp_server_parameters(mcp_json: dict):
                     import google_drive_bearer_auth
 
                     connection["auth"] = google_drive_bearer_auth.GoogleDriveBearerAuth()
+                elif config.get("auth_type") == "mcp_bearer":
+                    import mcp_bearer_auth
+
+                    connection["auth"] = mcp_bearer_auth.McpBearerAuth(
+                        config.get("auth_name") or server_name
+                    )
                 elif config.get("auth_type") == "notion_bearer":
                     import notion_bearer_auth
 

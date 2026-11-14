@@ -33,6 +33,13 @@ async def call_tool(body: CallToolRequest, request: Request) -> dict[str, Any]:
             user_id=user_id,
         )
     except ValueError as exc:
+        # The 400 body is not in the server log; record why the iframe call was refused.
+        logger.warning(
+            "mcp-apps call rejected: server=%r tool=%r reason=%s",
+            body.mcpServer,
+            body.tool,
+            exc,
+        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("MCP App tool call failed")

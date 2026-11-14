@@ -13,6 +13,7 @@ import utils
 import unicode_paths
 import bedrock_data_retention
 import langgraph_agent
+import mcp_bearer_auth
 import mcp_config
 import skill
 
@@ -93,6 +94,7 @@ llm_gateway_url: str | None = None
 llm_gateway_key: str | None = None
 google_drive_access_token: str | None = None
 notion_access_token: str | None = None
+mcp_oauth_tokens: dict[str, str] = {}
 memory_id = None
 actor_id = None
 session_id = None
@@ -108,11 +110,12 @@ def update(
     llmGatewayKey=None,
     googleDriveAccessToken=None,
     notionAccessToken=None,
+    mcpOauthTokens=None,
 ):
     global model_name, model_id, model_type, debug_mode, reasoning_mode
     global models, user_id, guardrail_enabled, memory_enabled
     global llm_gateway_enabled, llm_gateway_url, llm_gateway_key
-    global google_drive_access_token, notion_access_token
+    global google_drive_access_token, notion_access_token, mcp_oauth_tokens
 
     if userId != user_id:
         user_id = userId
@@ -168,6 +171,19 @@ def update(
             os.environ["NOTION_REMOTE_ACCESS_TOKEN"] = notion_access_token
         else:
             os.environ.pop("NOTION_REMOTE_ACCESS_TOKEN", None)
+
+    if mcpOauthTokens is not None:
+        import mcp_bearer_auth
+
+        for old_name in list(mcp_oauth_tokens):
+            os.environ.pop(mcp_bearer_auth.env_name(old_name), None)
+        mcp_oauth_tokens = {
+            str(k): str(v).strip()
+            for k, v in (mcpOauthTokens or {}).items()
+            if str(v or "").strip()
+        }
+        for name, token in mcp_oauth_tokens.items():
+            os.environ[mcp_bearer_auth.env_name(name)] = token
 
 
 def _llm_gateway_settings() -> tuple[str, str] | None:
@@ -2403,6 +2419,19 @@ def append_tool_guidance_to_prompt(system_prompt: str, mcp_servers: list) -> str
             "사용자 Drive 권한 범위 안에서만 동작합니다."
         )
 
+    if "canva" in selected:
+        extras.append(
+            "Canva 작업은 canva MCP 도구를 사용하세요. "
+            "create-design, generate-image, remove-background, separate-image-layers는 "
+            "채팅에 인터랙티브 UI(MCP Apps)를 렌더하므로, 결과 UI가 보이면 같은 내용을 "
+            "텍스트로 길게 반복하지 마세요. 디자인 편집은 start-editing-transaction → "
+            "perform-editing-operations → commit-editing-transaction 순서로 하고, "
+            "commit 전에는 반드시 사용자 승인을 받으세요. "
+            "Canva 스킬(canva-edit-design 등)이 있으면 get_skill_instructions로 먼저 읽으세요. "
+            "생성·편집 도구가 권한 오류(403/insufficient scope)를 내면, 사용자에게 "
+            "MCP 메뉴에서 'Canva 쓰기 권한 추가'를 눌러 다시 승인하도록 안내하세요."
+        )
+
     if not extras:
         return system_prompt
 
@@ -2474,6 +2503,19 @@ async def create_agent(
         )
         server_params.pop("notion-remote", None)
 
+    for oauth_name in ("canva",):
+        oauth_token = (
+            (mcp_oauth_tokens or {}).get(oauth_name)
+            or os.environ.get(mcp_bearer_auth.env_name(oauth_name))
+            or ""
+        ).strip()
+        if oauth_name in server_params and not oauth_token:
+            logger.warning(
+                f"{oauth_name} MCP skipped: OAuth token missing "
+                "(connect it in the web UI MCP menu)"
+            )
+            server_params.pop(oauth_name, None)
+
     import mcp_apps_host
 
     mcp_apps_host.clear()
@@ -2498,6 +2540,14 @@ async def create_agent(
                     logger.warning(
                         f"MCP Apps cache skipped for {server_name}: {app_exc}"
                     )
+            hidden = [
+                t.name
+                for t in mcp_tools
+                if mcp_apps_host.is_app_only_tool(getattr(t, "metadata", None))
+            ]
+            if hidden:
+                logger.info(f"app-only tools hidden from the model ({server_name}): {hidden}")
+                mcp_tools = [t for t in mcp_tools if t.name not in hidden]
             for tool in wrap_mcp_tools(mcp_tools):
                 logger.info(f"mcp_tool: {tool.name} (from {server_name})")
                 if tool.name not in [t.name for t in tools]:
@@ -2558,6 +2608,7 @@ current_id = None
 _active_agent_session = None
 _active_drive_authed = False
 _active_notion_authed = False
+_active_oauth_authed: frozenset[str] = frozenset()
 # tool_name -> MCP server name (populated in create_agent)
 mcp_tool_servers: dict[str, str] = {}
 
@@ -2592,6 +2643,7 @@ async def get_or_create_agent(
     """
     global app, agent_config, active_mcp_servers, active_skills, current_id
     global _active_agent_session, _active_drive_authed, _active_notion_authed
+    global _active_oauth_authed
 
     session_id = runtime_session_id or _checkpoint_session_id()
     drive_authed = bool(
@@ -2602,6 +2654,12 @@ async def get_or_create_agent(
         (notion_access_token or os.environ.get("NOTION_REMOTE_ACCESS_TOKEN") or "").strip()
     )
     notion_needed = _notion_mcp_requested(mcp_servers)
+    oauth_authed = frozenset(
+        n for n, t in (mcp_oauth_tokens or {}).items() if (t or "").strip()
+    )
+    oauth_needed = "canva" in {
+        str(s).strip().lower() for s in (mcp_servers or []) if str(s).strip()
+    }
 
     if (
         app is not None
@@ -2611,6 +2669,7 @@ async def get_or_create_agent(
         and _active_agent_session == session_id
         and (not drive_needed or _active_drive_authed == drive_authed)
         and (not notion_needed or _active_notion_authed == notion_authed)
+        and (not oauth_needed or _active_oauth_authed == oauth_authed)
     ):
         logger.info(
             f"Reusing cached agent/MCP tools (session={session_id}, "
@@ -2628,6 +2687,7 @@ async def get_or_create_agent(
     _active_agent_session = session_id
     _active_drive_authed = drive_authed if drive_needed else False
     _active_notion_authed = notion_authed if notion_needed else False
+    _active_oauth_authed = oauth_authed if oauth_needed else frozenset()
 
     app, agent_config = await create_agent(mcp_servers, skill_list, runtime_session_id)
     return app, agent_config

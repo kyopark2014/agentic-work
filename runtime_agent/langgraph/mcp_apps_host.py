@@ -70,18 +70,23 @@ def _fallback_weather_app(tool_name: str) -> dict[str, Any] | None:
     return get_tool_app(tool_name)
 
 
-def build_app_payload(tool_name: str | None, tool_result_text: str) -> dict[str, Any] | None:
+def build_app_payload(
+    tool_name: str | None,
+    tool_result_text: str,
+    structured_content: Any = None,
+) -> dict[str, Any] | None:
     app = get_tool_app(tool_name) or (
         _fallback_weather_app(tool_name) if tool_name else None
     )
     if not app:
         return None
-    return {
-        **app,
-        "toolResult": {
-            "content": [{"type": "text", "text": tool_result_text}],
-        },
+    tool_result: dict[str, Any] = {
+        "content": [{"type": "text", "text": tool_result_text}],
     }
+    # MCP Apps UIs (e.g. Canva) read the tool's ``structuredContent`` directly.
+    if structured_content is not None:
+        tool_result["structuredContent"] = structured_content
+    return {**app, "toolResult": tool_result}
 
 
 def extract_ui_resource_uri(tool_metadata: dict[str, Any] | None) -> str | None:
@@ -106,6 +111,20 @@ def extract_ui_resource_uri(tool_metadata: dict[str, Any] | None) -> str | None:
     if isinstance(legacy, str) and legacy.startswith("ui://"):
         return legacy
     return None
+
+
+def is_app_only_tool(tool_metadata: dict[str, Any] | None) -> bool:
+    """True when a tool is meant for the MCP App iframe only (``_meta.ui.visibility``
+    omits ``"model"``). Such tools are served through the host proxy and are hidden
+    from the model so it does not call UI plumbing (e.g. telemetry) directly."""
+    if not isinstance(tool_metadata, dict):
+        return False
+    mcp = tool_metadata.get("mcp")
+    tool_meta = mcp.get("tool") if isinstance(mcp, dict) else None
+    meta = tool_meta.get("_meta") if isinstance(tool_meta, dict) else None
+    ui = meta.get("ui") if isinstance(meta, dict) else None
+    visibility = ui.get("visibility") if isinstance(ui, dict) else None
+    return isinstance(visibility, list) and bool(visibility) and "model" not in visibility
 
 
 def extract_mcp_server_name(tool_metadata: dict[str, Any] | None) -> str | None:
@@ -173,7 +192,10 @@ async def cache_apps_from_adapter(
                 tool.name,
                 resource_uri=uri,
                 html=html,
-                mcp_server=extract_mcp_server_name(metadata) or fallback_server_name,
+                # The host proxy routes by the MCP *config key* ("canva", "notion-remote",
+                # "weather"). The server's self-declared name ("Canva MCP Server") is only
+                # a fallback: it is not unique or stable and the proxy would not know it.
+                mcp_server=fallback_server_name or extract_mcp_server_name(metadata),
                 csp=extra.get("csp"),
                 mime_type=extra.get("mimeType"),
             )

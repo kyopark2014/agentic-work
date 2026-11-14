@@ -396,6 +396,19 @@ def load_config(mcp_type):
             }
         }
 
+    elif mcp_type == "canva":
+        # Canva hosted MCP (per-user OAuth bearer injected per request; see mcp_bearer_auth.py).
+        return {
+            "mcpServers": {
+                "canva": {
+                    "type": "streamable_http",
+                    "url": "https://mcp.canva.com/mcp",
+                    "auth_type": "mcp_bearer",
+                    "auth_name": "canva",
+                }
+            }
+        }
+
     elif mcp_type in ("notion-remote", "notion remote", "notion_remote"):
         # Notion hosted MCP (OAuth bearer injected per request; see notion_bearer_auth.py).
         return {

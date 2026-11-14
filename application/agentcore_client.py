@@ -113,6 +113,7 @@ class AgentCoreService:
         llm_gateway_key=None,
         google_drive_access_token=None,
         notion_access_token=None,
+        mcp_oauth_tokens=None,
         files=None,
         task_id=None,
     ) -> str:
@@ -136,6 +137,7 @@ class AgentCoreService:
                 "llm_gateway_key": llm_gateway_key or "",
                 "google_drive_access_token": google_drive_access_token or "",
                 "notion_access_token": notion_access_token or "",
+                "mcp_oauth_tokens": mcp_oauth_tokens or {},
                 "runtime_session_id": runtime_session_id,
                 "task_id": task_id or "",
                 "files": files or [],
@@ -210,6 +212,7 @@ class AgentCoreService:
         llm_gateway_key=None,
         google_drive_access_token=None,
         notion_access_token=None,
+        mcp_oauth_tokens=None,
         files=None,
         task_id=None,
     ):
@@ -238,6 +241,7 @@ class AgentCoreService:
             llm_gateway_key=llm_gateway_key,
             google_drive_access_token=google_drive_access_token,
             notion_access_token=notion_access_token,
+            mcp_oauth_tokens=mcp_oauth_tokens,
             files=files,
             task_id=task_id,
         )
@@ -253,6 +257,10 @@ class AgentCoreService:
                 payload_log["google_drive_access_token"] = "***"
             if payload_log.get("notion_access_token"):
                 payload_log["notion_access_token"] = "***"
+            if payload_log.get("mcp_oauth_tokens"):
+                payload_log["mcp_oauth_tokens"] = {
+                    k: "***" for k in payload_log["mcp_oauth_tokens"]
+                }
             logger.info("Payload: %s", json.dumps(payload_log, ensure_ascii=False))
         except Exception:
             logger.info("Payload: (omitted)")
@@ -328,6 +336,7 @@ def run_agent(
     llm_gateway_key=None,
     google_drive_access_token=None,
     notion_access_token=None,
+    mcp_oauth_tokens=None,
     files=None,
     task_id=None,
 ):
@@ -346,6 +355,7 @@ def run_agent(
         llm_gateway_key=llm_gateway_key,
         google_drive_access_token=google_drive_access_token,
         notion_access_token=notion_access_token,
+        mcp_oauth_tokens=mcp_oauth_tokens,
         files=files,
         task_id=task_id,
     )

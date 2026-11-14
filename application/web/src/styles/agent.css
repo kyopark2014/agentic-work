@@ -2686,6 +2686,22 @@ button.config-popover-choice.is-selected {
   cursor: not-allowed;
 }
 
+.config-popover-footer-actions input {
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-primary);
+  border-radius: 8px;
+  padding: 5px 8px;
+  font-size: 12px;
+}
+
+.config-popover-footer-manual {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
 .config-popover-footer-error {
   font-size: 11px;
   color: #f87171;

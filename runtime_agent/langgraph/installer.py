@@ -2155,7 +2155,7 @@ def create_agent_runtime_func(config, repository_name, image_tag):
             filesystemConfigurations=session_storage_filesystem_configurations(config),
             networkConfiguration=network_configuration,
             roleArn=agent_runtime_role,
-            platformVersion="V2",
+            platformVersion="V1",
         )
         
         print(f"? Agent runtime created: {response['agentRuntimeArn']}")

@@ -53,6 +53,9 @@ class SessionResponse(BaseModel):
     google_drive_fresh: bool = False
     notion_connected: bool = False
     notion_fresh: bool = False
+    canva_connected: bool = False
+    canva_fresh: bool = False
+    canva_write: bool = False
 
 
 class SessionSettingsPatch(BaseModel):
@@ -307,17 +310,12 @@ def _google_drive_status(user_id: str) -> dict:
         return {"connected": False, "fresh": False}
 
 
-def _notion_status(user_id: str) -> dict:
+def _oauth_status(user_id: str, name: str) -> dict:
     try:
-        try:
-            from application import notion_auth
-        except ImportError:
-            import notion_auth
-
-        return notion_auth.status_for_user(user_id)
+        return _oauth_module(name).status_for_user(user_id)
     except Exception:
-        logger.exception("Failed to load Notion status for %s", user_id)
-        return {"connected": False, "fresh": False}
+        logger.exception("Failed to load %s status for %s", name, user_id)
+        return {"connected": False, "fresh": False, "write": False}
 
 
 def _session_response(
@@ -329,7 +327,8 @@ def _session_response(
 ) -> SessionResponse:
     settings = utils.load_user_settings(user_id)
     drive = _google_drive_status(user_id)
-    notion = _notion_status(user_id)
+    notion = _oauth_status(user_id, "notion")
+    canva = _oauth_status(user_id, "canva")
     return SessionResponse(
         user_id=user_id,
         name=name,
@@ -349,6 +348,9 @@ def _session_response(
         google_drive_fresh=bool(drive.get("fresh")),
         notion_connected=bool(notion.get("connected")),
         notion_fresh=bool(notion.get("fresh")),
+        canva_connected=bool(canva.get("connected")),
+        canva_fresh=bool(canva.get("fresh")),
+        canva_write=bool(canva.get("write")),
     )
 
 
@@ -583,33 +585,48 @@ def disconnect_google_drive(request: Request) -> None:
     google_drive_auth.clear_token(user_id)
 
 
-class NotionStatusResponse(BaseModel):
+class McpOAuthStatusResponse(BaseModel):
     connected: bool
     fresh: bool
     expires_at: float | None = None
     updated_at: str | None = None
+    write: bool = False
 
 
-class NotionAuthorizeResponse(BaseModel):
+class McpOAuthAuthorizeResponse(BaseModel):
     url: str
+    # True when the provider only accepts loopback redirects and this deployment is not
+    # loopback: the user must paste the post-approval address-bar URL to /exchange.
+    manual: bool = False
 
 
-def _notion_auth_module():
+class McpOAuthExchangeRequest(BaseModel):
+    url: str = Field(..., min_length=1, max_length=4096)
+
+
+# Hosted MCP servers connected through per-user OAuth (see mcp_oauth.py).
+_OAUTH_MCP_MODULES = {"notion": "notion_auth", "canva": "canva_auth"}
+
+
+def _oauth_module(name: str):
+    import importlib
+
+    module = _OAUTH_MCP_MODULES[name]
     try:
-        from application import notion_auth
+        return importlib.import_module(f"application.{module}")
     except ImportError:
-        import notion_auth
-    return notion_auth
+        return importlib.import_module(module)
 
 
-def _notion_redirect_uri(request: Request) -> str:
+def _oauth_redirect_uri(request: Request, name: str) -> str:
     """Public callback URL (must be identical for authorize + token exchange)."""
+    path = f"/api/session/{name}/callback"
     if not is_loopback_request(request):
         # Behind CloudFront -> ALB the Host header is not the viewer's domain;
         # the configured public URL is the origin the browser actually uses.
         sharing = (utils.load_config().get("sharing_url") or "").strip().rstrip("/")
         if sharing.startswith("https://"):
-            return f"{sharing}/api/session/notion/callback"
+            return f"{sharing}{path}"
     secure = _cookie_secure(request)
     host = (
         request.headers.get("x-forwarded-host")
@@ -617,61 +634,108 @@ def _notion_redirect_uri(request: Request) -> str:
         or request.url.netloc
     )
     scheme = "https" if secure else "http"
-    return f"{scheme}://{host}/api/session/notion/callback"
+    return f"{scheme}://{host}{path}"
 
 
-@router.get("/notion", response_model=NotionStatusResponse)
-def get_notion_status(request: Request) -> NotionStatusResponse:
-    user_id = require_user_id(request)
-    return NotionStatusResponse(**_notion_auth_module().status_for_user(user_id))
+def _register_oauth_mcp_routes(name: str) -> None:
+    label = name.capitalize()
 
+    def get_status(request: Request) -> McpOAuthStatusResponse:
+        user_id = require_user_id(request)
+        return McpOAuthStatusResponse(**_oauth_module(name).status_for_user(user_id))
 
-@router.get("/notion/authorize", response_model=NotionAuthorizeResponse)
-def authorize_notion(request: Request) -> NotionAuthorizeResponse:
-    """Return the Notion OAuth URL; the browser opens it in a popup."""
-    user_id = require_user_id(request)
-    try:
-        url = _notion_auth_module().start(user_id, _notion_redirect_uri(request))
-    except Exception as e:
-        logger.exception("Notion authorize failed")
-        raise HTTPException(status_code=502, detail=f"Notion OAuth start failed: {e}") from e
-    return NotionAuthorizeResponse(url=url)
-
-
-@router.get("/notion/callback")
-def notion_callback(
-    request: Request,
-    code: str | None = None,
-    state: str | None = None,
-    iss: str | None = None,
-    error: str | None = None,
-) -> Response:
-    """OAuth redirect target. Identity comes from ``state`` (single-use, server-side)."""
-    ok = False
-    message = error or "Notion connection failed"
-    if not error and code and state:
+    def authorize(request: Request, write: bool = False) -> McpOAuthAuthorizeResponse:
+        """Return the OAuth URL; the browser opens it in a popup."""
+        user_id = require_user_id(request)
+        provider = _oauth_module(name).PROVIDER
+        manual = bool(provider.loopback_only and not is_loopback_request(request))
+        redirect_uri = (
+            provider.manual_redirect_uri if manual else _oauth_redirect_uri(request, name)
+        )
         try:
-            _notion_auth_module().finish(state, code, iss)
-            ok = True
-            message = "connected"
+            url = _oauth_module(name).start(user_id, redirect_uri, write=write)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         except Exception as e:
-            logger.warning("Notion OAuth callback failed: %s", e)
-            message = "Notion 연결에 실패했습니다. 다시 시도하세요."
-    payload = json.dumps({"type": "notion-oauth", "ok": ok, "message": message})
-    title = "Notion 연결됨" if ok else "Notion 연결 실패"
-    html = (
-        "<!doctype html><meta charset=utf-8><title>%s</title>"
-        "<body style=\"font-family:system-ui;padding:2rem\"><p>%s. 이 창은 닫아도 됩니다.</p>"
-        "<script>try{window.opener&&window.opener.postMessage(%s,window.location.origin)}"
-        "catch(e){}window.close()</script></body>"
-    ) % (title, title, payload.replace("<", "\\u003c"))
-    return Response(content=html, media_type="text/html", status_code=200 if ok else 400)
+            logger.exception("%s authorize failed", label)
+            raise HTTPException(
+                status_code=502, detail=f"{label} OAuth start failed: {e}"
+            ) from e
+        return McpOAuthAuthorizeResponse(url=url, manual=manual)
+
+    def exchange(
+        body: McpOAuthExchangeRequest, request: Request
+    ) -> McpOAuthStatusResponse:
+        """Finish a manual flow from the URL the user pasted after approving."""
+        user_id = require_user_id(request)
+        auth = _oauth_module(name)
+        try:
+            state, code, iss = auth.oauth.parse_redirect(body.url)
+            auth.oauth.finish(state, code, iss, expected_user_id=user_id)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except Exception as e:
+            logger.warning("%s manual exchange failed: %s", label, e)
+            raise HTTPException(
+                status_code=502, detail=f"{label} 연결에 실패했습니다. 다시 시도하세요."
+            ) from e
+        return McpOAuthStatusResponse(**auth.status_for_user(user_id))
+
+    def callback(
+        code: str | None = None,
+        state: str | None = None,
+        iss: str | None = None,
+        error: str | None = None,
+    ) -> Response:
+        """OAuth redirect target. Identity comes from ``state`` (single-use, server-side)."""
+        ok = False
+        message = error or f"{label} connection failed"
+        if not error and code and state:
+            try:
+                _oauth_module(name).finish(state, code, iss)
+                ok = True
+                message = "connected"
+            except Exception as e:
+                logger.warning("%s OAuth callback failed: %s", label, e)
+                message = f"{label} 연결에 실패했습니다. 다시 시도하세요."
+        payload = json.dumps({"type": f"{name}-oauth", "ok": ok, "message": message})
+        title = f"{label} 연결됨" if ok else f"{label} 연결 실패"
+        html = (
+            "<!doctype html><meta charset=utf-8><title>%s</title>"
+            "<body style=\"font-family:system-ui;padding:2rem\"><p>%s. 이 창은 닫아도 됩니다.</p>"
+            "<script>try{window.opener&&window.opener.postMessage(%s,window.location.origin)}"
+            "catch(e){}window.close()</script></body>"
+        ) % (title, title, payload.replace("<", "\\u003c"))
+        return Response(
+            content=html, media_type="text/html", status_code=200 if ok else 400
+        )
+
+    def disconnect(request: Request) -> None:
+        user_id = require_user_id(request)
+        _oauth_module(name).clear_token(user_id)
+
+    base = f"/{name}"
+    router.add_api_route(
+        base, get_status, methods=["GET"], response_model=McpOAuthStatusResponse
+    )
+    router.add_api_route(
+        f"{base}/authorize",
+        authorize,
+        methods=["GET"],
+        response_model=McpOAuthAuthorizeResponse,
+    )
+    router.add_api_route(
+        f"{base}/exchange",
+        exchange,
+        methods=["POST"],
+        response_model=McpOAuthStatusResponse,
+    )
+    router.add_api_route(f"{base}/callback", callback, methods=["GET"])
+    router.add_api_route(base, disconnect, methods=["DELETE"], status_code=204)
 
 
-@router.delete("/notion", status_code=204)
-def disconnect_notion(request: Request) -> None:
-    user_id = require_user_id(request)
-    _notion_auth_module().clear_token(user_id)
+for _oauth_name in _OAUTH_MCP_MODULES:
+    _register_oauth_mcp_routes(_oauth_name)
 
 
 def require_user_id(request: Request) -> str:

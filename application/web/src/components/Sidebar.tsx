@@ -2,7 +2,8 @@ import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } f
 import { api } from "../api";
 import { formatBrandTitle } from "../formatBrandTitle";
 import { connectGoogleDrive } from "../googleDriveAuth";
-import { connectNotion } from "../notionAuth";
+import { connectMcpOAuth } from "../mcpOAuth";
+import { OAuthMcpFooter } from "./OAuthMcpFooter";
 import { useTheme } from "../hooks/useTheme";
 import type { Theme } from "../theme";
 import type { AppConfig, Task } from "../types";
@@ -104,6 +105,9 @@ export function Sidebar({
   const [driveError, setDriveError] = useState<string | null>(null);
   const [notionBusy, setNotionBusy] = useState(false);
   const [notionError, setNotionError] = useState<string | null>(null);
+  const [canvaBusy, setCanvaBusy] = useState(false);
+  const [canvaError, setCanvaError] = useState<string | null>(null);
+  const [canvaManual, setCanvaManual] = useState(false);
   const modelBtnRef = useRef<HTMLButtonElement>(null);
   const appearanceBtnRef = useRef<HTMLButtonElement>(null);
   const wikiBtnRef = useRef<HTMLButtonElement>(null);
@@ -863,6 +867,8 @@ export function Sidebar({
             const enablingNotion =
               next.includes("notion-remote") &&
               !mcpServers.includes("notion-remote");
+            const enablingCanva =
+              next.includes("canva") && !mcpServers.includes("canva");
             await onPatchTask(activeTask.id, { mcp_servers: next });
             if (
               enablingNotion &&
@@ -871,12 +877,28 @@ export function Sidebar({
               setNotionError(null);
               setNotionBusy(true);
               try {
-                await connectNotion();
+                await connectMcpOAuth("notion");
                 if (onRefreshConfig) await onRefreshConfig();
               } catch (err) {
                 setNotionError(err instanceof Error ? err.message : String(err));
               } finally {
                 setNotionBusy(false);
+              }
+            }
+            if (
+              enablingCanva &&
+              !(config.canva_connected && config.canva_fresh)
+            ) {
+              setCanvaError(null);
+              setCanvaBusy(true);
+              try {
+                const result = await connectMcpOAuth("canva");
+                if (result === "manual") setCanvaManual(true);
+                if (onRefreshConfig) await onRefreshConfig();
+              } catch (err) {
+                setCanvaError(err instanceof Error ? err.message : String(err));
+              } finally {
+                setCanvaBusy(false);
               }
             }
             if (
@@ -907,66 +929,91 @@ export function Sidebar({
           footer={
             <>
             {mcpServers.includes("notion-remote") ? (
-              <div>
-                <div className="config-popover-footer-status">
-                  {config.notion_connected && config.notion_fresh
-                    ? "Notion 연결됨"
-                    : config.notion_connected
-                      ? "Notion 토큰 만료 — 다시 연결하세요"
-                      : "notion-remote MCP 사용 전 Notion 연결 필요"}
-                </div>
-                <div className="config-popover-footer-actions">
-                  <button
-                    type="button"
-                    disabled={notionBusy}
-                    onClick={async () => {
-                      setNotionError(null);
-                      setNotionBusy(true);
-                      try {
-                        await connectNotion();
-                        if (onRefreshConfig) await onRefreshConfig();
-                      } catch (err) {
-                        setNotionError(
-                          err instanceof Error ? err.message : String(err),
-                        );
-                      } finally {
-                        setNotionBusy(false);
-                      }
-                    }}
-                  >
-                    {notionBusy
-                      ? "연결 중…"
-                      : config.notion_connected
-                        ? "다시 연결"
-                        : "Notion 연결"}
-                  </button>
-                  {config.notion_connected ? (
-                    <button
-                      type="button"
-                      disabled={notionBusy}
-                      onClick={async () => {
-                        setNotionError(null);
-                        setNotionBusy(true);
-                        try {
-                          await api.disconnectNotion();
-                          if (onRefreshConfig) await onRefreshConfig();
-                        } catch (err) {
-                          setNotionError(
-                            err instanceof Error ? err.message : String(err),
-                          );
-                        } finally {
-                          setNotionBusy(false);
-                        }
-                      }}
-                    >
-                      연결 해제
-                    </button>
-                  ) : null}
-                </div>
-                {notionError ? (
-                  <div className="config-popover-footer-error">{notionError}</div>
-                ) : null}
-              </div>
+              <OAuthMcpFooter
+                label="Notion"
+                mcpName="notion-remote"
+                connected={Boolean(config.notion_connected)}
+                fresh={Boolean(config.notion_fresh)}
+                busy={notionBusy}
+                error={notionError}
+                onConnect={async () => {
+                  setNotionError(null);
+                  setNotionBusy(true);
+                  try {
+                    await connectMcpOAuth("notion");
+                    if (onRefreshConfig) await onRefreshConfig();
+                  } catch (err) {
+                    setNotionError(err instanceof Error ? err.message : String(err));
+                  } finally {
+                    setNotionBusy(false);
+                  }
+                }}
+                onDisconnect={async () => {
+                  setNotionError(null);
+                  setNotionBusy(true);
+                  try {
+                    await api.disconnectOAuthMcp("notion");
+                    if (onRefreshConfig) await onRefreshConfig();
+                  } catch (err) {
+                    setNotionError(err instanceof Error ? err.message : String(err));
+                  } finally {
+                    setNotionBusy(false);
+                  }
+                }}
+              />
+            ) : null}
+            {mcpServers.includes("canva") ? (
+              <OAuthMcpFooter
+                label="Canva"
+                mcpName="canva"
+                connected={Boolean(config.canva_connected)}
+                fresh={Boolean(config.canva_fresh)}
+                write={Boolean(config.canva_write)}
+                supportsWrite
+                busy={canvaBusy}
+                error={canvaError}
+                onConnect={async (write) => {
+                  setCanvaError(null);
+                  setCanvaBusy(true);
+                  try {
+                    const result = await connectMcpOAuth("canva", { write });
+                    setCanvaManual(result === "manual");
+                    if (onRefreshConfig) await onRefreshConfig();
+                  } catch (err) {
+                    setCanvaError(err instanceof Error ? err.message : String(err));
+                  } finally {
+                    setCanvaBusy(false);
+                  }
+                }}
+                onDisconnect={async () => {
+                  setCanvaError(null);
+                  setCanvaBusy(true);
+                  try {
+                    await api.disconnectOAuthMcp("canva");
+                    setCanvaManual(false);
+                    if (onRefreshConfig) await onRefreshConfig();
+                  } catch (err) {
+                    setCanvaError(err instanceof Error ? err.message : String(err));
+                  } finally {
+                    setCanvaBusy(false);
+                  }
+                }}
+                manualPending={canvaManual}
+                onCancelManual={() => setCanvaManual(false)}
+                onSubmitManual={async (url) => {
+                  setCanvaError(null);
+                  setCanvaBusy(true);
+                  try {
+                    await api.exchangeOAuthMcp("canva", url);
+                    setCanvaManual(false);
+                    if (onRefreshConfig) await onRefreshConfig();
+                  } catch (err) {
+                    setCanvaError(err instanceof Error ? err.message : String(err));
+                  } finally {
+                    setCanvaBusy(false);
+                  }
+                }}
+              />
             ) : null}
             {config.mcp_servers.includes("drive") ? (
               <div>

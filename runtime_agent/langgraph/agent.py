@@ -150,6 +150,10 @@ async def agent_langgraph(payload):
             _payload_log["google_drive_access_token"] = "***"
         if _payload_log.get("notion_access_token"):
             _payload_log["notion_access_token"] = "***"
+        if _payload_log.get("mcp_oauth_tokens"):
+            _payload_log["mcp_oauth_tokens"] = {
+                k: "***" for k in _payload_log["mcp_oauth_tokens"]
+            }
         logger.info(f"payload: {_payload_log}")
     except Exception:
         logger.info("payload: (received)")
@@ -185,6 +189,7 @@ async def agent_langgraph(payload):
         llmGatewayKey=payload.get("llm_gateway_key"),
         googleDriveAccessToken=payload.get("google_drive_access_token"),
         notionAccessToken=payload.get("notion_access_token"),
+        mcpOauthTokens=payload.get("mcp_oauth_tokens"),
     )
 
     logger.info(f"guardrail_enabled: {chat.guardrail_enabled}")
@@ -595,7 +600,15 @@ async def agent_langgraph(payload):
                 import mcp_apps_host
 
                 normalized = mcp_apps_host.normalize_tool_result_text(tool_result_text)
-                mcp_app = mcp_apps_host.build_app_payload(tool_name, normalized)
+                artifact = getattr(chunk, "artifact", None)
+                structured = (
+                    artifact.get("structured_content")
+                    if isinstance(artifact, dict)
+                    else None
+                )
+                mcp_app = mcp_apps_host.build_app_payload(
+                    tool_name, normalized, structured
+                )
                 tool_result_payload = {
                     "toolResult": utils.truncate_for_stream(normalized),
                     "toolUseId": tool_use_id,

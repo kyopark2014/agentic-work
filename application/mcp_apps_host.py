@@ -105,7 +105,9 @@ def normalize_tool_result_text(content: Any) -> str:
     return str(content)
 
 
-# Read-only Notion tools an MCP App iframe may call on the user's behalf.
+# Tools an MCP App iframe may call on the signed-in user's behalf, per remote MCP.
+# The iframe is untrusted page content, so this is an explicit allowlist (never
+# "whatever the server lists").
 NOTION_IFRAME_TOOLS = frozenset(
     {
         "notion-search",
@@ -117,45 +119,70 @@ NOTION_IFRAME_TOOLS = frozenset(
     }
 )
 
+# Canva: the tools its MCP Apps UIs use (app-only helpers, job pollers, thumbnails)
+# plus the one explicit user action in the UI (turn a candidate into a design).
+CANVA_IFRAME_TOOLS = frozenset(
+    {
+        "track-event-lifecycle",
+        "get-design-candidates",
+        "get-design-thumbnails",
+        "get-design-thumbnail",
+        "get-create-design-async-job",
+        "get-generate-image-job",
+        "get-separate-image-layers-job",
+        "get-assets",
+        "create-design-from-candidate",
+    }
+)
 
-async def _call_notion_tool(
+# Names an MCP server declares for itself, as older stored mcpApp payloads carried them.
+_SERVER_ALIASES = {"canva mcp server": "canva"}
+
+# server name (as used in the mcpApp payload) -> (auth module, allowed tools)
+_REMOTE_OAUTH_MCPS: dict[str, tuple[str, frozenset[str]]] = {
+    "notion-remote": ("notion_auth", NOTION_IFRAME_TOOLS),
+    "canva": ("canva_auth", CANVA_IFRAME_TOOLS),
+}
+
+
+async def _call_remote_oauth_tool(
+    server: str,
     user_id: str | None,
     tool_name: str,
     arguments: dict[str, Any],
 ) -> dict[str, Any]:
-    """Call the hosted Notion MCP with the signed-in user's OAuth token."""
+    """Call a hosted MCP (Notion/Canva) with the signed-in user's OAuth token."""
     import asyncio
+    import importlib
 
-    if tool_name not in NOTION_IFRAME_TOOLS:
-        raise ValueError(f"Notion tool not allowed from MCP Apps: {tool_name}")
+    module_name, allowed = _REMOTE_OAUTH_MCPS[server]
+    if tool_name not in allowed:
+        raise ValueError(f"{server} tool not allowed from MCP Apps: {tool_name}")
     if not user_id:
         raise ValueError("Sign in required")
 
     try:
-        from application import notion_auth
+        auth = importlib.import_module(f"application.{module_name}")
     except ImportError:  # pragma: no cover - flat layout
-        import notion_auth  # type: ignore
+        auth = importlib.import_module(module_name)
 
     # Refreshes with the refresh token when near expiry (blocking urllib).
-    token = await asyncio.to_thread(notion_auth.get_access_token, user_id)
+    token = await asyncio.to_thread(auth.get_access_token, user_id)
     if not token:
-        raise ValueError("Notion is not connected. Connect it from the MCP menu.")
+        raise ValueError(f"{server} is not connected. Connect it from the MCP menu.")
 
     import mcp
     from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
 
+    mcp_url = auth.PROVIDER.mcp_url
     http = create_mcp_http_client(headers={"Authorization": f"Bearer {token}"})
     async with http:
-        async with streamable_http_client(notion_auth.NOTION_MCP_URL, http_client=http) as streams:
+        async with streamable_http_client(mcp_url, http_client=http) as streams:
             async with mcp.ClientSession(streams[0], streams[1]) as session:
                 await session.initialize()
                 result = await session.call_tool(tool_name, arguments)
-    blocks = [
-        {"type": "text", "text": getattr(c, "text", "") or ""}
-        for c in (result.content or [])
-        if getattr(c, "text", None) is not None
-    ]
-    return {"content": blocks, "isError": bool(getattr(result, "is_error", False) or getattr(result, "isError", False))}
+    # Keep the whole result (structuredContent, image blocks, _meta): UIs read them.
+    return result.model_dump(by_alias=True, exclude_none=True, mode="json")
 
 
 async def call_mcp_tool(
@@ -171,14 +198,15 @@ async def call_mcp_tool(
     """
     arguments = arguments or {}
     server = (mcp_server or "").strip().lower()
+    server = _SERVER_ALIASES.get(server, server)
     name = (tool_name or "").strip()
 
-    if server == "notion-remote":
-        return await _call_notion_tool(user_id, name, arguments)
+    if server in _REMOTE_OAUTH_MCPS:
+        return await _call_remote_oauth_tool(server, user_id, name, arguments)
 
     if server != "weather":
         raise ValueError(
-            "ECS mcp-apps proxy only supports weather and notion-remote "
+            "ECS mcp-apps proxy only supports weather, notion-remote and canva "
             f"(got mcpServer={mcp_server!r})"
         )
 

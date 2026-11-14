@@ -28,7 +28,7 @@ iframe 버튼(검색/열기) → POST /api/mcp-apps/call-tool → ECS가 사용�
 
 | 파일 | 역할 |
 |------|------|
-| `application/notion_auth.py` | DCR/PKCE/토큰 저장·refresh (`{SESSION_STORAGE_DIR}/{user}/notion_oauth.json`) |
+| `application/notion_auth.py`, `mcp_oauth.py` | Notion 공급자 설정 + 공용 OAuth(DCR/PKCE/토큰 저장·refresh, `{SESSION_STORAGE_DIR}/{user}/notion_oauth.json`). Canva와 `mcp_oauth.py`를 공유 |
 | `application/api/routes_auth.py` | `/api/session/notion`, `/authorize`, `/callback` |
 | `application/runtime_mode.py`, `agentcore_client.py` | invoke payload로 토큰 전달 |
 | `application/mcp_apps_host.py` | iframe `tools/call` 프록시 (`notion-remote`, **읽기 전용 허용 목록**) |

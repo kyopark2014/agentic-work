@@ -23,6 +23,7 @@ export interface McpAppPayload {
   csp?: Record<string, unknown>;
   toolResult?: {
     content: Array<{ type: string; text?: string; [key: string]: unknown }>;
+    structuredContent?: unknown;
     isError?: boolean;
   };
 }
@@ -77,6 +78,9 @@ export interface AppConfig {
   google_drive_scopes?: string[];
   notion_connected?: boolean;
   notion_fresh?: boolean;
+  canva_connected?: boolean;
+  canva_fresh?: boolean;
+  canva_write?: boolean;
 }
 
 /** True when /api/config returned authenticated capability catalogs. */

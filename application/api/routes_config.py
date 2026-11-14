@@ -230,16 +230,23 @@ def get_config(request: Request):
     default_model = preferred_model or DEFAULT_MODEL
     if default_model not in MODELS and default_model not in gateway_models:
         default_model = DEFAULT_MODEL
-    notion_status = {"connected": False, "fresh": False}
+    oauth_status = {
+        name: {"connected": False, "fresh": False, "write": False}
+        for name in ("notion", "canva")
+    }
     try:
         if session_user:
             try:
-                from application import notion_auth
+                from application import canva_auth, notion_auth
             except ImportError:
+                import canva_auth
                 import notion_auth
-            notion_status = notion_auth.status_for_user(session_user)
+            oauth_status["notion"] = notion_auth.status_for_user(session_user)
+            oauth_status["canva"] = canva_auth.status_for_user(session_user)
     except Exception:
-        logger.exception("Failed to load Notion status for config")
+        logger.exception("Failed to load MCP OAuth status for config")
+    notion_status = oauth_status["notion"]
+    canva_status = oauth_status["canva"]
     drive_status = {"connected": False, "fresh": False, "scopes": []}
     try:
         try:
@@ -272,6 +279,9 @@ def get_config(request: Request):
         "llm_gateway_configured": gateway_configured,
         "notion_connected": bool(notion_status.get("connected")),
         "notion_fresh": bool(notion_status.get("fresh")),
+        "canva_connected": bool(canva_status.get("connected")),
+        "canva_fresh": bool(canva_status.get("fresh")),
+        "canva_write": bool(canva_status.get("write")),
         "google_drive_connected": bool(drive_status.get("connected")),
         "google_drive_fresh": bool(drive_status.get("fresh")),
         "google_drive_scopes": list(drive_status.get("scopes") or []),
