@@ -16,31 +16,6 @@ type TokenClient = {
   requestAccessToken: (overrideConfig?: { prompt?: string }) => void;
 };
 
-declare global {
-  interface Window {
-    google?: {
-      accounts: {
-        id: {
-          initialize: (config: Record<string, unknown>) => void;
-          disableAutoSelect: () => void;
-        };
-        oauth2: {
-          initTokenClient: (config: {
-            client_id: string;
-            scope: string;
-            callback: (response: {
-              access_token?: string;
-              error?: string;
-              error_description?: string;
-            }) => void;
-            error_callback?: (error: { type?: string; message?: string }) => void;
-          }) => TokenClient;
-        };
-      };
-    };
-  }
-}
-
 const GSI_SCRIPT_ID = "google-gsi-client";
 const GSI_SRC = "https://accounts.google.com/gsi/client";
 

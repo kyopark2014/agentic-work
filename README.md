@@ -3016,7 +3016,108 @@ https://{region}.console.aws.amazon.com/cloudwatch/home?region={region}#dashboar
 <img width="800" alt="image" src="https://github.com/user-attachments/assets/7069c737-f72d-4289-8c09-04e8aba806a1" />
 
 
+## Google Drive 연결
+
+Google의 원격 Drive MCP(`https://drivemcp.googleapis.com/mcp/v1`)를 Streamable HTTP로 연결합니다. 웹 UI에서 사용자별 Google OAuth access token을 받은 뒤, AgentCore Runtime invoke payload의 `google_drive_access_token`으로 전달합니다. 상세 메모는 [google-drive-mcp.md](./google-drive-mcp.md)를 참고하세요.
+
+### 1. Google Cloud 사전 설정
+
+1. **API 활성화** (둘 다 필요)
+   - Google Drive API (`drive.googleapis.com`)
+   - Google Drive MCP API (`drivemcp.googleapis.com`)
+2. **OAuth consent screen**에 스코프 추가
+   - `https://www.googleapis.com/auth/drive.readonly`
+   - `https://www.googleapis.com/auth/drive.file`
+3. Publishing status가 **Testing**이면 **Test users**에 사용할 Google 계정(예: 본인)을 등록합니다.  
+   미등록 시 `403 access_denied` / “앱은 현재 테스트 중이며 개발자가 승인한 테스터만…” 오류가 납니다.
+4. 기존 웹 앱 OAuth 클라이언트(`application/config.json`의 `google_client_id`)에서
+   - **Use this client for an AI-powered agent** 체크
+   - Authorized JavaScript origins에 앱 origin 등록 (예: `https://cowork.my-agentic-ai.click`, 로컬이면 `http://localhost:…`)
+5. Developer Preview 가이드: [Configure the Drive MCP server](https://developers.google.com/workspace/drive/api/guides/configure-mcp-server)
+
+### 2. 웹 UI에서 연결
+
+1. 로그인 후 Sidebar → **MCP** → **`drive` 체크**
+2. 상태가 “연결됨”이 아니면 **Drive 연결** 클릭 → Google 권한 동의 완료  
+   (`Popup window closed`가 나오면 팝업을 닫지 말고 동의를 끝까지 완료하세요.)
+3. MCP 패널에 **「Google Drive 연결됨」**이 보이는지 확인
+4. 채팅에서 Drive 관련 요청 (예: “드라이브 최근 파일 목록 보여줘”)
+
+토큰은 약 1시간 후 만료됩니다. 만료 시 **다시 연결**하거나, `drive`가 선택된 채팅 전송 시 브라우저가 silent refresh를 시도합니다.
+
+### 3. 동작 흐름
+
+```
+Web UI (GSI token client + Drive scopes)
+  → POST /api/session/google-drive  (앱에 토큰 저장)
+  → chat invoke
+  → runtime_mode: 사용자 토큰 조회
+  → AgentCore payload.google_drive_access_token
+  → Runtime chat.create_agent
+  → MCPAdapter → https://drivemcp.googleapis.com/mcp/v1
+     Authorization: Bearer <access_token>
+```
+
+로그인만으로는 Drive가 붙지 않습니다. **MCP에서 `drive`를 켜고** OAuth 연결이 있어야 Runtime 도구 목록에 `search_files`, `list_recent_files` 등이 등록됩니다.
+
+### 4. 제공 도구
+
+`search_files`, `list_recent_files`, `get_file_metadata`, `read_file_content`, `download_file_content`, `create_file`, `copy_file`, `get_file_permissions`
+
+### 5. 주요 파일
+
+| 파일 | 역할 |
+|------|------|
+| [application/google_drive_auth.py](./application/google_drive_auth.py) | 사용자별 토큰 저장/조회 |
+| [application/api/routes_auth.py](./application/api/routes_auth.py) | `/api/session/google-drive` API |
+| [application/runtime_mode.py](./application/runtime_mode.py) | invoke 시 토큰 주입 |
+| [runtime_agent/langgraph/mcp_config.py](./runtime_agent/langgraph/mcp_config.py) | `drive` MCP 정의 |
+| [runtime_agent/langgraph/google_drive_bearer_auth.py](./runtime_agent/langgraph/google_drive_bearer_auth.py) | 요청마다 Bearer 주입 |
+| [application/web/src/googleDriveAuth.ts](./application/web/src/googleDriveAuth.ts) | GSI Drive 권한 요청 |
+
+### 6. 문제 해결
+
+| 증상 | 원인 | 조치 |
+|------|------|------|
+| `403 access_denied` (인증 절차 미완료 / 테스터만 가능) | OAuth consent가 Testing이고 계정이 테스터 아님 | GCP → OAuth 동의 화면 → Test users에 계정 추가 |
+| UI는 “연결됨”인데 에이전트가 Drive 도구 없다고 함 | Runtime에서 Drive MCP 로드 실패, 또는 같은 session에 실패 결과가 캐시됨 | CloudWatch에서 `Failed to load MCP server 'drive'` 확인 후 **새 task**로 재시도 |
+| `drivemcp.googleapis.com` → **403 Forbidden** | Drive MCP API 미활성화, 또는 OAuth 클라이언트에 AI agent 미설정, 스코프 부족 | API 활성화 + “Use this client for an AI-powered agent” + 스코프 확인 후 **다시 연결** |
+| payload에 `drive` 없음 / `google_drive_access_token` 빈 문자열 | MCP에서 `drive` 미선택 또는 토큰 미연결 | Sidebar에서 `drive` 체크 + Drive 연결 |
+| `Popup window closed` | OAuth 팝업을 닫아 재인증 중단 | **다시 연결** 후 팝업에서 동의 완료 |
+
+AgentCore Runtime 로그 예:
+
+```
+WARNING drive MCP skipped: google_drive_access_token missing
+HTTP Request: POST https://drivemcp.googleapis.com/mcp/v1 "HTTP/1.1 403 Forbidden"
+ERROR Failed to load MCP server 'drive': Server returned an error response
+```
+
+
+- **search_files, list_recent_files 같은 Google Drive MCP 도구가 연결되어 있지 않아요.** 라고 나오는 경우
+
+[Drive MCP 서버 구성](https://developers.google.com/workspace/drive/api/guides/configure-mcp-server?hl=ko)에 따라서 데이터 액세스에 "직접 범위 추가"에 아래를 추가하세요.
+
+```text
+https://www.googleapis.com/auth/drive.readonly
+https://www.googleapis.com/auth/drive.file
+```
+
+또한, API 및 서비스에서 "Google Drive API", "Google Drive MCP API"을 찾아서 사용설정합니다. 또, "AI 기반 에이전트에 이 클라이언트 사용" checkbox를 선택합니다.
+
+
+
+### 7. 제한
+
+- refresh token / client secret 기반 서버 갱신은 아직 없습니다. GSI access token + UI 재연결에 의존합니다.
+- AgentCore Runtime은 앱 디스크의 토큰 파일을 읽지 않으므로, 매 invoke payload로 토큰을 전달합니다.
+- OAuth 클라이언트에 AI agent 설정이 없으면 Google이 MCP 요청을 거절할 수 있습니다.
+- Drive MCP 로드에 한 번 실패하면 동일 `runtimeSessionId`에서는 캐시된 도구 목록을 재사용할 수 있으므로, 설정 수정 후에는 **새 task**에서 확인하는 것이 안전합니다.
+
+
 ## Reference 
+
+[Configure the Drive MCP server](https://developers.google.com/workspace/drive/api/guides/configure-mcp-server)
 
 [Invoke streaming agents](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-invoke-agent.html)
 

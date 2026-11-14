@@ -2646,6 +2646,52 @@ button.config-popover-choice.is-selected {
   font-size: 12px;
 }
 
+.config-popover-footer {
+  margin-top: 6px;
+  padding: 8px 10px 4px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.config-popover-footer-status {
+  font-size: 11px;
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
+.config-popover-footer-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.config-popover-footer-actions button {
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-primary);
+  border-radius: 8px;
+  padding: 5px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.config-popover-footer-actions button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.config-popover-footer-actions button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.config-popover-footer-error {
+  font-size: 11px;
+  color: #f87171;
+  line-height: 1.35;
+}
+
 .streaming-indicator {
   color: var(--text-muted);
   font-size: 13px;
