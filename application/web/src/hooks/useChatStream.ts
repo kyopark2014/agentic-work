@@ -3,6 +3,7 @@ import type { ToolEvent } from "../types";
 import { uiError, uiLog, uiWarn } from "../debug";
 import { chatService } from "../services/chatService";
 import { appDataService } from "../services/appDataService";
+import { notifyVaultMutatedFromToolResult } from "../vaultRefresh";
 
 const TOOL_INPUT_INFO_RE = /^Tool: .+?, Input:/s;
 const TOOL_RESULT_INFO_RE = /^Tool Result: /s;
@@ -194,6 +195,23 @@ export function useChatStream() {
               ...s,
               events: localEvents,
             }));
+            if (event.type === "tool_result") {
+              const toolEvent = event as ToolEvent;
+              const prior =
+                localEvents.find(
+                  (e) =>
+                    e.type === "tool" &&
+                    e.toolUseId &&
+                    e.toolUseId === toolEvent.toolUseId,
+                ) ??
+                localEvents.find(
+                  (e) => e.type === "tool" && e.tool === toolEvent.tool,
+                );
+              notifyVaultMutatedFromToolResult(
+                toolEvent.tool ?? prior?.tool,
+                prior?.input ?? toolEvent.input,
+              );
+            }
           } else if (event.type === "error") {
             const msg = event.data ?? "Unknown error";
             uiError("chat:send stream error", msg);

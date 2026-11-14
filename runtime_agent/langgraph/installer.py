@@ -2264,7 +2264,7 @@ def update_agent_runtime_func(config, repository_name, agent_runtime_id, image_t
             roleArn=agent_runtime_role,
             networkConfiguration=network_configuration,
             protocolConfiguration={"serverProtocol": "HTTP"},
-            platformVersion="V2",
+            platformVersion="V1",
         )
         
         print(f"? Agent runtime updated: {response['agentRuntimeArn']}")

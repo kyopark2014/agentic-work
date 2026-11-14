@@ -23,7 +23,8 @@ from application import mcp_apps_host
 
 logger = logging.getLogger("mcp_app_resources")
 
-CACHE_TTL_SECONDS = 600
+# Keep short so use-vault UI updates show up quickly after MCP redeploy.
+CACHE_TTL_SECONDS = 30
 VIEWS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_app_views")
 
 MIME = "text/html;profile=mcp-app"

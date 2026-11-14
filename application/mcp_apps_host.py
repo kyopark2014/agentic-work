@@ -139,9 +139,22 @@ CANVA_IFRAME_TOOLS = frozenset(
 # Names an MCP server declares for itself, as older stored mcpApp payloads carried them.
 _SERVER_ALIASES = {"canva mcp server": "canva"}
 
-# use-vault (ob-note): read tools only. Writes (vault_write/append/delete/...) stay agent-only.
+# use-vault (ob-note): read tools + in-app Save (vault_write). Other mutations stay agent-only.
 VAULT_IFRAME_TOOLS = frozenset(
-    {"vault_tree", "vault_list", "vault_read", "vault_search", "vault_graph", "vault_backlinks"}
+    {
+        "vault_tree",
+        "vault_list",
+        "vault_read",
+        "vault_search",
+        "vault_graph",
+        "vault_backlinks",
+        # Viewer-only: resolve relative markdown images to data URLs.
+        "vault_asset",
+        # Viewer Preview: server-side markdown → HTML (ob-note share pipeline).
+        "vault_render",
+        # Viewer Save (Preview/Edit/Save toolbar).
+        "vault_write",
+    }
 )
 
 # server name (as used in the mcpApp payload) -> (auth module, allowed tools)

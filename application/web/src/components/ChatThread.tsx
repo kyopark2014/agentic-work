@@ -59,6 +59,16 @@ export function ChatThread({
     });
   }, [messages, streamText, streamEvents, streaming]);
 
+  const lastMessage = messages[messages.length - 1];
+  const lastIsStreamingDraft =
+    lastMessage?.role === "assistant" && lastMessage.status === "streaming";
+  const hasLiveStream =
+    streamEvents.length > 0 || Boolean(streamText.trim());
+  const draftAlreadyShowsProgress =
+    lastIsStreamingDraft &&
+    (Boolean(lastMessage.content?.trim()) ||
+      (lastMessage.tool_events?.length ?? 0) > 0);
+
   return (
     <>
       <header className="main-header">
@@ -83,31 +93,20 @@ export function ChatThread({
           {messages.map((m) => (
             <MessageFromRecord key={m.id} message={m} />
           ))}
-          {streaming && messages[messages.length - 1]?.status === "streaming" && (
+          {streaming && hasLiveStream && (
+            <MessageBubble
+              role="assistant"
+              content={streamText}
+              toolEvents={streamEvents}
+            />
+          )}
+          {streaming && !hasLiveStream && !draftAlreadyShowsProgress && (
             <div className="message-row assistant">
               <div className="streaming-indicator" aria-label="Thinking">
                 Thinking
                 <span className="thinking-ellipsis" aria-hidden="true" />
               </div>
             </div>
-          )}
-          {streaming && messages[messages.length - 1]?.status !== "streaming" && (
-            <>
-              {streamEvents.length > 0 || streamText ? (
-                <MessageBubble
-                  role="assistant"
-                  content={streamText}
-                  toolEvents={streamEvents}
-                />
-              ) : (
-                <div className="message-row assistant">
-                  <div className="streaming-indicator" aria-label="Thinking">
-                    Thinking
-                    <span className="thinking-ellipsis" aria-hidden="true" />
-                  </div>
-                </div>
-              )}
-            </>
           )}
           <div ref={bottomRef} />
         </div>

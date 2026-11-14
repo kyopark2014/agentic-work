@@ -9,6 +9,10 @@ import {
   type AppCspMeta,
   type AppResource,
 } from "../mcpAppHost";
+import {
+  VAULT_MUTATED_EVENT,
+  type VaultMutatedDetail,
+} from "../vaultRefresh";
 
 interface Props {
   app: McpAppPayload;
@@ -107,6 +111,12 @@ export function McpAppFrame({ app }: Props) {
   const [canExpand, setCanExpand] = useState(true);
   const [theme, setTheme] = useState(currentTheme);
 
+  // Latest props for the long-lived message listener: the listener must not be torn down (which
+  // would forget that the iframe already finished its handshake) when a parent re-render hands
+  // us a new `app` object — the iframe itself is not reloaded in that case.
+  const appRef = useRef(app);
+  appRef.current = app;
+
   const initializedRef = useRef(false);
   const pendingToolResultRef = useRef(app.toolResult);
   const modeRef = useRef<DisplayMode>("inline");
@@ -198,6 +208,37 @@ export function McpAppFrame({ app }: Props) {
     return () => obs.disconnect();
   }, [post]);
 
+  // After vault_write/append/… finishes in chat, ask open vault viewers to reload.
+  useEffect(() => {
+    const isVault =
+      app.mcpServer === "use-vault" ||
+      (typeof app.tool === "string" && app.tool.startsWith("vault_"));
+    if (!isVault) return;
+
+    let timer: number | null = null;
+    const onMutated = (ev: Event) => {
+      const detail = (ev as CustomEvent<VaultMutatedDetail>).detail || {};
+      if (timer !== null) window.clearTimeout(timer);
+      // Coalesce rapid write bursts (append then write, etc.).
+      timer = window.setTimeout(() => {
+        if (!initializedRef.current) return;
+        post({
+          method: "ui/notifications/vault-refresh",
+          params: {
+            tool: detail.tool,
+            path: detail.path,
+          },
+        });
+      }, 250);
+    };
+
+    window.addEventListener(VAULT_MUTATED_EVENT, onMutated);
+    return () => {
+      window.removeEventListener(VAULT_MUTATED_EVENT, onMutated);
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [app.mcpServer, app.tool, post]);
+
   // Fullscreen: follow the chat column, close with Esc. Key events inside the (opaque-origin)
   // iframe never reach this page, so focus the host-side close button on entry; once the user
   // clicks into the app, the visible 닫기 button is the way out.
@@ -208,9 +249,18 @@ export function McpAppFrame({ app }: Props) {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && changeMode("inline");
     window.addEventListener("resize", relayout);
     window.addEventListener("keydown", onKey);
+    // Composer can grow (activity strip / queue); keep the iframe above it.
+    const composer = document.querySelector(".chat-input-area");
+    const ro =
+      composer && typeof ResizeObserver !== "undefined"
+        ? new ResizeObserver(relayout)
+        : null;
+    ro?.observe(composer as Element);
+    relayout();
     return () => {
       window.removeEventListener("resize", relayout);
       window.removeEventListener("keydown", onKey);
+      ro?.disconnect();
     };
   }, [mode, changeMode]);
 
@@ -256,18 +306,20 @@ export function McpAppFrame({ app }: Props) {
       id: string | number | undefined,
       params: Record<string, unknown> | undefined,
     ) {
-      const name = typeof params?.name === "string" ? params.name : app.tool;
+      const name = typeof params?.name === "string" ? params.name : appRef.current.tool;
       const args =
         params?.arguments && typeof params.arguments === "object"
           ? (params.arguments as Record<string, unknown>)
           : {};
-      const mcpServer = app.mcpServer;
+      const mcpServer = appRef.current.mcpServer;
       if (!mcpServer || !name) {
         replyError(id, "MCP server/tool is not available for this app");
         return;
       }
       try {
-        setStatus("도구 호출 중…");
+        // Don't show a host-level "도구 호출 중…" banner — the app already has
+        // its own skeleton/loading UI (e.g. vault focus ↔ explorer switches).
+        setStatus("");
         const res = await fetch("/api/mcp-apps/call-tool", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -312,8 +364,9 @@ export function McpAppFrame({ app }: Props) {
         case "ui/notifications/initialized": {
           initializedRef.current = true;
           // Same order as the MCP Apps lifecycle: tool-input, then tool-result.
-          if (app.toolInput) {
-            post({ method: "ui/notifications/tool-input", params: { arguments: app.toolInput } });
+          const toolInput = appRef.current.toolInput;
+          if (toolInput) {
+            post({ method: "ui/notifications/tool-input", params: { arguments: toolInput } });
           }
           const result = pendingToolResultRef.current;
           if (result) {
@@ -376,7 +429,7 @@ export function McpAppFrame({ app }: Props) {
       window.removeEventListener("message", onMessage);
       window.clearTimeout(t);
     };
-  }, [srcDoc, app.tool, app.mcpServer, app.toolInput, hostContext, changeMode, post]);
+  }, [srcDoc, hostContext, changeMode, post]);
 
   const isFullscreen = mode === "fullscreen";
   const frameStyle = isFullscreen
