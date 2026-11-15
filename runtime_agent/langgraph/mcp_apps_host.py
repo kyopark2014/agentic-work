@@ -17,7 +17,9 @@ def clear() -> None:
 # MCP servers whose `ui://` resources the web host reads itself (GET /api/mcp-apps/resource),
 # like a real MCP Apps host does with resources/read. For these the tool result carries
 # only the resource URI, not the HTML, so a 300KB UI is not repeated in every message.
-HOST_FETCHED_SERVERS = frozenset({"weather", "notion-remote", "canva", "use-vault"})
+HOST_FETCHED_SERVERS = frozenset(
+    {"weather", "notion-remote", "canva", "use-vault", "excalidraw"}
+)
 
 
 def register_tool_app(

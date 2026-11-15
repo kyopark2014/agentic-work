@@ -157,6 +157,16 @@ VAULT_IFRAME_TOOLS = frozenset(
     }
 )
 
+# Excalidraw OSS MCP Apps: widget-only tools (model uses read_me / create_view).
+EXCALIDRAW_IFRAME_TOOLS = frozenset(
+    {
+        "export_to_excalidraw",
+        "save_checkpoint",
+        "read_checkpoint",
+    }
+)
+EXCALIDRAW_MCP_URL = "https://mcp.excalidraw.com/mcp"
+
 # server name (as used in the mcpApp payload) -> (auth module, allowed tools)
 _REMOTE_OAUTH_MCPS: dict[str, tuple[str, frozenset[str]]] = {
     "notion-remote": ("notion_auth", NOTION_IFRAME_TOOLS),
@@ -164,31 +174,50 @@ _REMOTE_OAUTH_MCPS: dict[str, tuple[str, frozenset[str]]] = {
 }
 # Servers reached with the ECS task role (SigV4) instead of a per-user OAuth token.
 _IAM_MCPS: dict[str, frozenset[str]] = {"use-vault": VAULT_IFRAME_TOOLS}
+# Public Streamable HTTP MCPs (no OAuth / SigV4). URL + iframe tool allowlist.
+_PUBLIC_HTTP_MCPS: dict[str, tuple[str, frozenset[str]]] = {
+    "excalidraw": (EXCALIDRAW_MCP_URL, EXCALIDRAW_IFRAME_TOOLS),
+}
 _ALLOWED_TOOLS: dict[str, frozenset[str]] = {
     **{k: v[1] for k, v in _REMOTE_OAUTH_MCPS.items()},
     **_IAM_MCPS,
+    **{k: v[1] for k, v in _PUBLIC_HTTP_MCPS.items()},
 }
 
 
 @asynccontextmanager
 async def remote_session(server: str, user_id: str | None):
-    """Open an authenticated MCP ClientSession to a hosted MCP on the user's behalf.
+    """Open an MCP ClientSession to a hosted MCP for iframe resource/tool proxying.
 
-    OAuth servers (Notion/Canva) use the user's own token; the token is refreshed with
-    its refresh token when near expiry (blocking urllib, so it runs in a thread).
+    OAuth servers (Notion/Canva) use the user's own token; IAM servers (use-vault) use
+    the ECS task role (SigV4); public servers (excalidraw) need no credentials.
     """
     import asyncio
     import importlib
 
-    if server not in _REMOTE_OAUTH_MCPS and server not in _IAM_MCPS:
+    if (
+        server not in _REMOTE_OAUTH_MCPS
+        and server not in _IAM_MCPS
+        and server not in _PUBLIC_HTTP_MCPS
+    ):
         raise ValueError(f"No remote MCP session for server: {server}")
     if not user_id:
         raise ValueError("Sign in required")
 
-    if server in _IAM_MCPS:
-        import mcp
-        from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
+    import mcp
+    from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
 
+    if server in _PUBLIC_HTTP_MCPS:
+        url, _allowed = _PUBLIC_HTTP_MCPS[server]
+        http = create_mcp_http_client(timeout=None)
+        async with http:
+            async with streamable_http_client(url, http_client=http) as streams:
+                async with mcp.ClientSession(streams[0], streams[1]) as session:
+                    await session.initialize()
+                    yield session
+        return
+
+    if server in _IAM_MCPS:
         from application import agentcore_mcp
 
         url, region = await asyncio.to_thread(agentcore_mcp.use_vault_endpoint)
@@ -209,9 +238,6 @@ async def remote_session(server: str, user_id: str | None):
     token = await asyncio.to_thread(auth.get_access_token, user_id)
     if not token:
         raise ValueError(f"{server} is not connected. Connect it from the MCP menu.")
-
-    import mcp
-    from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
 
     http = create_mcp_http_client(headers={"Authorization": f"Bearer {token}"})
     async with http:
@@ -269,8 +295,8 @@ async def call_mcp_tool(
 
     if server != "weather":
         raise ValueError(
-            "ECS mcp-apps proxy only supports weather, notion-remote, canva and use-vault "
-            f"(got mcpServer={mcp_server!r})"
+            "ECS mcp-apps proxy only supports weather, notion-remote, canva, "
+            f"use-vault and excalidraw (got mcpServer={mcp_server!r})"
         )
 
     from application.mcp_server_weather import (

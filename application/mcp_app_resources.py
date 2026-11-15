@@ -10,6 +10,7 @@ Sources, per server:
   notion-remote  viewer shipped with this app (application/mcp_app_views/)
   canva          read from mcp.canva.com with the user's OAuth token
   use-vault      read from the use-vault MCP runtime (SigV4, ECS task role)
+  excalidraw     read from mcp.excalidraw.com (public Streamable HTTP, no auth)
 """
 
 from __future__ import annotations
@@ -32,7 +33,11 @@ MIME = "text/html;profile=mcp-app"
 NOTION_VIEWER_URI = "ui://agentic-work/notion-viewer.html"
 
 # Remote servers: only these URI prefixes may be read through the host.
-_REMOTE_URI_PREFIX = {"canva": "ui://canva/", "use-vault": "ui://vault/"}
+_REMOTE_URI_PREFIX = {
+    "canva": "ui://canva/",
+    "use-vault": "ui://vault/",
+    "excalidraw": "ui://excalidraw/",
+}
 
 _cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 

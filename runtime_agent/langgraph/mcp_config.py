@@ -465,6 +465,18 @@ def load_config(mcp_type):
             }
         }
 
+    elif mcp_type in ("excalidraw", "excalidraw-mcp", "excalidraw mcp"):
+        # Open-source Excalidraw MCP Apps (no auth). Diagram UI via ui://excalidraw/...
+        # https://mcp.excalidraw.com/mcp — Plus workspace MCP is a different endpoint.
+        return {
+            "mcpServers": {
+                "excalidraw": {
+                    "type": "streamable_http",
+                    "url": "https://mcp.excalidraw.com/mcp",
+                }
+            }
+        }
+
 def load_selected_config(mcp_servers: dict):
     logger.info(f"mcp_servers: {mcp_servers}")
     

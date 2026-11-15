@@ -52,10 +52,10 @@ def _s3_connect_src_hosts() -> str:
 # MCP Apps UIs rendered by third-party MCP servers (srcdoc iframes inherit this CSP).
 # Canva's UI loads its app bundle/CSS/fonts from static.canva.com and talks to its own
 # APIs/media (these mirror the `_meta.ui.csp` its MCP server declares, plus its Sentry).
-_MCP_APPS_STATIC_HOSTS = "https://static.canva.com"
+_MCP_APPS_STATIC_HOSTS = "https://static.canva.com https://esm.sh"
 _MCP_APPS_CONNECT_HOSTS = (
     "https://*.canva.com https://media.canva.com blob: "
-    "https://o13855.ingest.us.sentry.io"
+    "https://o13855.ingest.us.sentry.io https://esm.sh"
 )
 
 # Allow Google Identity Services (GSI) while locking down everything else.
