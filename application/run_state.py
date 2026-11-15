@@ -21,7 +21,6 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from application import run_registry
 from application import task_store
 from application import utils
-from application.task_store_persistence import flush_persist
 from application.tool_events_slim import slim_tool_events
 
 logger = logging.getLogger("run_state")
@@ -320,7 +319,6 @@ def _hydrate_assistant_if_needed(
                 images=images or [],
                 tool_events=events,
             )
-            flush_persist(user_id)
             logger.info(
                 "Finalized streaming assistant from run query (%s chars, %s events) task=%s",
                 len(content),
@@ -337,7 +335,6 @@ def _hydrate_assistant_if_needed(
                 events,
             )
             if updated:
-                flush_persist(user_id)
                 logger.info(
                     "Backfilled tool_events on hydrated assistant (%s events) task=%s",
                     len(events),
@@ -355,7 +352,6 @@ def _hydrate_assistant_if_needed(
         images=images or [],
         tool_events=events,
     )
-    flush_persist(user_id)
     logger.info(
         "Hydrated assistant message from run query (%s chars, %s events) task=%s",
         len(content),

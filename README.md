@@ -376,7 +376,7 @@ application/agentcore_client.py  ──SSE──▶  chat.py · skill.py · mcp_
 ```text
 application/
 ├── server.py               # FastAPI 진입점, SPA 정적 파일 서빙
-├── task_store.py           # 태스크·메시지 SQLite 저장
+├── task_store.py           # 태스크·메시지·로그인 DynamoDB 저장
 ├── api/                    # REST + SSE API
 ├── web/                    # React + Vite 프론트엔드
 ├── agentcore_client.py     # AgentCore Runtime 호출 (invoke_agent_runtime, SSE 파싱)
@@ -406,7 +406,7 @@ Web UI는 **FastAPI 백엔드 + React SPA**로 구성됩니다. Streamlit을 대
 | 구분 | 기술 | 용도 |
 |------|------|------|
 | **백엔드** | FastAPI, uvicorn | REST API, SSE 스트리밍, SPA 정적 파일 서빙 |
-| **백엔드** | SQLite (`task_store.py`) | User별 task·메시지·`runtime_session_id` 영속 |
+| **백엔드** | DynamoDB (`task_store.py`) | User별 task·메시지·`runtime_session_id` 영속 |
 | **백엔드** | `agentcore_client.py` | AgentCore Runtime `invoke_agent_runtime` 호출 |
 | **프론트엔드** | React 19, TypeScript | SPA UI |
 | **프론트엔드** | Vite 6 | 개발 서버·프로덕션 빌드 |
@@ -589,7 +589,7 @@ uvicorn application.server:app --host 0.0.0.0 --port 8501
 |-----------|------------|
 | 헬스체크 | `GET http://localhost:8501/api/health` |
 | UI 미빌드 시 | `Frontend not built` — 위 1) 단계 실행 후 서버 재시작 |
-| 태스크·메시지 DB | `application/data/tasks.db` (로컬 working). ECS 배포 시 S3 Files `/mnt/app-data/application-database/{projectName}/tasks.db`에 영속화 |
+| 태스크·메시지 DB | DynamoDB `{projectName}-tasks` / `-messages` / `-login-events` (로컬은 DynamoDB Local) |
 
 #### 3) (선택) 프론트엔드만 핫 리로드
 
@@ -673,80 +673,46 @@ cd ../..
 
 확인: CloudFront URL에서 도구가 많은 질의(예: *강남역 맛집 정보를 사진과 함께*) 후 assistant 응답·`done` 이벤트 수신.
 
-### Task DB persistence (S3 Files)
+### Task store (DynamoDB)
 
-ECS 재배포 후에도 Web UI **태스크·메시지 목록**(`tasks.db`)을 유지하기 위해, LangGraph checkpoint와 동일한 **working copy + S3 Files persist** 패턴을 사용합니다.
+Web UI의 **태스크·메시지·로그인 이력**은 DynamoDB에 저장합니다. 이전에는 ECS task마다 per-user SQLite working copy를 두고 S3 Files로 파일 통째로 sync했기 때문에, 여러 컴퓨터(=서로 다른 ECS task)에서 로그인하면 오래된 복사본이 최신 파일을 덮어써 task 정보가 과거로 돌아가는 문제가 있었습니다. 이제 모든 쓰기가 필드 단위 단일 item 연산이라 이런 덮어쓰기가 발생하지 않습니다.
 
-#### 왜 NFS/S3 Files 위에서 SQLite를 직접 열지 않나
+| 테이블 | PK / SK | 용도 |
+|--------|---------|------|
+| `{projectName}-tasks` | `user_id` / `task_id` | task 메타데이터, `message_count` 카운터 |
+| `{projectName}-messages` | `task_id` / `message_id` (+ LSI `task_id-created_at-index`) | 메시지 (시간순 조회는 LSI, strongly consistent) |
+| `{projectName}-login-events` | `user_id` / `sk` (`logged_at#id`) | 대시보드용 로그인 이력 |
 
-S3 Files(NFS) 위에서 SQLite를 직접 read/write하면 lock·corruption 위험이 있습니다. Runtime checkpoint와 같이:
-
-| 경로 | 용도 |
-|------|------|
-| **Working** | `application/data/tasks.db` — 실행 중 SQLite I/O (로컬 디스크) |
-| **Persistent** | `/mnt/app-data/application-database/{projectName}/tasks.db` — S3 Files 마운트 (ECS Fargate) |
-
-S3 bucket 실제 객체 경로 (별도 S3 Files prefix `app-data/`):
-
-```text
-s3://storage-for-{project}-{account}-{region}/app-data/application-database/{projectName}/tasks.db
-```
-
-Runtime은 `agentcore-sessions/` → `/mnt/workspace`를 쓰고, ECS는 **별도** `app-data/` FS를 `/mnt/app-data`에 마운트합니다. Runtime IAM은 `app-data/*`를 Deny합니다.
-
-#### 동작 흐름
-
-```text
-[ECS 시작]  restore: S3 Files persistent → working (없으면 working 삭제 후 신규 생성)
-[실행 중]   task_store → application/data/tasks.db
-[변경 후]   schedule_persist (20초 debounce) / chat 종료·shutdown 시 flush_persist
-[persist]   PRAGMA wal_checkpoint → working → persistent copy
-```
+`projectName`은 `application/config.json`(기본 `agentic-work`)을 따르며, `TASKS_TABLE` / `MESSAGES_TABLE` / `LOGIN_EVENTS_TABLE` 환경 변수로 개별 이름을 덮어쓸 수 있습니다.
 
 관련 코드:
 
 | 파일 | 역할 |
 |------|------|
-| `application/task_store_persistence.py` | restore / persist / debounce |
-| `application/task_store.py` | write 후 `schedule_persist()` |
-| `application/server.py` | lifespan: restore → init_db → shutdown flush |
-| `application/api/routes_chat.py` | SSE stream `finally`: `flush_persist()` |
-| `installer.py` | ECS task definition S3 Files volume (`/mnt/app-data`), IAM·SG |
+| `application/task_store.py` | DynamoDB 구현 (공개 함수 시그니처는 SQLite 시절과 동일) |
+| `installer.py` | `create_task_store_tables()` + ECS task role 정책, 단독 실행: `python installer.py --task-store-only` |
+| `migrate_sqlite_to_dynamodb.py` | 기존 SQLite DB → DynamoDB 이관 (idempotent, 최신 `updated_at` 우선 병합) |
+| `application/graph_jobs.py` | graph 파이프라인 실행 시 DynamoDB에서 임시 SQLite로 export (`task_store.export_user_sqlite`) |
 
-#### 인프라 (installer.py)
+메시지 한 건은 LSI 사본을 포함해 DynamoDB 400KB 제한을 받으므로 payload를 약 180KB로 제한합니다. 초과 시 `tool_events`를 줄이고, 그래도 크면 `content`를 잘라 저장합니다.
 
-- ECS Fargate task definition에 **app-data** `s3filesVolumeConfiguration` 볼륨 추가
-- ECS task role: app-data FS에 대한 `s3files:ClientMount`, `ClientWrite`, `GetAccessPoint`, `ListMountTargets`
-- S3 Files file system policy: **app-data FS = ECS only**, session FS = Runtime only
-- ECS SG ↔ S3 Files mount SG: NFS **TCP 2049**
-- 배포: `minimumHealthyPercent=0`, `maximumPercent=100` (롤링 배포 중 DB 동시 write 방지)
+로컬 개발: `./run_local.sh`가 DynamoDB Local(Docker, `application/data/dynamodb`에 영속화)을 띄우고 `DYNAMODB_ENDPOINT_URL`을 설정합니다. 테이블은 앱 시작 시 자동 생성됩니다. 실제 AWS 테이블을 쓰려면 `DYNAMODB_ENDPOINT_URL` 없이 실행합니다(테이블은 installer가 생성).
 
-환경 변수 (ECS task definition에서 설정):
-
-| 변수 | 값 |
-|------|-----|
-| `TASK_DB_MOUNT` | `/mnt/app-data` |
-| `TASK_DB_PROJECT` | `agentic-work` (project name) |
-
-로컬 개발(`uvicorn`)에서는 `/mnt/app-data`가 없으므로 **기존처럼 `application/data/tasks.db`만** 사용합니다.
-
-Docker 이미지에는 `application/data/`를 포함하지 않습니다(`.dockerignore`). ECS 첫 기동 시 S3 Files에 persistent DB가 없으면 이미지에 포함된 테스트 DB 대신 **빈 DB**를 생성합니다.
-
-#### 배포·확인
+#### 기존 SQLite 데이터 이관
 
 ```bash
-# S3 Files ECS volume + IAM/SG + task definition 갱신
-python installer.py
+# 1) 테이블/IAM 생성 (신규 배포는 python installer.py 가 자동 수행)
+python installer.py --task-store-only
 
-# 또는 application 코드만 변경한 경우: Docker 이미지 재빌드 후 ECS 재배포
+# 2) 사전 확인 (쓰기 없음)
+python migrate_sqlite_to_dynamodb.py --source application/data --source /path/to/session_storage --dry-run
+
+# 3) 이관. S3 버전닝이 켜져 있으면 과거로 덮어써진 복사본까지 병합해 복구할 수 있습니다.
+python migrate_sqlite_to_dynamodb.py --source application/data \
+  --s3-bucket <bucket> --s3-prefix app-data/ --s3-include-versions
 ```
 
-확인:
-
-1. CloudFront에서 태스크 생성·채팅 후 ECS 서비스 재배포
-2. 재배포 후 동일 User ID로 태스크·메시지 목록 유지
-3. S3 bucket: `app-data/application-database/{projectName}/tasks.db` 객체 존재
-4. CloudWatch 로그: `Restored task DB from S3 Files` / `Persisted task DB to S3 Files`
+컷오버 순서: 테이블 생성 → 이관 → 새 이미지 배포 → (이전 컨테이너가 쓴 델타가 있으면) 이관 재실행. 이관 후 SQLite 파일은 롤백용으로 보관하세요.
 
 ### `runtime_agent/langgraph/` — LangGraph Agent (AgentCore Runtime)
 
@@ -2052,7 +2018,7 @@ flowchart LR
 
 #### Job JSON (DynamoDB)
 
-테이블: `dynamodb-{project}-schedules` (PK `job_id`, GSI `user_id-created_at-index`, `task_id-created_at-index`).
+테이블: `{project}-schedules` (PK `job_id`, GSI `user_id-created_at-index`, `task_id-created_at-index`).
 
 ```json
 {
@@ -2185,7 +2151,7 @@ API: `GET/DELETE /api/schedules` (세션 쿠키).
 루트 installer가 CloudFront 생성 후 `deploy_schedule_infrastructure()`로 다음을 만듭니다.
 
 - Secrets Manager: `{project}/schedule-agent-token`
-- DynamoDB: `dynamodb-{project}-schedules`
+- DynamoDB: `{project}-schedules`
 - Scheduler group: `schedule-group-{project}`
 - Lambda: `lambda-schedule-for-{project}` (+ IAM)
 - Scheduler invoke role + ECS task role의 DDB/Scheduler/PassRole 정책

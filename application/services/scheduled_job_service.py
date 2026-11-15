@@ -11,7 +11,6 @@ from application import schedule_store
 from application import task_store
 from application.run_state import summarize_tool_events
 from application.services.chat_stream_service import ChatStreamService
-from application.task_store_persistence import flush_persist
 
 logger = logging.getLogger("scheduled_job_service")
 
@@ -97,7 +96,6 @@ def run_scheduled_job(job_id: str) -> dict[str, Any]:
             tool_events=events,
         )
         schedule_store.mark_run(job_id, status="error", error=str(error)[:500])
-        flush_persist(user_id)
         summary = summarize_tool_events(events)
         logger.warning(
             "Scheduled job %s error for task %s tool_summary=%s error=%s",
@@ -126,7 +124,6 @@ def run_scheduled_job(job_id: str) -> dict[str, Any]:
         images=images,
         tool_events=tool_events,
     )
-    flush_persist(user_id)
     schedule_store.mark_run(job_id, status="ok")
     summary = summarize_tool_events(tool_events)
     logger.info(

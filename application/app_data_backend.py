@@ -3,7 +3,7 @@
 ECS mounts the bucket root at /mnt/app-data.
 Runtime mounts the same bucket root at /mnt/workspace.
 Locally that mount is usually absent; with s3_bucket the S3 API can share
-tasks.db / virtual_key.json with production — but that path is **opt-in**
+virtual_key.json with production — but that path is **opt-in**
 (``APP_DATA_S3_ENABLE=1``). Default local mode stays disk-only.
 """
 
@@ -116,45 +116,12 @@ def s3_key(*parts: str) -> str:
     return suffix
 
 
-def tasks_db_s3_key() -> str:
-    return s3_key("application-database", project_name(), "tasks.db")
-
-
 def virtual_key_s3_key() -> str:
     return s3_key("litellm", "virtual_key.json")
 
 
-def persistent_tasks_db_path() -> str:
-    """Path on the S3 Files mount (ECS). Unused for pure S3/local backends."""
-    return os.path.join(mount_dir(), "application-database", project_name(), "tasks.db")
-
-
 def persistent_virtual_key_path() -> str:
     return os.path.join(mount_dir(), "litellm", "virtual_key.json")
-
-
-def working_tasks_db_path() -> str:
-    """Global/legacy DB working path (login_events + migrate source)."""
-    custom = (os.environ.get("TASK_DB_WORKING_PATH") or "").strip()
-    if custom:
-        return custom
-    return os.path.join(working_dir(), "tasks.db")
-
-
-def working_user_db_path(user_segment: str) -> str:
-    """Per-user tasks/messages working DB under data/users/{segment}.db."""
-    segment = (user_segment or "").strip()
-    if not segment or "/" in segment or "\\" in segment or ".." in segment:
-        raise ValueError(f"Invalid user DB segment: {user_segment!r}")
-    return os.path.join(working_dir(), "users", f"{segment}.db")
-
-
-def user_db_s3_key(user_segment: str) -> str:
-    """S3 object key for durable per-user DB (mirrors session_storage layout)."""
-    segment = (user_segment or "").strip()
-    if not segment or "/" in segment or "\\" in segment or ".." in segment:
-        raise ValueError(f"Invalid user DB segment: {user_segment!r}")
-    return s3_key(segment, f"{segment}.db")
 
 
 def working_virtual_key_path() -> str:

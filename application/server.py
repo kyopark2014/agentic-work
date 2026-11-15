@@ -23,13 +23,6 @@ from application.api.routes_schedules import router as schedules_router
 from application.api.routes_mcp_apps import router as mcp_apps_router
 from application.security_headers import SecurityHeadersMiddleware
 from application.task_store import init_db
-from application.task_store_persistence import (
-    flush_persist,
-    persistence_enabled,
-    persistent_db_path,
-    restore_tasks_db,
-)
-from application import app_data_backend as app_data_backend
 from application import litellm_virtual_key as litellm_virtual_key
 
 logging.basicConfig(
@@ -59,7 +52,6 @@ _ENABLE_API_DOCS = os.environ.get("ENABLE_API_DOCS", "").strip().lower() in {
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    restore_tasks_db()
     # Load virtual keys (S3-only when local + s3_bucket; no local file created).
     try:
         location = litellm_virtual_key.restore_virtual_key_store()
@@ -67,20 +59,6 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Could not restore LiteLLM virtual_key store")
     init_db()
-    mode = app_data_backend.backend_mode()
-    if persistence_enabled():
-        logger.info(
-            "Global task DB persistence enabled (backend=%s): %s "
-            "(per-user tasks/messages use session_storage lazy restore)",
-            mode,
-            persistent_db_path(),
-        )
-    else:
-        logger.info(
-            "Task store using local SQLite (backend=%s); "
-            "per-user DBs under session_storage/{user}/{user}.db",
-            mode,
-        )
     try:
         from application import schedule_service
 
@@ -89,8 +67,6 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Startup schedule cleanup failed (non-fatal)")
     yield
-    flush_persist()
-    logger.info("Task store shutdown persist complete")
 
 
 app = FastAPI(

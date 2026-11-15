@@ -6,7 +6,6 @@ from application.api.routes_auth import require_user_id
 from application.api.routes_config import _llm_gateway_from_config
 from application import task_store
 from application import run_cancel
-from application.task_store_persistence import flush_persist
 from application import utils
 from application.run_state import query_task_run
 
@@ -222,7 +221,6 @@ def create_message(task_id: str, body: MessageCreate, request: Request):
         images=body.images,
         tool_events=body.tool_events,
     )
-    flush_persist(user_id)
     return message
 
 

@@ -22,7 +22,7 @@ CDK 스택과 동등한 AWS 인프라를 프로그래밍 방식으로 배포합�
 - **Web UI**: ECS Fargate (`application/` — FastAPI + 프론트엔드) — 사용자 입력·MCP/Skill 선택·결과 표시
 - **LangGraph Agent**: AgentCore Runtime (`runtime_agent/langgraph/installer.py`) — 추론·MCP·Skill 실행
 - MCP 서버는 Runtime 컨테이너 **내부 stdio subprocess**로 기동됩니다. (`runtime_mcp/` 별도 MCP Runtime은 이 저장소에서 사용하지 않습니다.)
-- **S3 Files**: AgentCore 세션 checkpoint·ECS `tasks.db` 영속화를 위해 S3 버킷을 NFS로 마운트
+- **S3 Files**: AgentCore 세션 checkpoint 영속화를 위해 S3 버킷을 NFS로 마운트 (태스크·메시지는 DynamoDB)
 - **공유 Secrets**: Tavily·Notion API Key를 계정/리전 공용 Secret(`tavilyapikey`, `notionapikey`)으로 관리
 
 ### 주요 특징
@@ -170,7 +170,7 @@ VPC 생성 직후 **두 개의** S3 Files FS를 **멱등**으로 프로비저닝
 |--------|------|
 | Sync IAM role | `role-s3files-sync-for-{project_name}` — S3 bucket ↔ NFS 동기화 |
 | Session FS | prefix `agentcore-sessions/` — skills, artifacts, checkpoints |
-| App-data FS | prefix `app-data/` — `tasks.db`, graph, settings, litellm |
+| App-data FS | prefix `app-data/` — graph, settings, litellm |
 | Mount targets | private subnet마다 (공유 mount SG 가능) |
 | Access point | FS별 마운트 진입점 (`posix uid/gid: 0/0`) |
 
@@ -187,7 +187,7 @@ VPC 생성 직후 **두 개의** S3 Files FS를 **멱등**으로 프로비저닝
 - **타겟 그룹**: ECS Fargate 태스크 (IP 타겟, 포트 8501)
 - **헬스체크**: `/api/health`
 - **Idle timeout**: 120초 (`ALB_IDLE_TIMEOUT_SECONDS`) — 장시간 SSE 스트림 유지
-- **Stickiness**: `app_cookie` on `agent_user_id` (86400초). SQLite working-copy 일관성용.  
+- **Stickiness**: `app_cookie` on `agent_user_id` (86400초). ECS task 단위 in-memory run 상태(스트리밍·cancel) 일관성용.  
   `lb_cookie`(AWSALB/AWSALBCORS)는 Secure/HttpOnly를 설정할 수 없어 사용하지 않음 ([AWS guidance](https://repost.aws/knowledge-center/elb-secure-flag-alb-cookies)).  
   세션 쿠키는 앱이 HttpOnly + Secure(HTTPS) + SameSite=Lax로 발급.
 - **Origin 보호**: listener default = **403 fixed-response**, `X-Custom-Header` 일치 시에만 ECS target group으로 forward (`ensure_alb_listener_origin_protection`)

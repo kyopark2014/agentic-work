@@ -1,463 +1,411 @@
-"""Task/message store with per-user SQLite DBs and a global login_events DB."""
+"""Task/message/login store backed by DynamoDB.
+
+Tables (names derive from the project name; override with env vars):
+
+* ``{project}-tasks``                PK ``user_id``, SK ``task_id``
+* ``{project}-messages``             PK ``task_id``, SK ``message_id``,
+                                      LSI ``task_id-created_at-index`` (chronological order)
+* ``{project}-login-events``         PK ``user_id``, SK ``sk`` (``logged_at#id``)
+
+Every write is a single-item, field-level operation, so concurrent ECS tasks (or the
+same user on several machines) can no longer overwrite each other with a stale
+whole-file copy the way the former per-user SQLite files could.
+
+Local development: set ``DYNAMODB_ENDPOINT_URL`` (``run_local.sh`` starts DynamoDB
+Local) and the tables are created automatically on startup.
+"""
 
 from __future__ import annotations
 
-import fcntl
 import json
 import logging
 import os
 import sqlite3
+import threading
 import uuid
-from contextlib import contextmanager
-from datetime import datetime, timezone
-from typing import Any, Iterator
+from datetime import datetime, timedelta, timezone
+from typing import Any, Iterable
 
-from application.task_store_persistence import (
-    durable_user_db_path,
-    flush_persist,
-    restore_user_db,
-    schedule_persist,
-    working_db_path,
-    working_user_db_path,
-)
-from application.utils import SESSION_STORAGE_DIR, sanitize_user_path_segment
+import boto3
+from boto3.dynamodb.conditions import Key
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
-
-_APPLICATION_DIR = os.path.dirname(os.path.abspath(__file__))
-_DATA_DIR = os.path.join(_APPLICATION_DIR, "data")
-_GLOBAL_DB_PATH = working_db_path()
 
 DEFAULT_MODEL = "Claude 5.0 Sonnet"
 MESSAGE_STATUS_STREAMING = "streaming"
 MESSAGE_STATUS_COMPLETE = "complete"
 
-_USER_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS tasks (
-  id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL,
-  title TEXT,
-  runtime_session_id TEXT NOT NULL UNIQUE,
-  model_name TEXT,
-  skills_json TEXT,
-  mcp_servers_json TEXT,
-  guardrail_enabled INTEGER DEFAULT 0,
-  memory_enabled INTEGER DEFAULT 1,
-  llm_gateway_enabled INTEGER DEFAULT 0,
-  pinned INTEGER DEFAULT 0,
-  created_at TEXT,
-  updated_at TEXT
-);
+_MESSAGES_BY_CREATED_INDEX = "task_id-created_at-index"
 
-CREATE TABLE IF NOT EXISTS messages (
-  id TEXT PRIMARY KEY,
-  task_id TEXT NOT NULL,
-  role TEXT NOT NULL,
-  content TEXT,
-  images_json TEXT,
-  tool_events_json TEXT,
-  status TEXT DEFAULT 'complete',
-  created_at TEXT,
-  FOREIGN KEY (task_id) REFERENCES tasks(id)
-);
+# DynamoDB items are capped at 400 KB, but the messages table has an LSI that projects
+# ALL attributes and the limit applies to the item plus its index copy (~200 KB each).
+_MAX_ITEM_PAYLOAD_BYTES = 180_000
 
-CREATE INDEX IF NOT EXISTS idx_tasks_user_updated
-  ON tasks(user_id, updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_messages_task_created
-  ON messages(task_id, created_at ASC);
-"""
+_local = threading.local()
+_tables_ready = False
+_tables_lock = threading.Lock()
 
-_GLOBAL_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS tasks (
-  id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL,
-  title TEXT,
-  runtime_session_id TEXT NOT NULL UNIQUE,
-  model_name TEXT,
-  skills_json TEXT,
-  mcp_servers_json TEXT,
-  guardrail_enabled INTEGER DEFAULT 0,
-  memory_enabled INTEGER DEFAULT 1,
-  llm_gateway_enabled INTEGER DEFAULT 0,
-  created_at TEXT,
-  updated_at TEXT
-);
 
-CREATE TABLE IF NOT EXISTS messages (
-  id TEXT PRIMARY KEY,
-  task_id TEXT NOT NULL,
-  role TEXT NOT NULL,
-  content TEXT,
-  images_json TEXT,
-  tool_events_json TEXT,
-  status TEXT DEFAULT 'complete',
-  created_at TEXT,
-  FOREIGN KEY (task_id) REFERENCES tasks(id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_tasks_user_updated
-  ON tasks(user_id, updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_messages_task_created
-  ON messages(task_id, created_at ASC);
-
-CREATE TABLE IF NOT EXISTS login_events (
-  id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL,
-  method TEXT NOT NULL,
-  name TEXT,
-  picture TEXT,
-  logged_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_login_events_logged
-  ON login_events(logged_at DESC);
-CREATE INDEX IF NOT EXISTS idx_login_events_user
-  ON login_events(user_id, logged_at DESC);
-"""
+# ---------------------------------------------------------------------------
+# Configuration / clients
+# ---------------------------------------------------------------------------
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _configure_connection(conn: sqlite3.Connection) -> sqlite3.Connection:
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=5000")
+def _app_config() -> dict[str, Any]:
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
-    except sqlite3.Error:
-        pass
-    return conn
+        from application import utils
+
+        cfg = utils.load_config()
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
 
 
-def _connect_path(db_path: str) -> sqlite3.Connection:
-    parent = os.path.dirname(db_path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    conn = sqlite3.connect(db_path, timeout=5, check_same_thread=False)
-    return _configure_connection(conn)
+def _project_name() -> str:
+    env_name = (os.environ.get("TASK_DB_PROJECT") or "").strip()
+    if env_name:
+        return env_name
+    name = _app_config().get("projectName")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    return "agentic-work"
 
 
-def _connect_global() -> sqlite3.Connection:
-    global _GLOBAL_DB_PATH
-    _GLOBAL_DB_PATH = working_db_path()
-    return _connect_path(_GLOBAL_DB_PATH)
-
-
-def _apply_task_column_migrations(conn: sqlite3.Connection) -> None:
-    for stmt in (
-        "ALTER TABLE tasks ADD COLUMN pinned INTEGER DEFAULT 0",
-        "ALTER TABLE tasks ADD COLUMN memory_enabled INTEGER DEFAULT 1",
-        "ALTER TABLE tasks ADD COLUMN llm_gateway_enabled INTEGER DEFAULT 0",
-        "ALTER TABLE messages ADD COLUMN status TEXT DEFAULT 'complete'",
-    ):
-        try:
-            conn.execute(stmt)
-        except sqlite3.OperationalError:
-            pass
-
-
-def _init_user_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(_USER_SCHEMA_SQL)
-    _apply_task_column_migrations(conn)
-
-
-def _init_global_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(_GLOBAL_SCHEMA_SQL)
-    _apply_task_column_migrations(conn)
-
-
-def init_db() -> None:
-    """Initialize the global DB (login_events + legacy tables)."""
-    global _GLOBAL_DB_PATH
-    _GLOBAL_DB_PATH = working_db_path()
-    with _connect_global() as conn:
-        _init_global_schema(conn)
-
-
-@contextmanager
-def _user_db_lock(user_id: str) -> Iterator[None]:
-    lock_path = working_user_db_path(user_id) + ".lock"
-    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-    with open(lock_path, "a+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-
-def _db_ready(path: str) -> bool:
-    return os.path.isfile(path) and os.path.getsize(path) > 0
-
-
-def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    if "." in table:
-        schema, name = table.split(".", 1)
-        rows = conn.execute(f"PRAGMA {schema}.table_info({name})").fetchall()
-    else:
-        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
-    return {row["name"] if isinstance(row, sqlite3.Row) else row[1] for row in rows}
-
-
-def _migrate_user_from_legacy(user_db_path: str, user_id: str) -> None:
-    """Create user DB and copy this user's tasks/messages from legacy global DB."""
-    legacy = working_db_path()
-    parent = os.path.dirname(user_db_path)
-    os.makedirs(parent, exist_ok=True)
-    tmp_path = user_db_path + f".migrating-{os.getpid()}"
-    for suffix in ("", "-wal", "-shm"):
-        side = tmp_path + suffix
-        if os.path.isfile(side):
-            os.remove(side)
-
-    task_rows: list[sqlite3.Row] = []
-    message_rows: list[sqlite3.Row] = []
-    task_cols: list[str] = []
-    msg_cols: list[str] = []
-
-    if _db_ready(legacy):
-        with _connect_path(legacy) as legacy_conn:
-            legacy_task_cols = _table_columns(legacy_conn, "tasks")
-            legacy_msg_cols = _table_columns(legacy_conn, "messages")
-            task_cols = [
-                c
-                for c in (
-                    "id",
-                    "user_id",
-                    "title",
-                    "runtime_session_id",
-                    "model_name",
-                    "skills_json",
-                    "mcp_servers_json",
-                    "guardrail_enabled",
-                    "memory_enabled",
-                    "llm_gateway_enabled",
-                    "pinned",
-                    "created_at",
-                    "updated_at",
-                )
-                if c in legacy_task_cols
-            ]
-            msg_cols = [
-                c
-                for c in (
-                    "id",
-                    "task_id",
-                    "role",
-                    "content",
-                    "images_json",
-                    "tool_events_json",
-                    "status",
-                    "created_at",
-                )
-                if c in legacy_msg_cols
-            ]
-            if task_cols:
-                col_csv = ", ".join(task_cols)
-                task_rows = legacy_conn.execute(
-                    f"SELECT {col_csv} FROM tasks WHERE user_id = ?",
-                    (user_id,),
-                ).fetchall()
-            if msg_cols and task_rows:
-                col_csv = ", ".join(msg_cols)
-                message_rows = legacy_conn.execute(
-                    f"""
-                    SELECT {col_csv}
-                    FROM messages
-                    WHERE task_id IN (
-                      SELECT id FROM tasks WHERE user_id = ?
-                    )
-                    """,
-                    (user_id,),
-                ).fetchall()
-
-    conn = _connect_path(tmp_path)
-    try:
-        _init_user_schema(conn)
-        dest_task_cols = _table_columns(conn, "tasks")
-        dest_msg_cols = _table_columns(conn, "messages")
-        task_cols = [c for c in task_cols if c in dest_task_cols]
-        msg_cols = [c for c in msg_cols if c in dest_msg_cols]
-        if task_cols and task_rows:
-            col_csv = ", ".join(task_cols)
-            placeholders = ", ".join("?" for _ in task_cols)
-            conn.executemany(
-                f"INSERT OR IGNORE INTO tasks ({col_csv}) VALUES ({placeholders})",
-                [tuple(row[c] for c in task_cols) for row in task_rows],
-            )
-        if msg_cols and message_rows:
-            col_csv = ", ".join(msg_cols)
-            placeholders = ", ".join("?" for _ in msg_cols)
-            conn.executemany(
-                f"INSERT OR IGNORE INTO messages ({col_csv}) VALUES ({placeholders})",
-                [tuple(row[c] for c in msg_cols) for row in message_rows],
-            )
-        conn.commit()
-    finally:
-        conn.close()
-
-    os.replace(tmp_path, user_db_path)
-    for suffix in ("-wal", "-shm"):
-        src = tmp_path + suffix
-        dst = user_db_path + suffix
-        if os.path.isfile(src):
-            os.replace(src, dst)
-        elif os.path.isfile(dst):
-            os.remove(dst)
-    logger.info(
-        "Migrated user tasks DB for %s -> %s (tasks=%s messages=%s)",
-        user_id,
-        user_db_path,
-        len(task_rows),
-        len(message_rows),
+def _region() -> str:
+    return (
+        os.environ.get("AWS_REGION")
+        or os.environ.get("AWS_DEFAULT_REGION")
+        or str(_app_config().get("region") or "").strip()
+        or "us-west-2"
     )
 
 
-def ensure_user_db(user_id: str) -> str:
-    """Return working path for the user's tasks/messages DB, creating/migrating if needed."""
-    if not sanitize_user_path_segment(user_id):
-        raise ValueError(f"Invalid user_id: {user_id!r}")
+def _endpoint_url() -> str | None:
+    return (os.environ.get("DYNAMODB_ENDPOINT_URL") or "").strip() or None
 
-    working = working_user_db_path(user_id)
-    with _user_db_lock(user_id):
-        if _db_ready(working):
-            with _connect_path(working) as conn:
-                _init_user_schema(conn)
-            return working
 
-        restored = False
+def tasks_table_name() -> str:
+    return (os.environ.get("TASKS_TABLE") or "").strip() or f"{_project_name()}-tasks"
+
+
+def messages_table_name() -> str:
+    return (os.environ.get("MESSAGES_TABLE") or "").strip() or f"{_project_name()}-messages"
+
+
+def login_events_table_name() -> str:
+    return (
+        (os.environ.get("LOGIN_EVENTS_TABLE") or "").strip()
+        or f"{_project_name()}-login-events"
+    )
+
+
+def _resource():
+    # boto3 resources are not thread-safe; keep one per thread.
+    res = getattr(_local, "resource", None)
+    if res is None:
+        kwargs: dict[str, Any] = {"region_name": _region()}
+        endpoint = _endpoint_url()
+        if endpoint:
+            kwargs["endpoint_url"] = endpoint
+            # DynamoDB Local accepts any credentials; make sure some exist.
+            if not os.environ.get("AWS_ACCESS_KEY_ID"):
+                kwargs["aws_access_key_id"] = "local"
+                kwargs["aws_secret_access_key"] = "local"
+        res = boto3.resource("dynamodb", **kwargs)
+        _local.resource = res
+    return res
+
+
+def _tasks():
+    return _resource().Table(tasks_table_name())
+
+
+def _messages():
+    return _resource().Table(messages_table_name())
+
+
+def _logins():
+    return _resource().Table(login_events_table_name())
+
+
+def table_specs() -> list[dict[str, Any]]:
+    """CreateTable arguments for all store tables (also used for local auto-create)."""
+    return [
+        {
+            "TableName": tasks_table_name(),
+            "AttributeDefinitions": [
+                {"AttributeName": "user_id", "AttributeType": "S"},
+                {"AttributeName": "task_id", "AttributeType": "S"},
+            ],
+            "KeySchema": [
+                {"AttributeName": "user_id", "KeyType": "HASH"},
+                {"AttributeName": "task_id", "KeyType": "RANGE"},
+            ],
+            "BillingMode": "PAY_PER_REQUEST",
+        },
+        {
+            "TableName": messages_table_name(),
+            "AttributeDefinitions": [
+                {"AttributeName": "task_id", "AttributeType": "S"},
+                {"AttributeName": "message_id", "AttributeType": "S"},
+                {"AttributeName": "created_at", "AttributeType": "S"},
+            ],
+            "KeySchema": [
+                {"AttributeName": "task_id", "KeyType": "HASH"},
+                {"AttributeName": "message_id", "KeyType": "RANGE"},
+            ],
+            "LocalSecondaryIndexes": [
+                {
+                    "IndexName": _MESSAGES_BY_CREATED_INDEX,
+                    "KeySchema": [
+                        {"AttributeName": "task_id", "KeyType": "HASH"},
+                        {"AttributeName": "created_at", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                }
+            ],
+            "BillingMode": "PAY_PER_REQUEST",
+        },
+        {
+            "TableName": login_events_table_name(),
+            "AttributeDefinitions": [
+                {"AttributeName": "user_id", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"},
+            ],
+            "KeySchema": [
+                {"AttributeName": "user_id", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"},
+            ],
+            "BillingMode": "PAY_PER_REQUEST",
+        },
+    ]
+
+
+def ensure_tables() -> None:
+    """Create any missing tables (DynamoDB Local / first run). No-op for existing tables."""
+    client = _resource().meta.client
+    for spec in table_specs():
+        name = spec["TableName"]
         try:
-            restored = restore_user_db(user_id)
-        except Exception:
-            logger.exception("Failed to restore user DB for %s", user_id)
-
-        if restored and _db_ready(working):
-            with _connect_path(working) as conn:
-                _init_user_schema(conn)
-            return working
-
-        # Durable may exist while restore was skipped (already local-only path).
-        durable = durable_user_db_path(user_id)
-        if _db_ready(durable) and not _db_ready(working):
-            try:
-                restore_user_db(user_id)
-            except Exception:
-                logger.exception("Failed durable→working restore for %s", user_id)
-            if _db_ready(working):
-                with _connect_path(working) as conn:
-                    _init_user_schema(conn)
-                return working
-
-        _migrate_user_from_legacy(working, user_id)
-        with _connect_path(working) as conn:
-            _init_user_schema(conn)
-        # Seed durable copy immediately so sibling instances can restore.
-        flush_persist(user_id)
-        return working
+            client.describe_table(TableName=name)
+            continue
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "ResourceNotFoundException":
+                raise
+        try:
+            client.create_table(**spec)
+            client.get_waiter("table_exists").wait(TableName=name)
+            logger.info("Created DynamoDB table %s", name)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "ResourceInUseException":
+                raise
 
 
-def _connect_user(user_id: str) -> sqlite3.Connection:
-    path = ensure_user_db(user_id)
-    return _connect_path(path)
+def init_db() -> None:
+    """Prepare the store. Auto-creates tables for DynamoDB Local or TASK_STORE_AUTO_CREATE=1."""
+    global _tables_ready
+    with _tables_lock:
+        auto_create = bool(_endpoint_url()) or (
+            os.environ.get("TASK_STORE_AUTO_CREATE", "").strip().lower() in {"1", "true", "yes", "on"}
+        )
+        if auto_create:
+            ensure_tables()
+        _tables_ready = True
+    logger.info(
+        "Task store using DynamoDB (tasks=%s, messages=%s, login_events=%s, endpoint=%s)",
+        tasks_table_name(),
+        messages_table_name(),
+        login_events_table_name(),
+        _endpoint_url() or "aws",
+    )
 
 
-def _after_write(user_id: str | None = None) -> None:
-    schedule_persist(user_id)
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
-def _row_to_task(row: sqlite3.Row) -> dict[str, Any]:
+def _query_all(table: Any, **kwargs: Any) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    while True:
+        resp = table.query(**kwargs)
+        items.extend(resp.get("Items", []))
+        last = resp.get("LastEvaluatedKey")
+        if not last:
+            return items
+        kwargs["ExclusiveStartKey"] = last
+
+
+def _scan_all(table: Any, **kwargs: Any) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    while True:
+        resp = table.scan(**kwargs)
+        items.extend(resp.get("Items", []))
+        last = resp.get("LastEvaluatedKey")
+        if not last:
+            return items
+        kwargs["ExclusiveStartKey"] = last
+
+
+def _is_conditional_failure(exc: ClientError) -> bool:
+    return exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException"
+
+
+def _item_to_task(item: dict[str, Any]) -> dict[str, Any]:
     return {
-        "id": row["id"],
-        "user_id": row["user_id"],
-        "title": row["title"] or "New task",
-        "runtime_session_id": row["runtime_session_id"],
-        "model_name": row["model_name"] or DEFAULT_MODEL,
-        "skills": json.loads(row["skills_json"] or "[]"),
-        "mcp_servers": json.loads(row["mcp_servers_json"] or "[]"),
-        "guardrail_enabled": bool(row["guardrail_enabled"]),
-        "memory_enabled": bool(row["memory_enabled"]) if "memory_enabled" in row.keys() else True,
-        "llm_gateway_enabled": (
-            bool(row["llm_gateway_enabled"])
-            if "llm_gateway_enabled" in row.keys()
-            else False
-        ),
-        "pinned": bool(row["pinned"]) if "pinned" in row.keys() else False,
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
+        "id": item["task_id"],
+        "user_id": item["user_id"],
+        "title": item.get("title") or "New task",
+        "runtime_session_id": item.get("runtime_session_id"),
+        "model_name": item.get("model_name") or DEFAULT_MODEL,
+        "skills": list(item.get("skills") or []),
+        "mcp_servers": list(item.get("mcp_servers") or []),
+        "guardrail_enabled": bool(item.get("guardrail_enabled", False)),
+        "memory_enabled": bool(item.get("memory_enabled", True)),
+        "llm_gateway_enabled": bool(item.get("llm_gateway_enabled", False)),
+        "pinned": bool(item.get("pinned", False)),
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
     }
 
 
-def _message_status(row: sqlite3.Row) -> str:
-    if "status" not in row.keys() or not row["status"]:
-        return MESSAGE_STATUS_COMPLETE
-    return str(row["status"])
+def _loads_list(raw: Any) -> list[Any]:
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else raw
+    except json.JSONDecodeError:
+        return []
+    return value if isinstance(value, list) else []
 
 
-def _row_to_message(row: sqlite3.Row) -> dict[str, Any]:
+def _message_status(item: dict[str, Any]) -> str:
+    return str(item.get("status") or MESSAGE_STATUS_COMPLETE)
+
+
+def _item_to_message(item: dict[str, Any]) -> dict[str, Any]:
     return {
-        "id": row["id"],
-        "task_id": row["task_id"],
-        "role": row["role"],
-        "content": row["content"] or "",
-        "images": json.loads(row["images_json"] or "[]"),
-        "tool_events": json.loads(row["tool_events_json"] or "[]"),
-        "status": _message_status(row),
-        "created_at": row["created_at"],
+        "id": item["message_id"],
+        "task_id": item["task_id"],
+        "role": item["role"],
+        "content": item.get("content") or "",
+        "images": _loads_list(item.get("images_json")),
+        "tool_events": _loads_list(item.get("tool_events_json")),
+        "status": _message_status(item),
+        "created_at": item.get("created_at"),
     }
 
 
-def _latest_message_row(
-    conn: sqlite3.Connection, task_id: str
-) -> sqlite3.Row | None:
-    return conn.execute(
-        """
-        SELECT * FROM messages
-        WHERE task_id = ?
-        ORDER BY created_at DESC
-        LIMIT 1
-        """,
-        (task_id,),
-    ).fetchone()
+def _fit_payload(
+    content: str, images: list[str], tool_events: list[dict[str, Any]]
+) -> tuple[str, str, str]:
+    """Serialize message fields, shrinking them if the item would exceed 400 KB."""
+    content = content or ""
+    images_json = json.dumps(images, ensure_ascii=False)
+    events_json = json.dumps(tool_events, ensure_ascii=False)
+
+    def size() -> int:
+        return len(content.encode("utf-8")) + len(images_json.encode("utf-8")) + len(
+            events_json.encode("utf-8")
+        )
+
+    if size() <= _MAX_ITEM_PAYLOAD_BYTES:
+        return content, images_json, events_json
+
+    try:
+        from application.tool_events_slim import slim_tool_events
+
+        events_json = json.dumps(slim_tool_events(tool_events), ensure_ascii=False)
+    except Exception:
+        events_json = "[]"
+    if size() > _MAX_ITEM_PAYLOAD_BYTES:
+        events_json = "[]"
+    if size() > _MAX_ITEM_PAYLOAD_BYTES:
+        budget = max(_MAX_ITEM_PAYLOAD_BYTES - len(images_json.encode("utf-8")) - 64, 1_000)
+        content = content.encode("utf-8")[:budget].decode("utf-8", errors="ignore") + "…"
+    logger.warning("Message payload exceeded DynamoDB item budget; truncated before write")
+    return content, images_json, events_json
+
+
+def _touch_task(
+    user_id: str,
+    task_id: str,
+    *,
+    updated_at: str,
+    new_message: bool = False,
+) -> bool:
+    """Bump ``updated_at`` (and message_count). Returns False if the task does not exist."""
+    expr = "SET updated_at = :u"
+    if new_message:
+        expr += " ADD message_count :one"
+    values: dict[str, Any] = {":u": updated_at}
+    if new_message:
+        values[":one"] = 1
+    try:
+        _tasks().update_item(
+            Key={"user_id": user_id, "task_id": task_id},
+            UpdateExpression=expr,
+            ExpressionAttributeValues=values,
+            ConditionExpression="attribute_exists(task_id)",
+        )
+        return True
+    except ClientError as exc:
+        if _is_conditional_failure(exc):
+            logger.warning("Task %s/%s not found while updating timestamp", user_id, task_id)
+            return False
+        raise
+
+
+def _set_title_if_default(user_id: str, task_id: str, title: str) -> None:
+    try:
+        _tasks().update_item(
+            Key={"user_id": user_id, "task_id": task_id},
+            UpdateExpression="SET title = :t",
+            ConditionExpression=(
+                "attribute_exists(task_id) AND "
+                "(attribute_not_exists(title) OR title = :empty OR title = :default)"
+            ),
+            ExpressionAttributeValues={":t": title, ":empty": "", ":default": "New task"},
+        )
+    except ClientError as exc:
+        if not _is_conditional_failure(exc):
+            raise
+
+
+# ---------------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------------
 
 
 def list_tasks(user_id: str, limit: int = 100) -> list[dict[str, Any]]:
-    with _connect_user(user_id) as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM tasks
-            WHERE user_id = ?
-            ORDER BY pinned DESC, updated_at DESC
-            LIMIT ?
-            """,
-            (user_id, limit),
-        ).fetchall()
-    return [_row_to_task(r) for r in rows]
+    items = _query_all(
+        _tasks(),
+        KeyConditionExpression=Key("user_id").eq(user_id),
+        ConsistentRead=True,
+    )
+    tasks = [_item_to_task(i) for i in items]
+    tasks.sort(key=lambda t: (t["pinned"], t["updated_at"] or ""), reverse=True)
+    return tasks[:limit]
 
 
 def get_task(task_id: str, user_id: str | None = None) -> dict[str, Any] | None:
     if not user_id:
-        raise ValueError("user_id is required to resolve the per-user task DB")
-    with _connect_user(user_id) as conn:
-        row = conn.execute(
-            "SELECT * FROM tasks WHERE id = ? AND user_id = ?",
-            (task_id, user_id),
-        ).fetchone()
-    return _row_to_task(row) if row else None
+        raise ValueError("user_id is required to resolve the task")
+    resp = _tasks().get_item(
+        Key={"user_id": user_id, "task_id": task_id}, ConsistentRead=True
+    )
+    item = resp.get("Item")
+    return _item_to_task(item) if item else None
 
 
 def get_task_refreshing(task_id: str, user_id: str | None = None) -> dict[str, Any] | None:
-    """Return a task, reloading this user's durable DB once if missing locally."""
+    """Kept for call-site compatibility: reads are strongly consistent, no refresh needed."""
     if not user_id:
-        return None
-    task = get_task(task_id, user_id)
-    if task:
-        return task
-    try:
-        # Force durable → working even if a stale working copy exists.
-        restore_user_db(user_id)
-    except Exception:
-        return None
-    if not _db_ready(working_user_db_path(user_id)):
         return None
     return get_task(task_id, user_id)
 
@@ -474,36 +422,50 @@ def create_task(
     title: str = "New task",
 ) -> dict[str, Any]:
     task_id = str(uuid.uuid4())
-    runtime_session_id = str(uuid.uuid4())
     now = _now_iso()
-    with _connect_user(user_id) as conn:
-        conn.execute(
-            """
-            INSERT INTO tasks (
-              id, user_id, title, runtime_session_id, model_name,
-              skills_json, mcp_servers_json, guardrail_enabled, memory_enabled,
-              llm_gateway_enabled, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                task_id,
-                user_id,
-                title,
-                runtime_session_id,
-                model_name or DEFAULT_MODEL,
-                json.dumps(skills or [], ensure_ascii=False),
-                json.dumps(mcp_servers or [], ensure_ascii=False),
-                1 if guardrail_enabled else 0,
-                1 if memory_enabled else 0,
-                1 if llm_gateway_enabled else 0,
-                now,
-                now,
-            ),
+    item = {
+        "user_id": user_id,
+        "task_id": task_id,
+        "title": title,
+        "runtime_session_id": str(uuid.uuid4()),
+        "model_name": model_name or DEFAULT_MODEL,
+        "skills": list(skills or []),
+        "mcp_servers": list(mcp_servers or []),
+        "guardrail_enabled": bool(guardrail_enabled),
+        "memory_enabled": bool(memory_enabled),
+        "llm_gateway_enabled": bool(llm_gateway_enabled),
+        "pinned": False,
+        "message_count": 0,
+        "created_at": now,
+        "updated_at": now,
+    }
+    _tasks().put_item(Item=item, ConditionExpression="attribute_not_exists(task_id)")
+    return _item_to_task(item)
+
+
+def _update_task_fields(
+    user_id: str, task_id: str, fields: dict[str, Any], *, now: str | None = None
+) -> bool:
+    names: dict[str, str] = {}
+    values: dict[str, Any] = {":updated_at": now or _now_iso()}
+    sets = ["updated_at = :updated_at"]
+    for idx, (attr, value) in enumerate(fields.items()):
+        names[f"#f{idx}"] = attr
+        values[f":v{idx}"] = value
+        sets.append(f"#f{idx} = :v{idx}")
+    try:
+        _tasks().update_item(
+            Key={"user_id": user_id, "task_id": task_id},
+            UpdateExpression="SET " + ", ".join(sets),
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=values,
+            ConditionExpression="attribute_exists(task_id)",
         )
-    # Flush immediately so sibling ECS tasks / replacements can see the row
-    # (debounced persist alone loses creates during rolling deploys).
-    flush_persist(user_id)
-    return get_task(task_id, user_id)  # type: ignore[return-value]
+        return True
+    except ClientError as exc:
+        if _is_conditional_failure(exc):
+            return False
+        raise
 
 
 def update_all_tasks(
@@ -515,34 +477,30 @@ def update_all_tasks(
     llm_gateway_enabled: bool | None = None,
 ) -> int:
     """Apply shared settings to every task for ``user_id``. Returns rows updated."""
-    sets: list[str] = []
-    values: list[Any] = []
+    fields: dict[str, Any] = {}
     if model_name is not None:
-        sets.append("model_name = ?")
-        values.append(str(model_name).strip() or DEFAULT_MODEL)
+        fields["model_name"] = str(model_name).strip() or DEFAULT_MODEL
     if guardrail_enabled is not None:
-        sets.append("guardrail_enabled = ?")
-        values.append(1 if guardrail_enabled else 0)
+        fields["guardrail_enabled"] = bool(guardrail_enabled)
     if memory_enabled is not None:
-        sets.append("memory_enabled = ?")
-        values.append(1 if memory_enabled else 0)
+        fields["memory_enabled"] = bool(memory_enabled)
     if llm_gateway_enabled is not None:
-        sets.append("llm_gateway_enabled = ?")
-        values.append(1 if llm_gateway_enabled else 0)
-    if not sets:
+        fields["llm_gateway_enabled"] = bool(llm_gateway_enabled)
+    if not fields:
         return 0
-    sets.append("updated_at = ?")
-    values.append(_now_iso())
-    values.append(user_id)
-    with _connect_user(user_id) as conn:
-        cur = conn.execute(
-            f"UPDATE tasks SET {', '.join(sets)} WHERE user_id = ?",
-            values,
-        )
-        rowcount = cur.rowcount
-    # Flush immediately so new-task creates / other instances see Settings.
-    flush_persist(user_id)
-    return int(rowcount or 0)
+
+    now = _now_iso()
+    updated = 0
+    items = _query_all(
+        _tasks(),
+        KeyConditionExpression=Key("user_id").eq(user_id),
+        ProjectionExpression="task_id",
+        ConsistentRead=True,
+    )
+    for item in items:
+        if _update_task_fields(user_id, item["task_id"], fields, now=now):
+            updated += 1
+    return updated
 
 
 def update_all_task_flags(
@@ -562,104 +520,146 @@ def update_all_task_flags(
 
 
 def update_task(task_id: str, user_id: str, **fields: Any) -> dict[str, Any] | None:
-    allowed = {
-        "title": "title",
-        "model_name": "model_name",
-        "guardrail_enabled": "guardrail_enabled",
-        "memory_enabled": "memory_enabled",
-        "llm_gateway_enabled": "llm_gateway_enabled",
-        "pinned": "pinned",
-    }
-    sets: list[str] = []
-    values: list[Any] = []
+    patch: dict[str, Any] = {}
+    for key in ("title", "model_name"):
+        if fields.get(key) is not None:
+            patch[key] = fields[key]
+    for key in ("guardrail_enabled", "memory_enabled", "llm_gateway_enabled", "pinned"):
+        if fields.get(key) is not None:
+            patch[key] = bool(fields[key])
+    for key in ("skills", "mcp_servers"):
+        if fields.get(key) is not None:
+            patch[key] = list(fields[key])
 
-    for key, column in allowed.items():
-        if key in fields and fields[key] is not None:
-            value = fields[key]
-            if key in ("guardrail_enabled", "memory_enabled", "llm_gateway_enabled", "pinned"):
-                value = 1 if value else 0
-            sets.append(f"{column} = ?")
-            values.append(value)
-
-    if "skills" in fields and fields["skills"] is not None:
-        sets.append("skills_json = ?")
-        values.append(json.dumps(fields["skills"], ensure_ascii=False))
-
-    if "mcp_servers" in fields and fields["mcp_servers"] is not None:
-        sets.append("mcp_servers_json = ?")
-        values.append(json.dumps(fields["mcp_servers"], ensure_ascii=False))
-
-    if not sets:
-        return get_task(task_id, user_id)
-
-    sets.append("updated_at = ?")
-    values.append(_now_iso())
-    values.extend([task_id, user_id])
-
-    with _connect_user(user_id) as conn:
-        conn.execute(
-            f"UPDATE tasks SET {', '.join(sets)} WHERE id = ? AND user_id = ?",
-            values,
-        )
-    _after_write(user_id)
+    if patch:
+        _update_task_fields(user_id, task_id, patch)
     return get_task(task_id, user_id)
 
 
 def delete_task(task_id: str, user_id: str) -> bool:
-    with _connect_user(user_id) as conn:
-        conn.execute("DELETE FROM messages WHERE task_id = ?", (task_id,))
-        cur = conn.execute(
-            "DELETE FROM tasks WHERE id = ? AND user_id = ?",
-            (task_id, user_id),
+    try:
+        resp = _tasks().delete_item(
+            Key={"user_id": user_id, "task_id": task_id},
+            ConditionExpression="attribute_exists(task_id)",
+            ReturnValues="ALL_OLD",
         )
-    if cur.rowcount > 0:
-        _after_write(user_id)
-    return cur.rowcount > 0
+    except ClientError as exc:
+        if _is_conditional_failure(exc):
+            return False
+        raise
+    if not resp.get("Attributes"):
+        return False
+
+    # Task row is gone first, so the task disappears from the UI immediately;
+    # then remove its messages.
+    keys = _query_all(
+        _messages(),
+        KeyConditionExpression=Key("task_id").eq(task_id),
+        ProjectionExpression="task_id, message_id",
+        ConsistentRead=True,
+    )
+    with _messages().batch_writer() as batch:
+        for key in keys:
+            batch.delete_item(Key={"task_id": key["task_id"], "message_id": key["message_id"]})
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Messages
+# ---------------------------------------------------------------------------
+
+
+def _owned(item: dict[str, Any] | None, user_id: str) -> dict[str, Any] | None:
+    if item is None:
+        return None
+    owner = item.get("user_id")
+    if owner is not None and owner != user_id:
+        return None
+    return item
+
+
+def _message_items(task_id: str, user_id: str) -> list[dict[str, Any]]:
+    items = _query_all(
+        _messages(),
+        IndexName=_MESSAGES_BY_CREATED_INDEX,
+        KeyConditionExpression=Key("task_id").eq(task_id),
+        ScanIndexForward=True,
+        ConsistentRead=True,
+    )
+    return [i for i in items if _owned(i, user_id) is not None]
+
+
+def _latest_message_item(task_id: str, user_id: str) -> dict[str, Any] | None:
+    resp = _messages().query(
+        IndexName=_MESSAGES_BY_CREATED_INDEX,
+        KeyConditionExpression=Key("task_id").eq(task_id),
+        ScanIndexForward=False,
+        Limit=1,
+        ConsistentRead=True,
+    )
+    items = resp.get("Items", [])
+    return _owned(items[0], user_id) if items else None
 
 
 def list_messages(task_id: str, user_id: str) -> list[dict[str, Any]]:
-    with _connect_user(user_id) as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM messages
-            WHERE task_id = ?
-            ORDER BY created_at ASC
-            """,
-            (task_id,),
-        ).fetchall()
-    return [_row_to_message(r) for r in rows]
+    return [_item_to_message(i) for i in _message_items(task_id, user_id)]
 
 
 def _write_message_payload(
-    conn: sqlite3.Connection,
     *,
     message_id: str,
     task_id: str,
+    user_id: str,
     content: str,
     images: list[str],
     tool_events: list[dict[str, Any]],
     status: str,
     updated_at: str,
 ) -> None:
-    conn.execute(
-        """
-        UPDATE messages
-        SET content = ?, images_json = ?, tool_events_json = ?, status = ?
-        WHERE id = ? AND task_id = ?
-        """,
-        (
-            content,
-            json.dumps(images, ensure_ascii=False),
-            json.dumps(tool_events, ensure_ascii=False),
-            status,
-            message_id,
-            task_id,
+    content, images_json, events_json = _fit_payload(content, images, tool_events)
+    _messages().update_item(
+        Key={"task_id": task_id, "message_id": message_id},
+        UpdateExpression=(
+            "SET content = :c, images_json = :i, tool_events_json = :e, #s = :s"
         ),
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={
+            ":c": content,
+            ":i": images_json,
+            ":e": events_json,
+            ":s": status,
+        },
+        ConditionExpression="attribute_exists(message_id)",
     )
-    conn.execute(
-        "UPDATE tasks SET updated_at = ? WHERE id = ?",
-        (updated_at, task_id),
-    )
+    _touch_task(user_id, task_id, updated_at=updated_at)
+
+
+def _insert_message(
+    *,
+    task_id: str,
+    user_id: str,
+    role: str,
+    content: str,
+    images: list[str],
+    tool_events: list[dict[str, Any]],
+    status: str,
+    now: str,
+) -> dict[str, Any]:
+    content, images_json, events_json = _fit_payload(content, images, tool_events)
+    item = {
+        "task_id": task_id,
+        "message_id": str(uuid.uuid4()),
+        "user_id": user_id,
+        "role": role,
+        "content": content,
+        "images_json": images_json,
+        "tool_events_json": events_json,
+        "status": status,
+        "created_at": now,
+    }
+    _messages().put_item(Item=item, ConditionExpression="attribute_not_exists(message_id)")
+    _touch_task(user_id, task_id, updated_at=now, new_message=True)
+    return item
 
 
 def add_message(
@@ -671,67 +671,48 @@ def add_message(
     images: list[str] | None = None,
     tool_events: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    message_id = str(uuid.uuid4())
     now = _now_iso()
     image_list = images or []
     tool_event_list = tool_events or []
-    with _connect_user(user_id) as conn:
-        last = _latest_message_row(conn, task_id) if role == "assistant" else None
-        if (
-            last is not None
-            and last["role"] == "assistant"
-            and _message_status(last) == MESSAGE_STATUS_STREAMING
-        ):
-            message_id = last["id"]
-            _write_message_payload(
-                conn,
-                message_id=message_id,
-                task_id=task_id,
-                content=content,
-                images=image_list,
-                tool_events=tool_event_list,
-                status=MESSAGE_STATUS_COMPLETE,
-                updated_at=now,
-            )
-        else:
-            conn.execute(
-                """
-                INSERT INTO messages (
-                  id, task_id, role, content, images_json, tool_events_json,
-                  status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    message_id,
-                    task_id,
-                    role,
-                    content,
-                    json.dumps(image_list, ensure_ascii=False),
-                    json.dumps(tool_event_list, ensure_ascii=False),
-                    MESSAGE_STATUS_COMPLETE,
-                    now,
-                ),
-            )
-            title_update = None
-            if role == "user":
-                row = conn.execute(
-                    "SELECT title FROM tasks WHERE id = ?", (task_id,)
-                ).fetchone()
-                if row and (row["title"] or "New task") in ("New task", ""):
-                    title_update = content.strip()[:50] or "New task"
 
-            conn.execute(
-                "UPDATE tasks SET updated_at = ?"
-                + (", title = ?" if title_update else "")
-                + " WHERE id = ?",
-                ([now, title_update, task_id] if title_update else [now, task_id]),
-            )
-    _after_write(user_id)
-    with _connect_user(user_id) as conn:
-        row = conn.execute(
-            "SELECT * FROM messages WHERE id = ?", (message_id,)
-        ).fetchone()
-    return _row_to_message(row) if row else {}
+    last = _latest_message_item(task_id, user_id) if role == "assistant" else None
+    if (
+        last is not None
+        and last.get("role") == "assistant"
+        and _message_status(last) == MESSAGE_STATUS_STREAMING
+    ):
+        _write_message_payload(
+            message_id=last["message_id"],
+            task_id=task_id,
+            user_id=user_id,
+            content=content,
+            images=image_list,
+            tool_events=tool_event_list,
+            status=MESSAGE_STATUS_COMPLETE,
+            updated_at=now,
+        )
+        done = dict(last)
+        done["content"], done["images_json"], done["tool_events_json"] = _fit_payload(
+            content, image_list, tool_event_list
+        )
+        done["status"] = MESSAGE_STATUS_COMPLETE
+        return _item_to_message(done)
+
+    item = _insert_message(
+        task_id=task_id,
+        user_id=user_id,
+        role=role,
+        content=content,
+        images=image_list,
+        tool_events=tool_event_list,
+        status=MESSAGE_STATUS_COMPLETE,
+        now=now,
+    )
+    if role == "user":
+        title = content.strip()[:50]
+        if title:
+            _set_title_if_default(user_id, task_id, title)
+    return _item_to_message(item)
 
 
 def upsert_streaming_message(
@@ -753,60 +734,47 @@ def upsert_streaming_message(
         return None
 
     now = _now_iso()
-    with _connect_user(user_id) as conn:
-        last = _latest_message_row(conn, task_id)
-        if (
-            last is not None
-            and last["role"] == "assistant"
-            and _message_status(last) == MESSAGE_STATUS_COMPLETE
-        ):
-            return _row_to_message(last)
-        if (
-            last is not None
-            and last["role"] == "assistant"
-            and _message_status(last) == MESSAGE_STATUS_STREAMING
-        ):
-            message_id = last["id"]
-            _write_message_payload(
-                conn,
-                message_id=message_id,
-                task_id=task_id,
-                content=content,
-                images=image_list,
-                tool_events=tool_event_list,
-                status=MESSAGE_STATUS_STREAMING,
-                updated_at=now,
-            )
-        else:
-            message_id = str(uuid.uuid4())
-            conn.execute(
-                """
-                INSERT INTO messages (
-                  id, task_id, role, content, images_json, tool_events_json,
-                  status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    message_id,
-                    task_id,
-                    "assistant",
-                    content,
-                    json.dumps(image_list, ensure_ascii=False),
-                    json.dumps(tool_event_list, ensure_ascii=False),
-                    MESSAGE_STATUS_STREAMING,
-                    now,
-                ),
-            )
-            conn.execute(
-                "UPDATE tasks SET updated_at = ? WHERE id = ?",
-                (now, task_id),
-            )
-    _after_write(user_id)
-    with _connect_user(user_id) as conn:
-        row = conn.execute(
-            "SELECT * FROM messages WHERE id = ?", (message_id,)
-        ).fetchone()
-    return _row_to_message(row) if row else {}
+    last = _latest_message_item(task_id, user_id)
+    if (
+        last is not None
+        and last.get("role") == "assistant"
+        and _message_status(last) == MESSAGE_STATUS_COMPLETE
+    ):
+        return _item_to_message(last)
+
+    if (
+        last is not None
+        and last.get("role") == "assistant"
+        and _message_status(last) == MESSAGE_STATUS_STREAMING
+    ):
+        _write_message_payload(
+            message_id=last["message_id"],
+            task_id=task_id,
+            user_id=user_id,
+            content=content,
+            images=image_list,
+            tool_events=tool_event_list,
+            status=MESSAGE_STATUS_STREAMING,
+            updated_at=now,
+        )
+        draft = dict(last)
+        draft["content"], draft["images_json"], draft["tool_events_json"] = _fit_payload(
+            content, image_list, tool_event_list
+        )
+        draft["status"] = MESSAGE_STATUS_STREAMING
+        return _item_to_message(draft)
+
+    item = _insert_message(
+        task_id=task_id,
+        user_id=user_id,
+        role="assistant",
+        content=content,
+        images=image_list,
+        tool_events=tool_event_list,
+        status=MESSAGE_STATUS_STREAMING,
+        now=now,
+    )
+    return _item_to_message(item)
 
 
 def update_message_tool_events(
@@ -818,34 +786,31 @@ def update_message_tool_events(
     """Backfill tool_events on an existing assistant message (refresh recovery)."""
     if not message_id or not tool_events:
         return None
-    with _connect_user(user_id) as conn:
-        row = conn.execute(
-            "SELECT * FROM messages WHERE id = ? AND task_id = ?",
-            (message_id, task_id),
-        ).fetchone()
-        if not row:
-            return None
-        conn.execute(
-            """
-            UPDATE messages
-            SET tool_events_json = ?
-            WHERE id = ? AND task_id = ?
-            """,
-            (
-                json.dumps(tool_events, ensure_ascii=False),
-                message_id,
-                task_id,
-            ),
-        )
-        conn.execute(
-            "UPDATE tasks SET updated_at = ? WHERE id = ?",
-            (_now_iso(), task_id),
-        )
-        updated = conn.execute(
-            "SELECT * FROM messages WHERE id = ?", (message_id,)
-        ).fetchone()
-    _after_write(user_id)
-    return _row_to_message(updated) if updated else None
+    resp = _messages().get_item(
+        Key={"task_id": task_id, "message_id": message_id}, ConsistentRead=True
+    )
+    item = _owned(resp.get("Item"), user_id)
+    if not item:
+        return None
+
+    _, _, events_json = _fit_payload(
+        item.get("content") or "", _loads_list(item.get("images_json")), tool_events
+    )
+    _messages().update_item(
+        Key={"task_id": task_id, "message_id": message_id},
+        UpdateExpression="SET tool_events_json = :e",
+        ExpressionAttributeValues={":e": events_json},
+        ConditionExpression="attribute_exists(message_id)",
+    )
+    _touch_task(user_id, task_id, updated_at=_now_iso())
+    updated = dict(item)
+    updated["tool_events_json"] = events_json
+    return _item_to_message(updated)
+
+
+# ---------------------------------------------------------------------------
+# Login events / dashboard
+# ---------------------------------------------------------------------------
 
 
 def record_login(
@@ -855,24 +820,29 @@ def record_login(
     name: str | None = None,
     picture: str | None = None,
 ) -> dict[str, Any]:
-    """Record a login for dashboard access metrics (global DB)."""
+    """Record a login for dashboard access metrics."""
     event_id = str(uuid.uuid4())
     now = _now_iso()
     uid = user_id.strip()
-    with _connect_global() as conn:
-        prior = conn.execute(
-            "SELECT 1 FROM login_events WHERE user_id = ? LIMIT 1",
-            (uid,),
-        ).fetchone()
-        is_new_user = prior is None
-        conn.execute(
-            """
-            INSERT INTO login_events (id, user_id, method, name, picture, logged_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (event_id, uid, method, name, picture, now),
-        )
-    _after_write(None)
+
+    prior = _logins().query(
+        KeyConditionExpression=Key("user_id").eq(uid), Limit=1, ConsistentRead=True
+    )
+    is_new_user = not prior.get("Items")
+
+    item: dict[str, Any] = {
+        "user_id": uid,
+        "sk": f"{now}#{event_id}",
+        "id": event_id,
+        "method": method,
+        "logged_at": now,
+    }
+    if name:
+        item["name"] = name
+    if picture:
+        item["picture"] = picture
+    _logins().put_item(Item=item)
+
     try:
         from application.cloudwatch_user_metrics import publish_login_metrics
 
@@ -890,193 +860,116 @@ def record_login(
     }
 
 
-def _discover_user_db_paths() -> dict[str, str]:
-    """Map user_id/segment → best available DB path (working preferred)."""
-    found: dict[str, str] = {}
-
-    users_dir = os.path.join(_DATA_DIR, "users")
-    if os.path.isdir(users_dir):
-        for name in os.listdir(users_dir):
-            if not name.endswith(".db") or name.endswith(".lock"):
-                continue
-            segment = name[:-3]
-            path = os.path.join(users_dir, name)
-            if _db_ready(path):
-                found[segment] = path
-
-    if os.path.isdir(SESSION_STORAGE_DIR):
-        for segment in os.listdir(SESSION_STORAGE_DIR):
-            if segment in found:
-                continue
-            path = os.path.join(SESSION_STORAGE_DIR, segment, f"{segment}.db")
-            if _db_ready(path):
-                found[segment] = path
-
-    return found
-
-
-def _task_stats_from_db(db_path: str) -> list[sqlite3.Row]:
-    try:
-        with _connect_path(db_path) as conn:
-            return conn.execute(
-                """
-                SELECT
-                  user_id,
-                  COUNT(*) AS task_count,
-                  MIN(created_at) AS first_task_at,
-                  MAX(updated_at) AS last_task_at,
-                  (
-                    SELECT COUNT(m.id)
-                    FROM messages m
-                    JOIN tasks t2 ON t2.id = m.task_id
-                    WHERE t2.user_id = tasks.user_id
-                  ) AS message_count
-                FROM tasks
-                GROUP BY user_id
-                """
-            ).fetchall()
-    except sqlite3.Error:
-        logger.exception("Failed reading task stats from %s", db_path)
-        return []
-
-
 def get_dashboard_stats(*, recent_limit: int = 50, daily_days: int = 14) -> dict[str, Any]:
-    """Aggregate registrant + access metrics for the admin dashboard."""
-    migrated_users: set[str] = set()
-    task_users: list[Any] = []
-    message_counts: dict[str, int] = {}
+    """Aggregate registrant + access metrics for the admin dashboard.
 
-    for segment, path in _discover_user_db_paths().items():
-        for row in _task_stats_from_db(path):
-            uid = row["user_id"]
-            migrated_users.add(uid)
-            task_users.append(row)
-            message_counts[uid] = int(row["message_count"] or 0)
+    Uses table scans: acceptable for the low-traffic admin page. Message counts come
+    from the per-task ``message_count`` counter so message bodies are never scanned.
+    """
+    task_rows = _scan_all(
+        _tasks(),
+        ProjectionExpression="user_id, created_at, updated_at, message_count",
+    )
+    login_rows = _scan_all(
+        _logins(),
+        ProjectionExpression="user_id, #m, #n, picture, logged_at, id",
+        ExpressionAttributeNames={"#m": "method", "#n": "name"},
+    )
 
-    # Legacy global tasks for users not yet migrated to a per-user DB.
-    if _db_ready(working_db_path()):
-        try:
-            with _connect_global() as conn:
-                for row in conn.execute(
-                    """
-                    SELECT
-                      user_id,
-                      COUNT(*) AS task_count,
-                      MIN(created_at) AS first_task_at,
-                      MAX(updated_at) AS last_task_at
-                    FROM tasks
-                    GROUP BY user_id
-                    """
-                ).fetchall():
-                    uid = row["user_id"]
-                    if uid in migrated_users:
-                        continue
-                    task_users.append(row)
-                    msg_row = conn.execute(
-                        """
-                        SELECT COUNT(m.id) AS message_count
-                        FROM tasks t
-                        LEFT JOIN messages m ON m.task_id = t.id
-                        WHERE t.user_id = ?
-                        """,
-                        (uid,),
-                    ).fetchone()
-                    message_counts[uid] = int((msg_row["message_count"] if msg_row else 0) or 0)
-        except sqlite3.Error:
-            logger.exception("Failed reading legacy task stats")
-
-    with _connect_global() as conn:
-        login_users = conn.execute(
-            """
-            SELECT
-              user_id,
-              COUNT(*) AS login_count,
-              MIN(logged_at) AS first_login_at,
-              MAX(logged_at) AS last_login_at,
-              GROUP_CONCAT(DISTINCT method) AS methods
-            FROM login_events
-            GROUP BY user_id
-            """
-        ).fetchall()
-
-        total_logins = conn.execute("SELECT COUNT(*) AS c FROM login_events").fetchone()["c"]
-
-        recent_logins = [
+    task_users: dict[str, dict[str, Any]] = {}
+    for row in task_rows:
+        uid = row["user_id"]
+        entry = task_users.setdefault(
+            uid,
             {
-                "id": row["id"],
-                "user_id": row["user_id"],
-                "method": row["method"],
-                "name": row["name"],
-                "picture": row["picture"],
-                "logged_at": row["logged_at"],
-            }
-            for row in conn.execute(
-                """
-                SELECT id, user_id, method, name, picture, logged_at
-                FROM login_events
-                ORDER BY logged_at DESC
-                LIMIT ?
-                """,
-                (recent_limit,),
-            ).fetchall()
+                "user_id": uid,
+                "task_count": 0,
+                "message_count": 0,
+                "first_task_at": None,
+                "last_task_at": None,
+            },
+        )
+        entry["task_count"] += 1
+        entry["message_count"] += int(row.get("message_count") or 0)
+        created = row.get("created_at")
+        updated = row.get("updated_at")
+        if created and (not entry["first_task_at"] or created < entry["first_task_at"]):
+            entry["first_task_at"] = created
+        if updated and (not entry["last_task_at"] or updated > entry["last_task_at"]):
+            entry["last_task_at"] = updated
+
+    login_users: dict[str, dict[str, Any]] = {}
+    for row in login_rows:
+        uid = row["user_id"]
+        logged = row.get("logged_at") or ""
+        entry = login_users.setdefault(
+            uid,
+            {
+                "user_id": uid,
+                "login_count": 0,
+                "first_login_at": None,
+                "last_login_at": None,
+                "methods": set(),
+            },
+        )
+        entry["login_count"] += 1
+        if logged and (not entry["first_login_at"] or logged < entry["first_login_at"]):
+            entry["first_login_at"] = logged
+        if logged and (not entry["last_login_at"] or logged > entry["last_login_at"]):
+            entry["last_login_at"] = logged
+        if row.get("method"):
+            entry["methods"].add(row["method"])
+
+    total_logins = len(login_rows)
+    recent_logins = [
+        {
+            "id": row.get("id"),
+            "user_id": row["user_id"],
+            "method": row.get("method"),
+            "name": row.get("name"),
+            "picture": row.get("picture"),
+            "logged_at": row.get("logged_at"),
+        }
+        for row in sorted(login_rows, key=lambda r: r.get("logged_at") or "", reverse=True)[
+            :recent_limit
         ]
+    ]
 
-        daily_rows = conn.execute(
-            """
-            SELECT
-              substr(logged_at, 1, 10) AS day,
-              COUNT(*) AS logins,
-              COUNT(DISTINCT user_id) AS unique_users
-            FROM login_events
-            WHERE substr(logged_at, 1, 10) >= date('now', ?)
-            GROUP BY substr(logged_at, 1, 10)
-            ORDER BY day ASC
-            """,
-            (f"-{max(daily_days, 1)} days",),
-        ).fetchall()
+    today = datetime.now(timezone.utc).date()
+    daily_cutoff = (today - timedelta(days=max(daily_days, 1))).isoformat()
+    week_cutoff = (today - timedelta(days=7)).isoformat()
+    today_str = today.isoformat()
 
-        logins_today = conn.execute(
-            """
-            SELECT COUNT(*) AS c
-            FROM login_events
-            WHERE substr(logged_at, 1, 10) = date('now')
-            """
-        ).fetchone()["c"]
-        active_today = conn.execute(
-            """
-            SELECT COUNT(DISTINCT user_id) AS c
-            FROM login_events
-            WHERE substr(logged_at, 1, 10) = date('now')
-            """
-        ).fetchone()["c"]
-        logins_7d = conn.execute(
-            """
-            SELECT COUNT(*) AS c
-            FROM login_events
-            WHERE substr(logged_at, 1, 10) >= date('now', '-7 days')
-            """
-        ).fetchone()["c"]
-        active_7d = conn.execute(
-            """
-            SELECT COUNT(DISTINCT user_id) AS c
-            FROM login_events
-            WHERE substr(logged_at, 1, 10) >= date('now', '-7 days')
-            """
-        ).fetchone()["c"]
+    daily: dict[str, dict[str, Any]] = {}
+    logins_today = logins_7d = 0
+    active_today: set[str] = set()
+    active_7d: set[str] = set()
+    for row in login_rows:
+        day = (row.get("logged_at") or "")[:10]
+        if not day:
+            continue
+        uid = row["user_id"]
+        if day >= daily_cutoff:
+            bucket = daily.setdefault(day, {"logins": 0, "users": set()})
+            bucket["logins"] += 1
+            bucket["users"].add(uid)
+        if day == today_str:
+            logins_today += 1
+            active_today.add(uid)
+        if day >= week_cutoff:
+            logins_7d += 1
+            active_7d.add(uid)
 
     total_tasks = 0
     total_messages = 0
     by_user: dict[str, dict[str, Any]] = {}
-    for row in task_users:
-        uid = row["user_id"]
-        task_count = int(row["task_count"] or 0)
-        msg_count = int(message_counts.get(uid, 0) or 0)
-        total_tasks += task_count
-        total_messages += msg_count
+    for uid, row in task_users.items():
+        total_tasks += row["task_count"]
+        total_messages += row["message_count"]
         by_user[uid] = {
             "user_id": uid,
-            "task_count": task_count,
-            "message_count": msg_count,
+            "task_count": row["task_count"],
+            "message_count": row["message_count"],
             "login_count": 0,
             "first_seen": row["first_task_at"],
             "last_active": row["last_task_at"],
@@ -1084,13 +977,8 @@ def get_dashboard_stats(*, recent_limit: int = 50, daily_days: int = 14) -> dict
             "auth_methods": [],
             "is_google": "@" in uid,
         }
-    for row in login_users:
-        uid = row["user_id"]
-        methods = [
-            m.strip()
-            for m in (row["methods"] or "").split(",")
-            if m and m.strip()
-        ]
+    for uid, row in login_users.items():
+        methods = sorted(row["methods"])
         entry = by_user.get(uid)
         if not entry:
             entry = {
@@ -1106,7 +994,6 @@ def get_dashboard_stats(*, recent_limit: int = 50, daily_days: int = 14) -> dict
             }
             by_user[uid] = entry
         else:
-            entry["login_count"] = int(row["login_count"] or 0)
             entry["last_login"] = row["last_login_at"]
             entry["auth_methods"] = methods
             entry["is_google"] = entry["is_google"] or ("google" in methods)
@@ -1118,37 +1005,141 @@ def get_dashboard_stats(*, recent_limit: int = 50, daily_days: int = 14) -> dict
                 not entry["last_active"] or row["last_login_at"] > entry["last_active"]
             ):
                 entry["last_active"] = row["last_login_at"]
-        entry["login_count"] = int(row["login_count"] or 0)
+        entry["login_count"] = int(row["login_count"])
 
-    users = sorted(
-        by_user.values(),
-        key=lambda u: u.get("last_active") or "",
-        reverse=True,
-    )
+    users = sorted(by_user.values(), key=lambda u: u.get("last_active") or "", reverse=True)
     google_users = sum(1 for u in users if u.get("is_google"))
-    legacy_users = len(users) - google_users
 
     return {
         "summary": {
             "total_users": len(users),
             "google_users": google_users,
-            "legacy_users": legacy_users,
-            "total_tasks": int(total_tasks or 0),
-            "total_messages": int(total_messages or 0),
-            "total_logins": int(total_logins or 0),
-            "logins_today": int(logins_today or 0),
-            "active_users_today": int(active_today or 0),
-            "logins_7d": int(logins_7d or 0),
-            "active_users_7d": int(active_7d or 0),
+            "legacy_users": len(users) - google_users,
+            "total_tasks": int(total_tasks),
+            "total_messages": int(total_messages),
+            "total_logins": int(total_logins),
+            "logins_today": int(logins_today),
+            "active_users_today": len(active_today),
+            "logins_7d": int(logins_7d),
+            "active_users_7d": len(active_7d),
         },
         "users": users,
         "recent_logins": recent_logins,
         "daily_logins": [
             {
-                "date": row["day"],
-                "logins": int(row["logins"] or 0),
-                "unique_users": int(row["unique_users"] or 0),
+                "date": day,
+                "logins": int(bucket["logins"]),
+                "unique_users": len(bucket["users"]),
             }
-            for row in daily_rows
+            for day, bucket in sorted(daily.items())
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# Graph pipeline support
+# ---------------------------------------------------------------------------
+
+
+def get_message_fingerprint(user_id: str) -> dict[str, Any]:
+    """Return ``{message_count, max_created_at}`` across the user's messages."""
+    tasks = _query_all(
+        _tasks(),
+        KeyConditionExpression=Key("user_id").eq(user_id),
+        ProjectionExpression="task_id, message_count",
+        ConsistentRead=True,
+    )
+    message_count = 0
+    max_created_at: str | None = None
+    for task in tasks:
+        message_count += int(task.get("message_count") or 0)
+        resp = _messages().query(
+            IndexName=_MESSAGES_BY_CREATED_INDEX,
+            KeyConditionExpression=Key("task_id").eq(task["task_id"]),
+            ScanIndexForward=False,
+            Limit=1,
+            ProjectionExpression="created_at",
+            ConsistentRead=True,
+        )
+        for item in resp.get("Items", []):
+            created = item.get("created_at")
+            if created and (max_created_at is None or created > max_created_at):
+                max_created_at = created
+    return {"message_count": message_count, "max_created_at": max_created_at}
+
+
+def export_user_sqlite(user_id: str, path: str) -> str:
+    """Write the user's tasks/messages to a scratch SQLite file for ``graph/`` to read.
+
+    The graph pipeline is a separate process that reads SQLite; this file is a
+    throw-away export, never a source of truth.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    if os.path.exists(path):
+        os.remove(path)
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE tasks (
+              id TEXT PRIMARY KEY, user_id TEXT NOT NULL, title TEXT,
+              runtime_session_id TEXT, model_name TEXT, skills_json TEXT,
+              mcp_servers_json TEXT, guardrail_enabled INTEGER, memory_enabled INTEGER,
+              llm_gateway_enabled INTEGER, pinned INTEGER, created_at TEXT, updated_at TEXT
+            );
+            CREATE TABLE messages (
+              id TEXT PRIMARY KEY, task_id TEXT NOT NULL, role TEXT NOT NULL,
+              content TEXT, images_json TEXT, tool_events_json TEXT,
+              status TEXT, created_at TEXT
+            );
+            """
+        )
+        for task in list_tasks(user_id, limit=10_000):
+            conn.execute(
+                "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    task["id"],
+                    user_id,
+                    task["title"],
+                    task["runtime_session_id"],
+                    task["model_name"],
+                    json.dumps(task["skills"], ensure_ascii=False),
+                    json.dumps(task["mcp_servers"], ensure_ascii=False),
+                    int(task["guardrail_enabled"]),
+                    int(task["memory_enabled"]),
+                    int(task["llm_gateway_enabled"]),
+                    int(task["pinned"]),
+                    task["created_at"],
+                    task["updated_at"],
+                ),
+            )
+            for item in _message_items(task["id"], user_id):
+                conn.execute(
+                    "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        item["message_id"],
+                        item["task_id"],
+                        item["role"],
+                        item.get("content") or "",
+                        item.get("images_json") or "[]",
+                        item.get("tool_events_json") or "[]",
+                        _message_status(item),
+                        item.get("created_at"),
+                    ),
+                )
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+def batch_iter(items: Iterable[Any], size: int) -> Iterable[list[Any]]:
+    batch: list[Any] = []
+    for item in items:
+        batch.append(item)
+        if len(batch) >= size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+

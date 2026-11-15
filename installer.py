@@ -61,7 +61,11 @@ ALB_ORIGIN_HEADER_SECRET_NAME = f"{project_name}/cloudfront-alb-origin-header"
 SESSION_SIGNING_KEY_SECRET_NAME = f"{project_name}/session-signing-key"
 # HMAC for my-schedule skill + Lambda → ECS (AgentCore may read this; not session-signing-key).
 SCHEDULE_AGENT_TOKEN_SECRET_NAME = f"{project_name}/schedule-agent-token"
-SCHEDULE_JOBS_TABLE_NAME = f"dynamodb-{project_name}-schedules"
+SCHEDULE_JOBS_TABLE_NAME = f"{project_name}-schedules"
+TASKS_TABLE_NAME = f"{project_name}-tasks"
+MESSAGES_TABLE_NAME = f"{project_name}-messages"
+LOGIN_EVENTS_TABLE_NAME = f"{project_name}-login-events"
+TASK_STORE_TABLE_NAMES = [TASKS_TABLE_NAME, MESSAGES_TABLE_NAME, LOGIN_EVENTS_TABLE_NAME]
 SCHEDULE_LAMBDA_NAME = f"lambda-schedule-for-{project_name}"
 SCHEDULE_LAMBDA_ROLE_NAME = f"role-lambda-schedule-for-{project_name}-{region}"
 SCHEDULER_INVOKE_ROLE_NAME = f"role-scheduler-invoke-for-{project_name}-{region}"
@@ -1752,6 +1756,120 @@ def create_schedule_jobs_table() -> str:
             raise
         logger.warning(f"  DynamoDB table already exists: {table_name}")
     return table_name
+
+
+def create_task_store_tables() -> dict:
+    """DynamoDB tables for tasks / messages / login events (replaces per-user SQLite)."""
+    specs = [
+        {
+            "TableName": TASKS_TABLE_NAME,
+            "AttributeDefinitions": [
+                {"AttributeName": "user_id", "AttributeType": "S"},
+                {"AttributeName": "task_id", "AttributeType": "S"},
+            ],
+            "KeySchema": [
+                {"AttributeName": "user_id", "KeyType": "HASH"},
+                {"AttributeName": "task_id", "KeyType": "RANGE"},
+            ],
+        },
+        {
+            "TableName": MESSAGES_TABLE_NAME,
+            "AttributeDefinitions": [
+                {"AttributeName": "task_id", "AttributeType": "S"},
+                {"AttributeName": "message_id", "AttributeType": "S"},
+                {"AttributeName": "created_at", "AttributeType": "S"},
+            ],
+            "KeySchema": [
+                {"AttributeName": "task_id", "KeyType": "HASH"},
+                {"AttributeName": "message_id", "KeyType": "RANGE"},
+            ],
+            "LocalSecondaryIndexes": [
+                {
+                    "IndexName": "task_id-created_at-index",
+                    "KeySchema": [
+                        {"AttributeName": "task_id", "KeyType": "HASH"},
+                        {"AttributeName": "created_at", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                }
+            ],
+        },
+        {
+            "TableName": LOGIN_EVENTS_TABLE_NAME,
+            "AttributeDefinitions": [
+                {"AttributeName": "user_id", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"},
+            ],
+            "KeySchema": [
+                {"AttributeName": "user_id", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"},
+            ],
+        },
+    ]
+    for spec in specs:
+        name = spec["TableName"]
+        logger.info(f"[task-store] Creating DynamoDB table: {name}")
+        try:
+            dynamodb_client.create_table(
+                **spec,
+                BillingMode="PAY_PER_REQUEST",
+                Tags=[
+                    {"Key": "Name", "Value": name},
+                    {"Key": "Project", "Value": project_name},
+                ],
+            )
+            dynamodb_client.get_waiter("table_exists").wait(TableName=name)
+            logger.info(f"  ✓ Created DynamoDB table: {name}")
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ResourceInUseException":
+                raise
+            logger.warning(f"  DynamoDB table already exists: {name}")
+    return {
+        "tasks_table": TASKS_TABLE_NAME,
+        "messages_table": MESSAGES_TABLE_NAME,
+        "login_events_table": LOGIN_EVENTS_TABLE_NAME,
+    }
+
+
+def attach_ecs_task_store_policy(task_role_name: str) -> None:
+    """Allow the ECS Web task to read/write the task-store tables."""
+    resources = []
+    for name in TASK_STORE_TABLE_NAMES:
+        resources.append(f"arn:aws:dynamodb:{region}:{account_id}:table/{name}")
+        resources.append(f"arn:aws:dynamodb:{region}:{account_id}:table/{name}/index/*")
+    attach_inline_policy(
+        task_role_name,
+        f"ecs-task-task-store-policy-for-{project_name}",
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "TaskStoreTables",
+                    "Effect": "Allow",
+                    "Action": [
+                        "dynamodb:GetItem",
+                        "dynamodb:PutItem",
+                        "dynamodb:UpdateItem",
+                        "dynamodb:DeleteItem",
+                        "dynamodb:Query",
+                        "dynamodb:Scan",
+                        "dynamodb:BatchWriteItem",
+                        "dynamodb:BatchGetItem",
+                    ],
+                    "Resource": resources,
+                }
+            ],
+        },
+    )
+    logger.info(f"  ✓ Attached task-store policy to {task_role_name}")
+
+
+def deploy_task_store(ecs_task_role_name: str) -> dict:
+    """Provision DynamoDB tables + ECS task role permissions for the task store."""
+    info = create_task_store_tables()
+    if ecs_task_role_name:
+        attach_ecs_task_store_policy(ecs_task_role_name)
+    return info
 
 
 def create_schedule_group() -> str:
@@ -7606,7 +7724,7 @@ def create_alb_target_group_for_ecs(vpc_info: Dict[str, str]) -> str:
     # Duration-based lb_cookie emits AWSALB / AWSALBCORS without configurable
     # Secure/HttpOnly flags (AWS platform limitation). Binding to our HMAC session
     # cookie (agent_user_id: HttpOnly + Secure on HTTPS) keeps same-target routing
-    # for SQLite working-copy consistency without those ALB cookies.
+    # for in-memory run state (streaming runs, cancel flags) kept per ECS task.
     try:
         elbv2_client.modify_target_group_attributes(
             TargetGroupArn=tg_arn,
@@ -9972,6 +10090,11 @@ def main():
         help="Install Agent Runtime. RUNTIME_TYPE can be 'langgraph' (default)."
     )
     parser.add_argument(
+        "--task-store-only",
+        action="store_true",
+        help="Create only the DynamoDB task-store tables + ECS task role policy.",
+    )
+    parser.add_argument(
         "--schedule-only",
         action="store_true",
         help="Deploy only my-schedule infra (DynamoDB, Lambda, Scheduler) and update config.",
@@ -9988,6 +10111,12 @@ def main():
     # If --verify-deployment flag is provided, verify EC2 subnet deployment
     if args.verify_deployment:
         verify_ec2_subnet_deployment()
+        return
+
+    if args.task_store_only:
+        info = deploy_task_store(f"role-ecs-task-for-{project_name}-{region}")
+        for key, value in info.items():
+            logger.info(f"  {key}: {value}")
         return
 
     if args.schedule_only:
@@ -10143,6 +10272,9 @@ def main():
             app_base_url=f"https://{cloudfront_info['domain']}",
             ecs_task_role_name=ecs_task_role_name,
         )
+
+        # 7.6 Task store: DynamoDB tables (tasks / messages / login events)
+        deploy_task_store(ecs_task_role_name)
         
         # 8. Build and push Docker image to ECR, then deploy ECS service
         sync_application_capability_lists()
