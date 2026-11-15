@@ -87,69 +87,293 @@ def setup_logging():
 
 logger = setup_logging()
 
+def _list_project_cloudfront_distributions():
+    """Return CloudFront distribution summaries whose Comment includes project_name."""
+    distributions = []
+    marker = None
+    while True:
+        kwargs = {"MaxItems": "100"}
+        if marker:
+            kwargs["Marker"] = marker
+        response = cloudfront_client.list_distributions(**kwargs)
+        dist_list = response.get("DistributionList") or {}
+        for dist in dist_list.get("Items") or []:
+            if project_name in (dist.get("Comment") or ""):
+                distributions.append(dist)
+        if not dist_list.get("IsTruncated"):
+            break
+        marker = dist_list.get("NextMarker")
+        if not marker:
+            break
+    return distributions
+
+
+def _wait_for_cloudfront_distribution_disabled(
+    dist_id: str,
+    max_wait_seconds: int = 1800,
+    poll_seconds: int = 30,
+) -> bool:
+    """Wait until a distribution is Enabled=False and Status=Deployed (or gone)."""
+    deadline = time.time() + max_wait_seconds
+    while time.time() < deadline:
+        try:
+            response = cloudfront_client.get_distribution(Id=dist_id)
+            dist = response.get("Distribution") or {}
+            config = dist.get("DistributionConfig") or {}
+            enabled = bool(config.get("Enabled"))
+            status = dist.get("Status") or ""
+            if not enabled and status == "Deployed":
+                logger.info(f"  ✓ Distribution {dist_id} is disabled and Deployed")
+                return True
+            logger.info(
+                f"  Waiting for distribution {dist_id} "
+                f"(Enabled={enabled}, Status={status})..."
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "NoSuchDistribution":
+                logger.info(f"  Distribution {dist_id} already deleted")
+                return True
+            raise
+        time.sleep(poll_seconds)
+    logger.warning(
+        f"  Timed out waiting for distribution {dist_id} to become disabled/Deployed"
+    )
+    return False
+
+
 def delete_cloudfront_distributions():
-    """Delete CloudFront distributions."""
-    logger.info("[1/9] Deleting CloudFront distributions")
-    
+    """Disable CloudFront distributions for this project."""
+    logger.info("[1/9] Disabling CloudFront distributions")
+
     try:
-        distributions = cloudfront_client.list_distributions()
-        for dist in distributions.get("DistributionList", {}).get("Items", []):
-            if project_name in dist.get("Comment", ""):
-                dist_id = dist["Id"]
-                logger.info(f"  Disabling distribution: {dist_id}")
-                
-                # Get current config
-                config_response = cloudfront_client.get_distribution_config(Id=dist_id)
-                config = config_response["DistributionConfig"]
-                etag = config_response["ETag"]
-                
-                # Disable distribution
-                config["Enabled"] = False
-                cloudfront_client.update_distribution(
-                    Id=dist_id,
-                    DistributionConfig=config,
-                    IfMatch=etag
-                )
-                
-                logger.info(f"  Distribution {dist_id} disabled, will be deleted after deployment")
-        
+        for dist in _list_project_cloudfront_distributions():
+            dist_id = dist["Id"]
+            if not dist.get("Enabled", True):
+                logger.info(f"  Distribution already disabled: {dist_id}")
+                continue
+
+            logger.info(f"  Disabling distribution: {dist_id}")
+            config_response = cloudfront_client.get_distribution_config(Id=dist_id)
+            config = config_response["DistributionConfig"]
+            etag = config_response["ETag"]
+            config["Enabled"] = False
+            cloudfront_client.update_distribution(
+                Id=dist_id,
+                DistributionConfig=config,
+                IfMatch=etag,
+            )
+            logger.info(
+                f"  Distribution {dist_id} disable requested; "
+                "will wait before delete"
+            )
+
         logger.info("✓ CloudFront distributions processed")
     except Exception as e:
         logger.error(f"Error processing CloudFront distributions: {e}")
 
+
 def delete_disabled_cloudfront_distributions():
-    """Delete disabled CloudFront distributions."""
+    """Wait for disabled CloudFront distributions, then delete them."""
     logger.info("Deleting disabled CloudFront distributions")
-    
+
     try:
-        distributions = cloudfront_client.list_distributions()
-        for dist in distributions.get("DistributionList", {}).get("Items", []):
-            if project_name in dist.get("Comment", "") and not dist.get("Enabled", True):
-                dist_id = dist["Id"]
-                logger.info(f"  Deleting disabled distribution: {dist_id}")
-                
-                try:
-                    # Get current config and ETag
-                    config_response = cloudfront_client.get_distribution_config(Id=dist_id)
-                    etag = config_response["ETag"]
-                    
-                    # Delete distribution
-                    cloudfront_client.delete_distribution(
-                        Id=dist_id,
-                        IfMatch=etag
+        for dist in _list_project_cloudfront_distributions():
+            dist_id = dist["Id"]
+            logger.info(f"  Preparing to delete distribution: {dist_id}")
+            if not _wait_for_cloudfront_distribution_disabled(dist_id):
+                logger.warning(f"  Skipping delete for distribution {dist_id} (not ready)")
+                continue
+
+            try:
+                config_response = cloudfront_client.get_distribution_config(Id=dist_id)
+                etag = config_response["ETag"]
+                cloudfront_client.delete_distribution(Id=dist_id, IfMatch=etag)
+                logger.info(f"  ✓ Deleted distribution: {dist_id}")
+            except ClientError as e:
+                code = e.response["Error"]["Code"]
+                if code == "DistributionNotDisabled":
+                    logger.warning(
+                        f"  Distribution {dist_id} is not fully disabled yet, skipping"
                     )
-                    logger.info(f"  ✓ Deleted distribution: {dist_id}")
-                except ClientError as e:
-                    if e.response["Error"]["Code"] == "DistributionNotDisabled":
-                        logger.info(f"  Distribution {dist_id} is not fully disabled yet, skipping")
-                    elif e.response["Error"]["Code"] == "NoSuchDistribution":
-                        logger.debug(f"  Distribution {dist_id} already deleted")
-                    else:
-                        logger.warning(f"  Could not delete distribution {dist_id}: {e}")
-        
+                elif code == "NoSuchDistribution":
+                    logger.debug(f"  Distribution {dist_id} already deleted")
+                else:
+                    logger.warning(f"  Could not delete distribution {dist_id}: {e}")
+
         logger.info("✓ Disabled CloudFront distributions processed")
     except Exception as e:
         logger.error(f"Error deleting disabled CloudFront distributions: {e}")
+
+
+def delete_cloudfront_oai():
+    """Delete project CloudFront Origin Access Identities created by installer."""
+    logger.info("Deleting CloudFront Origin Access Identities")
+    comment_marker = f"OAI for {project_name} S3 bucket"
+
+    try:
+        marker = None
+        deleted = 0
+        while True:
+            kwargs = {"MaxItems": "100"}
+            if marker:
+                kwargs["Marker"] = marker
+            response = cloudfront_client.list_cloud_front_origin_access_identities(
+                **kwargs
+            )
+            oai_list = response.get("CloudFrontOriginAccessIdentityList") or {}
+            for oai in oai_list.get("Items") or []:
+                comment = oai.get("Comment") or ""
+                if comment_marker not in comment:
+                    continue
+                oai_id = oai["Id"]
+                try:
+                    detail = cloudfront_client.get_cloud_front_origin_access_identity(
+                        Id=oai_id
+                    )
+                    cloudfront_client.delete_cloud_front_origin_access_identity(
+                        Id=oai_id,
+                        IfMatch=detail["ETag"],
+                    )
+                    deleted += 1
+                    logger.info(f"  ✓ Deleted CloudFront OAI: {oai_id}")
+                except ClientError as e:
+                    code = e.response["Error"]["Code"]
+                    if code in (
+                        "NoSuchCloudFrontOriginAccessIdentity",
+                        "CloudFrontOriginAccessIdentityInUse",
+                    ):
+                        logger.warning(f"  Could not delete OAI {oai_id}: {e}")
+                    else:
+                        logger.warning(f"  Could not delete OAI {oai_id}: {e}")
+
+            if not oai_list.get("IsTruncated"):
+                break
+            marker = oai_list.get("NextMarker")
+            if not marker:
+                break
+
+        if deleted == 0:
+            logger.info(f"  No CloudFront OAI found for comment: {comment_marker}")
+        logger.info("✓ CloudFront OAI processed")
+    except Exception as e:
+        logger.error(f"Error deleting CloudFront OAI: {e}")
+
+
+def delete_cloudfront_response_headers_policy():
+    """Delete project CloudFront response headers policy ({project}-security-headers)."""
+    logger.info("Deleting CloudFront response headers policy")
+    policy_name = f"{project_name}-security-headers"
+
+    try:
+        marker = None
+        policy_id = None
+        while True:
+            kwargs = {"Type": "custom", "MaxItems": "100"}
+            if marker:
+                kwargs["Marker"] = marker
+            response = cloudfront_client.list_response_headers_policies(**kwargs)
+            policy_list = response.get("ResponseHeadersPolicyList") or {}
+            for item in policy_list.get("Items") or []:
+                policy = item.get("ResponseHeadersPolicy") or {}
+                cfg = policy.get("ResponseHeadersPolicyConfig") or {}
+                if cfg.get("Name") == policy_name and policy.get("Id"):
+                    policy_id = policy["Id"]
+                    break
+            if policy_id or not policy_list.get("IsTruncated"):
+                break
+            marker = policy_list.get("NextMarker")
+            if not marker:
+                break
+
+        if not policy_id:
+            logger.info(f"  Response headers policy not found: {policy_name}")
+            logger.info("✓ CloudFront response headers policy processed")
+            return
+
+        try:
+            detail = cloudfront_client.get_response_headers_policy(Id=policy_id)
+            cloudfront_client.delete_response_headers_policy(
+                Id=policy_id,
+                IfMatch=detail["ETag"],
+            )
+            logger.info(
+                f"  ✓ Deleted CloudFront response headers policy: "
+                f"{policy_name} ({policy_id})"
+            )
+        except ClientError as e:
+            code = e.response["Error"]["Code"]
+            if code in (
+                "NoSuchResponseHeadersPolicy",
+                "ResponseHeadersPolicyInUse",
+            ):
+                logger.warning(
+                    f"  Could not delete response headers policy {policy_name}: {e}"
+                )
+            else:
+                logger.warning(
+                    f"  Could not delete response headers policy {policy_name}: {e}"
+                )
+
+        logger.info("✓ CloudFront response headers policy processed")
+    except Exception as e:
+        logger.error(f"Error deleting CloudFront response headers policy: {e}")
+
+
+def delete_dhcp_options():
+    """Delete project-tagged DHCP options sets created by installer."""
+    logger.info("Deleting DHCP options sets")
+    dhcp_name = f"dhcp-options-for-{project_name}"
+
+    try:
+        response = ec2_client.describe_dhcp_options(
+            Filters=[{"Name": "tag:Name", "Values": [dhcp_name]}]
+        )
+        dhcp_options = response.get("DhcpOptions") or []
+        if not dhcp_options:
+            logger.info(f"  No DHCP options found with Name={dhcp_name}")
+            logger.info("✓ DHCP options processed")
+            return
+
+        # Map DHCP options still attached to any VPC
+        associated = set()
+        for vpc in ec2_client.describe_vpcs().get("Vpcs") or []:
+            dhcp_id = vpc.get("DhcpOptionsId")
+            if dhcp_id:
+                associated.add(dhcp_id)
+
+        for dhcp in dhcp_options:
+            dhcp_id = dhcp["DhcpOptionsId"]
+            if dhcp_id in associated:
+                # Detach from any remaining project VPCs first
+                for vpc in ec2_client.describe_vpcs().get("Vpcs") or []:
+                    if vpc.get("DhcpOptionsId") != dhcp_id:
+                        continue
+                    try:
+                        ec2_client.associate_dhcp_options(
+                            DhcpOptionsId="default",
+                            VpcId=vpc["VpcId"],
+                        )
+                        logger.info(
+                            f"  ✓ Reset DHCP options to default for VPC {vpc['VpcId']}"
+                        )
+                    except ClientError as e:
+                        logger.warning(
+                            f"  Could not reset DHCP options on VPC {vpc['VpcId']}: {e}"
+                        )
+
+            try:
+                ec2_client.delete_dhcp_options(DhcpOptionsId=dhcp_id)
+                logger.info(f"  ✓ Deleted DHCP options: {dhcp_id} ({dhcp_name})")
+            except ClientError as e:
+                code = e.response["Error"]["Code"]
+                if code in ("InvalidDhcpOptionID.NotFound", "DependencyViolation"):
+                    logger.warning(f"  Could not delete DHCP options {dhcp_id}: {e}")
+                else:
+                    logger.warning(f"  Could not delete DHCP options {dhcp_id}: {e}")
+
+        logger.info("✓ DHCP options processed")
+    except Exception as e:
+        logger.error(f"Error deleting DHCP options: {e}")
 
 def delete_alb_resources():
     """Delete ALB, target groups, and listeners."""
@@ -226,12 +450,17 @@ def delete_nat_gateways():
             logger.info("  No NAT gateways found to delete")
             return
         
-        # Delete each NAT gateway
+        # Delete each NAT gateway (capture EIPs first so we can release them)
         deleted_nat_gw_ids = []
+        eip_allocation_ids = []
         for nat_gw in project_nat_gws:
             nat_gw_id = nat_gw["NatGatewayId"]
             vpc_id = nat_gw["VpcId"]
-            
+            for addr in nat_gw.get("NatGatewayAddresses") or []:
+                allocation_id = addr.get("AllocationId")
+                if allocation_id and allocation_id not in eip_allocation_ids:
+                    eip_allocation_ids.append(allocation_id)
+
             logger.info(f"  Deleting NAT gateway: {nat_gw_id}")
             
             # First, remove all routes that reference this NAT gateway
@@ -270,26 +499,43 @@ def delete_nat_gateways():
             except ClientError as nat_error:
                 logger.warning(f"    Could not delete NAT gateway {nat_gw_id}: {nat_error}")
         
-        # Wait for NAT gateways to be deleted only if there are any being deleted
+        # Wait for NAT gateways to reach deleted before releasing EIPs
         if deleted_nat_gw_ids:
-            # Check if any NAT gateways are still in deleting state
-            try:
-                nat_gws_status = ec2_client.describe_nat_gateways(NatGatewayIds=deleted_nat_gw_ids)
-                deleting_nat_gws = [
-                    ngw for ngw in nat_gws_status.get("NatGateways", [])
-                    if ngw["State"] == "deleting"
-                ]
-                
-                if deleting_nat_gws:
-                    logger.info(f"  Waiting for {len(deleting_nat_gws)} NAT gateway(s) to be deleted...")
-                    time.sleep(60)
-            except ClientError as e:
-                # If NAT gateways are already deleted, describe_nat_gateways will fail
-                if e.response["Error"]["Code"] == "InvalidNatGatewayID.NotFound":
-                    logger.debug("  NAT gateways already deleted")
-                else:
+            deadline = time.time() + 600
+            while time.time() < deadline:
+                try:
+                    nat_gws_status = ec2_client.describe_nat_gateways(
+                        NatGatewayIds=deleted_nat_gw_ids
+                    )
+                    remaining = [
+                        ngw
+                        for ngw in nat_gws_status.get("NatGateways", [])
+                        if ngw.get("State") not in ("deleted",)
+                    ]
+                    if not remaining:
+                        break
+                    logger.info(
+                        f"  Waiting for {len(remaining)} NAT gateway(s) to finish deleting..."
+                    )
+                except ClientError as e:
+                    if e.response["Error"]["Code"] == "InvalidNatGatewayID.NotFound":
+                        break
                     logger.debug(f"  Could not check NAT gateway status: {e}")
-        
+                    break
+                time.sleep(20)
+
+        for allocation_id in eip_allocation_ids:
+            try:
+                ec2_client.release_address(AllocationId=allocation_id)
+                logger.info(f"  ✓ Released NAT EIP: {allocation_id}")
+            except ClientError as e:
+                code = e.response["Error"]["Code"]
+                if code not in (
+                    "InvalidAllocationID.NotFound",
+                    "InvalidAddress.NotFound",
+                ):
+                    logger.warning(f"  Could not release EIP {allocation_id}: {e}")
+
         logger.info("✓ NAT gateways deleted")
     except Exception as e:
         logger.error(f"Error deleting NAT gateways: {e}")
@@ -2508,6 +2754,7 @@ def main():
         delete_route_tables()
 
         failed_vpcs = delete_vpc_resources()
+        delete_dhcp_options()
 
         delete_knowledge_bases()
         delete_opensearch_collection()
@@ -2529,6 +2776,9 @@ def main():
         )
         delete_s3_buckets()
         delete_disabled_cloudfront_distributions()
+        # OAI / response headers policy can only be removed after distributions are gone
+        delete_cloudfront_oai()
+        delete_cloudfront_response_headers_policy()
         delete_local_config_files()
         
         # Retry VPC deletion only if there were failures
@@ -2536,6 +2786,7 @@ def main():
             logger.info(f"  VPC deletion failed for {len(failed_vpcs)} VPC(s): {failed_vpcs}")
             logger.info("  Retrying VPC deletion after CloudFront cleanup...")
             retry_vpc_deletion()
+            delete_dhcp_options()
         
         elapsed_time = time.time() - start_time
         logger.info("")
