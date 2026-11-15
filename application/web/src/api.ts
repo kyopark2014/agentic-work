@@ -370,17 +370,17 @@ export const api = {
   disconnectGoogleDrive: () =>
     request<void>("/api/session/google-drive", { method: "DELETE" }),
   getNotionStatus: () => request<NotionStatus>("/api/session/notion"),
-  getOAuthMcpAuthorizeUrl: (provider: "notion" | "canva", write = false) =>
+  getOAuthMcpAuthorizeUrl: (provider: "notion", write = false) =>
     request<{ url: string; manual?: boolean }>(
       `/api/session/${provider}/authorize${write ? "?write=true" : ""}`,
     ),
   /** Finish a manual flow with the address-bar URL the user pasted after approving. */
-  exchangeOAuthMcp: (provider: "notion" | "canva", url: string) =>
+  exchangeOAuthMcp: (provider: "notion", url: string) =>
     request<NotionStatus>(`/api/session/${provider}/exchange`, {
       method: "POST",
       body: JSON.stringify({ url }),
     }),
-  disconnectOAuthMcp: (provider: "notion" | "canva") =>
+  disconnectOAuthMcp: (provider: "notion") =>
     request<void>(`/api/session/${provider}`, { method: "DELETE" }),
   getGraphStatus: () => request<GraphStatus>("/api/graph/status"),
   rebuildGraph: (force = false) =>

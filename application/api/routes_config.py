@@ -205,9 +205,14 @@ def get_config(request: Request):
 
     # Sync skills.list from builtins + S3 {user}/skills/ on the bucket root.
     skills_path = utils.ensure_user_skills_list(session_user)
-    skill_options = load_capability_list_from_path(skills_path)
+    skill_options = [
+        s
+        for s in load_capability_list_from_path(skills_path)
+        if not str(s).strip().lower().startswith("canva-")
+    ]
     logger.info("Loaded skills from %s (%d)", skills_path, len(skill_options))
-    mcp_options = load_capability_list("mcp.list")
+    # Canva MCP is disabled (see canva_auth.DISABLED / canva-mcp.md).
+    mcp_options = [m for m in load_capability_list("mcp.list") if str(m).strip().lower() != "canva"]
     # Prefer per-user settings.json; fall back to favorite_tools.json.
     default_skills, default_mcp = utils.get_user_tool_defaults(session_user)
     default_skills = [s for s in default_skills if s in skill_options]
@@ -230,23 +235,17 @@ def get_config(request: Request):
     default_model = preferred_model or DEFAULT_MODEL
     if default_model not in MODELS and default_model not in gateway_models:
         default_model = DEFAULT_MODEL
-    oauth_status = {
-        name: {"connected": False, "fresh": False, "write": False}
-        for name in ("notion", "canva")
-    }
+    oauth_status = {"notion": {"connected": False, "fresh": False, "write": False}}
     try:
         if session_user:
             try:
-                from application import canva_auth, notion_auth
+                from application import notion_auth
             except ImportError:
-                import canva_auth
                 import notion_auth
             oauth_status["notion"] = notion_auth.status_for_user(session_user)
-            oauth_status["canva"] = canva_auth.status_for_user(session_user)
     except Exception:
         logger.exception("Failed to load MCP OAuth status for config")
     notion_status = oauth_status["notion"]
-    canva_status = oauth_status["canva"]
     drive_status = {"connected": False, "fresh": False, "scopes": []}
     try:
         try:
@@ -279,9 +278,6 @@ def get_config(request: Request):
         "llm_gateway_configured": gateway_configured,
         "notion_connected": bool(notion_status.get("connected")),
         "notion_fresh": bool(notion_status.get("fresh")),
-        "canva_connected": bool(canva_status.get("connected")),
-        "canva_fresh": bool(canva_status.get("fresh")),
-        "canva_write": bool(canva_status.get("write")),
         "google_drive_connected": bool(drive_status.get("connected")),
         "google_drive_fresh": bool(drive_status.get("fresh")),
         "google_drive_scopes": list(drive_status.get("scopes") or []),

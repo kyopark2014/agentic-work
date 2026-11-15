@@ -105,9 +105,6 @@ export function Sidebar({
   const [driveError, setDriveError] = useState<string | null>(null);
   const [notionBusy, setNotionBusy] = useState(false);
   const [notionError, setNotionError] = useState<string | null>(null);
-  const [canvaBusy, setCanvaBusy] = useState(false);
-  const [canvaError, setCanvaError] = useState<string | null>(null);
-  const [canvaManual, setCanvaManual] = useState(false);
   const modelBtnRef = useRef<HTMLButtonElement>(null);
   const appearanceBtnRef = useRef<HTMLButtonElement>(null);
   const wikiBtnRef = useRef<HTMLButtonElement>(null);
@@ -867,8 +864,6 @@ export function Sidebar({
             const enablingNotion =
               next.includes("notion-remote") &&
               !mcpServers.includes("notion-remote");
-            const enablingCanva =
-              next.includes("canva") && !mcpServers.includes("canva");
             await onPatchTask(activeTask.id, { mcp_servers: next });
             if (
               enablingNotion &&
@@ -883,22 +878,6 @@ export function Sidebar({
                 setNotionError(err instanceof Error ? err.message : String(err));
               } finally {
                 setNotionBusy(false);
-              }
-            }
-            if (
-              enablingCanva &&
-              !(config.canva_connected && config.canva_fresh)
-            ) {
-              setCanvaError(null);
-              setCanvaBusy(true);
-              try {
-                const result = await connectMcpOAuth("canva");
-                if (result === "manual") setCanvaManual(true);
-                if (onRefreshConfig) await onRefreshConfig();
-              } catch (err) {
-                setCanvaError(err instanceof Error ? err.message : String(err));
-              } finally {
-                setCanvaBusy(false);
               }
             }
             if (
@@ -962,124 +941,50 @@ export function Sidebar({
                 }}
               />
             ) : null}
-            {mcpServers.includes("canva") ? (
+            {mcpServers.includes("drive") ? (
               <OAuthMcpFooter
-                label="Canva"
-                mcpName="canva"
-                connected={Boolean(config.canva_connected)}
-                fresh={Boolean(config.canva_fresh)}
-                write={Boolean(config.canva_write)}
-                supportsWrite
-                busy={canvaBusy}
-                error={canvaError}
-                onConnect={async (write) => {
-                  setCanvaError(null);
-                  setCanvaBusy(true);
+                label="Google Drive"
+                mcpName="drive"
+                connectLabel="Drive"
+                connected={Boolean(config.google_drive_connected)}
+                fresh={Boolean(config.google_drive_fresh)}
+                busy={driveBusy}
+                error={
+                  driveError ||
+                  (!config.google_client_id ? "Google client id가 설정되지 않았습니다." : null)
+                }
+                onConnect={async () => {
+                  if (!config.google_client_id) {
+                    setDriveError("Google client id가 설정되지 않았습니다.");
+                    return;
+                  }
+                  setDriveError(null);
+                  setDriveBusy(true);
                   try {
-                    const result = await connectMcpOAuth("canva", { write });
-                    setCanvaManual(result === "manual");
+                    await connectGoogleDrive(
+                      config.google_client_id,
+                      config.google_drive_scopes,
+                    );
                     if (onRefreshConfig) await onRefreshConfig();
                   } catch (err) {
-                    setCanvaError(err instanceof Error ? err.message : String(err));
+                    setDriveError(err instanceof Error ? err.message : String(err));
                   } finally {
-                    setCanvaBusy(false);
+                    setDriveBusy(false);
                   }
                 }}
                 onDisconnect={async () => {
-                  setCanvaError(null);
-                  setCanvaBusy(true);
+                  setDriveError(null);
+                  setDriveBusy(true);
                   try {
-                    await api.disconnectOAuthMcp("canva");
-                    setCanvaManual(false);
+                    await api.disconnectGoogleDrive();
                     if (onRefreshConfig) await onRefreshConfig();
                   } catch (err) {
-                    setCanvaError(err instanceof Error ? err.message : String(err));
+                    setDriveError(err instanceof Error ? err.message : String(err));
                   } finally {
-                    setCanvaBusy(false);
-                  }
-                }}
-                manualPending={canvaManual}
-                onCancelManual={() => setCanvaManual(false)}
-                onSubmitManual={async (url) => {
-                  setCanvaError(null);
-                  setCanvaBusy(true);
-                  try {
-                    await api.exchangeOAuthMcp("canva", url);
-                    setCanvaManual(false);
-                    if (onRefreshConfig) await onRefreshConfig();
-                  } catch (err) {
-                    setCanvaError(err instanceof Error ? err.message : String(err));
-                  } finally {
-                    setCanvaBusy(false);
+                    setDriveBusy(false);
                   }
                 }}
               />
-            ) : null}
-            {config.mcp_servers.includes("drive") ? (
-              <div>
-                <div className="config-popover-footer-status">
-                  {config.google_drive_connected && config.google_drive_fresh
-                    ? "Google Drive 연결됨"
-                    : config.google_drive_connected
-                      ? "Google Drive 토큰 만료 — 다시 연결하세요"
-                      : "drive MCP 사용 전 Google Drive 연결 필요"}
-                </div>
-                <div className="config-popover-footer-actions">
-                  <button
-                    type="button"
-                    disabled={driveBusy || !config.google_client_id}
-                    onClick={async () => {
-                      if (!config.google_client_id) return;
-                      setDriveError(null);
-                      setDriveBusy(true);
-                      try {
-                        await connectGoogleDrive(
-                          config.google_client_id,
-                          config.google_drive_scopes,
-                        );
-                        if (onRefreshConfig) await onRefreshConfig();
-                      } catch (err) {
-                        setDriveError(
-                          err instanceof Error ? err.message : String(err),
-                        );
-                      } finally {
-                        setDriveBusy(false);
-                      }
-                    }}
-                  >
-                    {driveBusy
-                      ? "연결 중…"
-                      : config.google_drive_connected
-                        ? "다시 연결"
-                        : "Drive 연결"}
-                  </button>
-                  {config.google_drive_connected ? (
-                    <button
-                      type="button"
-                      disabled={driveBusy}
-                      onClick={async () => {
-                        setDriveError(null);
-                        setDriveBusy(true);
-                        try {
-                          await api.disconnectGoogleDrive();
-                          if (onRefreshConfig) await onRefreshConfig();
-                        } catch (err) {
-                          setDriveError(
-                            err instanceof Error ? err.message : String(err),
-                          );
-                        } finally {
-                          setDriveBusy(false);
-                        }
-                      }}
-                    >
-                      연결 해제
-                    </button>
-                  ) : null}
-                </div>
-                {driveError ? (
-                  <div className="config-popover-footer-error">{driveError}</div>
-                ) : null}
-              </div>
             ) : null}
             </>
           }

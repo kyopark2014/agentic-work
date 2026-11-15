@@ -1,5 +1,14 @@
 """Per-user Canva (remote MCP) OAuth tokens.
 
+**DISABLED** in production UI/config. Kept for a possible future re-enable after
+Canva allows non-loopback redirect URIs (partner allowlist). See canva-mcp.md.
+
+Constraints that forced disable:
+* Canva DCR clients accept only loopback (``localhost`` / ``127.0.0.1``) redirect URIs.
+* Hosted deployments therefore cannot complete OAuth automatically; users must paste
+  the failed ``http://localhost:53682/canva/callback?...`` URL back into the app.
+* That paste-back UX is unsuitable for a deployed product, so Canva MCP is off.
+
 Canva's hosted MCP (``https://mcp.canva.com/mcp``) uses OAuth 2.0 authorization code
 + PKCE with dynamic client registration (public client). Scopes are tiered:
 
@@ -16,6 +25,13 @@ try:
     from application.mcp_oauth import McpOAuth, OAuthProvider
 except ImportError:  # flat layout
     from mcp_oauth import McpOAuth, OAuthProvider  # type: ignore
+
+# Off until Canva allows https redirect URIs for our domain (no localhost paste-back).
+DISABLED = True
+DISABLED_REASON = (
+    "Canva OAuth only allows localhost redirect URIs for DCR clients; "
+    "deployed UX requires paste-back and is disabled."
+)
 
 CANVA_MCP_URL = "https://mcp.canva.com/mcp"
 CANVA_ISSUER = "https://mcp.canva.com"
@@ -62,10 +78,25 @@ PROVIDER = OAuthProvider(
 oauth = McpOAuth(PROVIDER)
 
 token_path = oauth.token_path
-start = oauth.start
 finish = oauth.finish
 get_access_token = oauth.get_access_token
-status_for_user = oauth.status_for_user
 clear_token = oauth.clear_token
-mcp_selected = oauth.mcp_selected
 is_token_fresh = oauth.is_token_fresh
+
+
+def start(user_id: str, redirect_uri: str, *, write: bool = False) -> str:
+    if DISABLED:
+        raise ValueError(f"Canva MCP is disabled: {DISABLED_REASON}")
+    return oauth.start(user_id, redirect_uri, write=write)
+
+
+def status_for_user(user_id: str | None) -> dict:
+    if DISABLED:
+        return {"connected": False, "fresh": False, "expires_at": None, "write": False}
+    return oauth.status_for_user(user_id)
+
+
+def mcp_selected(mcp_servers: list | None) -> bool:
+    if DISABLED:
+        return False
+    return oauth.mcp_selected(mcp_servers)

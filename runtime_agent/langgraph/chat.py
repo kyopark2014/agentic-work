@@ -2430,19 +2430,6 @@ def append_tool_guidance_to_prompt(system_prompt: str, mcp_servers: list) -> str
             "검색어 입력이나 수정 요청은 사용자의 채팅 메시지로 받습니다."
         )
 
-    if "canva" in selected:
-        extras.append(
-            "Canva 작업은 canva MCP 도구를 사용하세요. "
-            "create-design, generate-image, remove-background, separate-image-layers는 "
-            "채팅에 인터랙티브 UI(MCP Apps)를 렌더하므로, 결과 UI가 보이면 같은 내용을 "
-            "텍스트로 길게 반복하지 마세요. 디자인 편집은 start-editing-transaction → "
-            "perform-editing-operations → commit-editing-transaction 순서로 하고, "
-            "commit 전에는 반드시 사용자 승인을 받으세요. "
-            "Canva 스킬(canva-edit-design 등)이 있으면 get_skill_instructions로 먼저 읽으세요. "
-            "생성·편집 도구가 권한 오류(403/insufficient scope)를 내면, 사용자에게 "
-            "MCP 메뉴에서 'Canva 쓰기 권한 추가'를 눌러 다시 승인하도록 안내하세요."
-        )
-
     if not extras:
         return system_prompt
 
@@ -2514,18 +2501,10 @@ async def create_agent(
         )
         server_params.pop("notion-remote", None)
 
-    for oauth_name in ("canva",):
-        oauth_token = (
-            (mcp_oauth_tokens or {}).get(oauth_name)
-            or os.environ.get(mcp_bearer_auth.env_name(oauth_name))
-            or ""
-        ).strip()
-        if oauth_name in server_params and not oauth_token:
-            logger.warning(
-                f"{oauth_name} MCP skipped: OAuth token missing "
-                "(connect it in the web UI MCP menu)"
-            )
-            server_params.pop(oauth_name, None)
+    # Drop disabled Canva MCP if an old task still lists it.
+    if "canva" in server_params:
+        logger.warning("canva MCP skipped: disabled (localhost OAuth redirect constraint)")
+        server_params.pop("canva", None)
 
     import mcp_apps_host
 
@@ -2619,7 +2598,6 @@ current_id = None
 _active_agent_session = None
 _active_drive_authed = False
 _active_notion_authed = False
-_active_oauth_authed: frozenset[str] = frozenset()
 # tool_name -> MCP server name (populated in create_agent)
 mcp_tool_servers: dict[str, str] = {}
 
@@ -2654,7 +2632,6 @@ async def get_or_create_agent(
     """
     global app, agent_config, active_mcp_servers, active_skills, current_id
     global _active_agent_session, _active_drive_authed, _active_notion_authed
-    global _active_oauth_authed
 
     session_id = runtime_session_id or _checkpoint_session_id()
     drive_authed = bool(
@@ -2665,13 +2642,6 @@ async def get_or_create_agent(
         (notion_access_token or os.environ.get("NOTION_REMOTE_ACCESS_TOKEN") or "").strip()
     )
     notion_needed = _notion_mcp_requested(mcp_servers)
-    oauth_authed = frozenset(
-        n for n, t in (mcp_oauth_tokens or {}).items() if (t or "").strip()
-    )
-    oauth_needed = "canva" in {
-        str(s).strip().lower() for s in (mcp_servers or []) if str(s).strip()
-    }
-
     if (
         app is not None
         and active_mcp_servers == mcp_servers
@@ -2680,7 +2650,6 @@ async def get_or_create_agent(
         and _active_agent_session == session_id
         and (not drive_needed or _active_drive_authed == drive_authed)
         and (not notion_needed or _active_notion_authed == notion_authed)
-        and (not oauth_needed or _active_oauth_authed == oauth_authed)
     ):
         logger.info(
             f"Reusing cached agent/MCP tools (session={session_id}, "
@@ -2698,7 +2667,6 @@ async def get_or_create_agent(
     _active_agent_session = session_id
     _active_drive_authed = drive_authed if drive_needed else False
     _active_notion_authed = notion_authed if notion_needed else False
-    _active_oauth_authed = oauth_authed if oauth_needed else frozenset()
 
     app, agent_config = await create_agent(mcp_servers, skill_list, runtime_session_id)
     return app, agent_config

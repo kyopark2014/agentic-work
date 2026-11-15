@@ -34,6 +34,10 @@ RUN pip install --upgrade "setuptools>=83.0.0" \
 COPY . .
 COPY --from=frontend /web/dist /app/application/web/dist
 
+# Notion MCP App viewer (self-contained HTML). Rebuild so the image works even
+# if dist/ was missing from the build context (.dockerignore used to drop **/dist).
+RUN python3 /app/application/mcp_app_views/build.py
+
 # Knowledge-graph + Wiki sync deps (import name: graphify ← PyPI graphifyy)
 # Includes pypdf/pdfplumber for PDF corpus extraction in sync_wiki.py.
 RUN pip install --no-cache-dir -r /app/graph/requirements.txt

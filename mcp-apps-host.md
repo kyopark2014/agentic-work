@@ -19,7 +19,7 @@ Web(McpAppFrame) ── GET /api/mcp-apps/resource ──▶ ECS가 ui:// 리소
 |---|---|---|---|
 | `weather` | 내장 (`application/mcp_server_weather.py`) | 없음 | 날씨 조회 |
 | `notion-remote` | `application/mcp_app_views/` (자체 뷰어) | 사용자 OAuth | 읽기 6개 |
-| `canva` | mcp.canva.com의 `ui://canva/*` | 사용자 OAuth | UI 헬퍼 9개 |
+| `canva` | **DISABLED** (localhost OAuth 제약 — [canva-mcp.md](canva-mcp.md)) | — | — |
 | `use-vault` | use-vault MCP의 `ui://vault/viewer.html` | ECS 태스크 역할(SigV4) | 읽기 6개, `actor_id`는 세션 사용자로 **강제** |
 
 `runtime_agent/langgraph/mcp_apps_host.py`의 `HOST_FETCHED_SERVERS`에 있는 서버는 페이로드에 HTML을 싣지 않습니다. 예전 메시지에 HTML이 들어 있으면(legacy) 그대로 렌더합니다.

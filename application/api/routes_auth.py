@@ -53,10 +53,6 @@ class SessionResponse(BaseModel):
     google_drive_fresh: bool = False
     notion_connected: bool = False
     notion_fresh: bool = False
-    canva_connected: bool = False
-    canva_fresh: bool = False
-    canva_write: bool = False
-
 
 class SessionSettingsPatch(BaseModel):
     knowledge_graph_enabled: bool | None = None
@@ -328,7 +324,6 @@ def _session_response(
     settings = utils.load_user_settings(user_id)
     drive = _google_drive_status(user_id)
     notion = _oauth_status(user_id, "notion")
-    canva = _oauth_status(user_id, "canva")
     return SessionResponse(
         user_id=user_id,
         name=name,
@@ -348,9 +343,6 @@ def _session_response(
         google_drive_fresh=bool(drive.get("fresh")),
         notion_connected=bool(notion.get("connected")),
         notion_fresh=bool(notion.get("fresh")),
-        canva_connected=bool(canva.get("connected")),
-        canva_fresh=bool(canva.get("fresh")),
-        canva_write=bool(canva.get("write")),
     )
 
 
@@ -605,7 +597,8 @@ class McpOAuthExchangeRequest(BaseModel):
 
 
 # Hosted MCP servers connected through per-user OAuth (see mcp_oauth.py).
-_OAUTH_MCP_MODULES = {"notion": "notion_auth", "canva": "canva_auth"}
+# Canva OAuth routes are not registered while canva MCP is disabled (see canva_auth.DISABLED).
+_OAUTH_MCP_MODULES = {"notion": "notion_auth"}
 
 
 def _oauth_module(name: str):

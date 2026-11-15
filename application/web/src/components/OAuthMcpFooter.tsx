@@ -1,10 +1,12 @@
 import { useState } from "react";
 
 interface Props {
-  /** Display name, e.g. "Notion" or "Canva". */
+  /** Display name, e.g. "Notion" or "Google Drive". */
   label: string;
-  /** MCP name used in the "사용 전 연결 필요" hint. */
+  /** MCP name used in status hints, e.g. "notion-remote" / "drive". */
   mcpName: string;
+  /** Short label on the connect button (defaults to `label`). Drive uses "Drive". */
+  connectLabel?: string;
   connected: boolean;
   fresh: boolean;
   /** Present only for providers with a second (generate/edit) scope tier. */
@@ -15,8 +17,7 @@ interface Props {
   onConnect: (write: boolean) => void;
   onDisconnect: () => void;
   /**
-   * Set when the provider cannot redirect back to this app (Canva only allows loopback
-   * redirects): the user pastes the popup's address-bar URL to finish connecting.
+   * Manual paste-back flow (loopback-only OAuth redirects). Unused while Canva is disabled.
    */
   manualPending?: boolean;
   onSubmitManual?: (url: string) => void;
@@ -27,6 +28,7 @@ interface Props {
 export function OAuthMcpFooter({
   label,
   mcpName,
+  connectLabel,
   connected,
   fresh,
   write,
@@ -40,18 +42,23 @@ export function OAuthMcpFooter({
   onCancelManual,
 }: Props) {
   const [pasted, setPasted] = useState("");
+  const buttonLabel = connectLabel || label;
+  // Keep the same "{mcp} MCP …" sentence shape for connected / expired / needed.
   const status = connected
     ? fresh
-      ? `${label} 연결됨${supportsWrite ? (write ? " (읽기+쓰기)" : " (읽기 전용)") : ""}`
-      : `${label} 토큰 만료 — 다시 연결하세요`
+      ? `${mcpName} MCP 연결됨${supportsWrite ? (write ? " (읽기+쓰기)" : " (읽기 전용)") : ""}`
+      : `${mcpName} MCP 토큰 만료 — 다시 연결하세요`
     : `${mcpName} MCP 사용 전 ${label} 연결 필요`;
+
   return (
     <div>
       <div className="config-popover-footer-status">{status}</div>
       <div className="config-popover-footer-actions">
-        <button type="button" disabled={busy} onClick={() => onConnect(false)}>
-          {busy ? "연결 중…" : connected ? "다시 연결" : `${label} 연결`}
-        </button>
+        {!connected || !fresh ? (
+          <button type="button" disabled={busy} onClick={() => onConnect(false)}>
+            {busy ? "연결 중…" : connected ? "다시 연결" : `${buttonLabel} 연결`}
+          </button>
+        ) : null}
         {supportsWrite && connected && !write ? (
           <button type="button" disabled={busy} onClick={() => onConnect(true)}>
             쓰기 권한 추가

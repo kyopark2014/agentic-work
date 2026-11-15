@@ -1,9 +1,9 @@
 import { api } from "./api";
 
-export type OAuthMcpProvider = "notion" | "canva";
+export type OAuthMcpProvider = "notion";
 
 /**
- * Connect a hosted MCP (Notion/Canva) via a server-driven OAuth popup.
+ * Connect a hosted MCP (Notion) via a server-driven OAuth popup.
  * The popup is opened synchronously (popup blockers) and navigated once the
  * authorize URL is known; the callback page posts {type:"<provider>-oauth"} back.
  * `write` requests the second (generate/edit) scope tier where the provider has one.
@@ -30,9 +30,7 @@ export async function connectMcpOAuth(
   }
   popup.location.href = url;
 
-  // The provider only redirects to a loopback address (nothing listens there on a
-  // hosted deployment), so the callback page cannot report back. The user copies the
-  // popup's address-bar URL and pastes it; see OAuthMcpFooter.
+  // Manual paste-back path (unused while Canva is disabled; Notion uses auto callback).
   if (manual) return "manual";
 
   await new Promise<void>((resolve, reject) => {
