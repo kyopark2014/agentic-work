@@ -783,7 +783,9 @@ def create_bedrock_agentcore_policy(config):
                     "arn:aws:bedrock:*::foundation-model/*",
                     f"arn:aws:bedrock:*:{accountId}:inference-profile/*",
                     f"arn:aws:bedrock:{region}:{accountId}:guardrail/*",
-                    f"arn:aws:bedrock:{region}:{accountId}:guardrail-profile/*",
+                    # STANDARD tier routes ApplyGuardrail via CRIS profiles
+                    # across destination Regions in the geographic boundary.
+                    f"arn:aws:bedrock:*:{accountId}:guardrail-profile/*",
                     f"arn:aws:bedrock:{region}:{accountId}:knowledge-base/*",
                 ],
             },
@@ -1342,8 +1344,33 @@ def guardrail_name(project_name: str) -> str:
     return f"guardrail-for-{safe_name}"
 
 
+def _guardrail_profile_for_region(region: str) -> str:
+    """Return the Bedrock Guardrail cross-Region profile id for a source region."""
+    if region.startswith("us-gov-"):
+        return "us-gov.guardrail.v1:0"
+    if region.startswith("us-"):
+        return "us.guardrail.v1:0"
+    if region == "eu-west-2":
+        return "uk.guardrail.v1:0"
+    if region.startswith("eu-") or region == "il-central-1":
+        return "eu.guardrail.v1:0"
+    if region.startswith("ca-"):
+        return "ca.guardrail.v1:0"
+    if region == "ap-southeast-2":
+        # AU profile is also valid; APAC profile covers ap-southeast-2 as well.
+        return "apac.guardrail.v1:0"
+    if (
+        region.startswith("ap-")
+        or region.startswith("me-")
+        or region.startswith("af-")
+    ):
+        return "apac.guardrail.v1:0"
+    # Fallback: US profile is the most widely available.
+    return "us.guardrail.v1:0"
+
+
 def _bedrock_guardrail_content_policy() -> dict:
-    """Content filters: block sexual content and prompt attacks (jailbreak/injection)."""
+    """Content filters (STANDARD tier): sexual content + prompt attacks."""
     return {
         "filtersConfig": [
             {
@@ -1363,7 +1390,8 @@ def _bedrock_guardrail_content_policy() -> dict:
                 "outputAction": "NONE",
                 "inputModalities": ["TEXT"],
             },
-        ]
+        ],
+        "tierConfig": {"tierName": "STANDARD"},
     }
 
 
@@ -1404,13 +1432,15 @@ def create_bedrock_guardrail() -> bool:
             "blocks sexual content and prompt attacks in user input."
         )
         blocked_input_message = (
-            "??? ?? ??? ?? ???????. "
-            "?? ?? ?? ???? ??? ???????."
+            "요청이 안전 정책에 의해 차단되었습니다. "
+            "성적 표현 또는 프롬프트 공격이 감지되었습니다."
         )
         blocked_output_message = (
-            "??? ?? ??? ?? ???????."
+            "응답이 안전 정책에 의해 차단되었습니다."
         )
         content_policy = _bedrock_guardrail_content_policy()
+        profile_id = _guardrail_profile_for_region(region)
+        cross_region_config = {"guardrailProfileIdentifier": profile_id}
 
         bedrock_client = boto3.client("bedrock", region_name=region)
         existing = _find_guardrail_by_name(bedrock_client, name)
@@ -1423,6 +1453,7 @@ def create_bedrock_guardrail() -> bool:
                 name=name,
                 description=description,
                 contentPolicyConfig=content_policy,
+                crossRegionConfig=cross_region_config,
                 blockedInputMessaging=blocked_input_message,
                 blockedOutputsMessaging=blocked_output_message,
             )
@@ -1433,6 +1464,7 @@ def create_bedrock_guardrail() -> bool:
                 name=name,
                 description=description,
                 contentPolicyConfig=content_policy,
+                crossRegionConfig=cross_region_config,
                 blockedInputMessaging=blocked_input_message,
                 blockedOutputsMessaging=blocked_output_message,
             )
@@ -1446,11 +1478,15 @@ def create_bedrock_guardrail() -> bool:
         update_config("guardrail_version", guardrail_version)
         update_config("guardrail_arn", guardrail_arn)
         update_config("guardrail_name", name)
+        update_config("guardrail_tier", "STANDARD")
+        update_config("guardrail_profile", profile_id)
 
         print(f"? Guardrail configuration saved to config.json")
         print(f"  - guardrail_id: {guardrail_id}")
         print(f"  - guardrail_version: {guardrail_version}")
         print(f"  - guardrail_name: {name}")
+        print(f"  - guardrail_tier: STANDARD")
+        print(f"  - guardrail_profile: {profile_id}")
         print("  - filters: SEXUAL (HIGH), PROMPT_ATTACK (HIGH)")
         return True
     except ClientError as e:
