@@ -2,12 +2,36 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Any
 
 logger = logging.getLogger("mcp_apps_host")
 
 _APP_BY_TOOL: dict[str, dict[str, Any]] = {}
+
+
+def resolve_vault_actor_id(user_id: str | None) -> str:
+    """Account id for use-vault ``actor_id`` (ob-note vault owner).
+
+    Prefer ``use_vault_actor_id`` when the local login id (e.g. ``admin``) is not
+    the same as the Google email that owns the vault on the ob-note server.
+    """
+    try:
+        from application import utils
+
+        cfg = utils.load_config() or {}
+    except Exception:
+        cfg = {}
+    override = (
+        (cfg.get("use_vault_actor_id") if isinstance(cfg, dict) else None)
+        or os.environ.get("use_vault_actor_id")
+        or os.environ.get("USE_VAULT_ACTOR_ID")
+        or ""
+    ).strip()
+    if override:
+        return override
+    return (user_id or "").strip() or "default"
 
 
 def clear() -> None:
@@ -63,18 +87,27 @@ def _fallback_weather_app(tool_name: str) -> dict[str, Any] | None:
     return get_tool_app(tool_name)
 
 
-def build_app_payload(tool_name: str | None, tool_result_text: str) -> dict[str, Any] | None:
+def build_app_payload(
+    tool_name: str | None,
+    tool_result_text: str,
+    structured_content: Any = None,
+    tool_input: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     app = get_tool_app(tool_name) or (
         _fallback_weather_app(tool_name) if tool_name else None
     )
     if not app:
         return None
-    return {
-        **app,
-        "toolResult": {
-            "content": [{"type": "text", "text": tool_result_text}],
-        },
+    tool_result: dict[str, Any] = {
+        "content": [{"type": "text", "text": tool_result_text}],
     }
+    # MCP Apps UIs (e.g. use-vault) read ``structuredContent`` (kind/list/files).
+    if structured_content is not None:
+        tool_result["structuredContent"] = structured_content
+    payload: dict[str, Any] = {**app, "toolResult": tool_result}
+    if isinstance(tool_input, dict):
+        payload["toolInput"] = tool_input
+    return payload
 
 
 def normalize_tool_result_text(content: Any) -> str:
@@ -261,8 +294,8 @@ async def _call_remote_oauth_tool(
         raise ValueError("Sign in required")
     if server == "use-vault":
         # These tools take the account as an argument. The iframe is untrusted page content,
-        # so never use the caller-supplied value: always act as the signed-in user.
-        arguments = {**arguments, "actor_id": user_id}
+        # so never use the caller-supplied value: always act as the signed-in / configured owner.
+        arguments = {**arguments, "actor_id": resolve_vault_actor_id(user_id)}
     async with remote_session(server, user_id) as session:
         result = await session.call_tool(tool_name, arguments)
     # Keep the whole result (structuredContent, image blocks, _meta): UIs read them.

@@ -2389,11 +2389,25 @@ def append_tool_guidance_to_prompt(system_prompt: str, mcp_servers: list) -> str
 
     if "use-vault" in selected:
         uid = (user_id or "").strip() or "default"
+        try:
+            cfg = utils.load_config() or {}
+            override = (
+                (cfg.get("use_vault_actor_id") if isinstance(cfg, dict) else None)
+                or os.environ.get("use_vault_actor_id")
+                or os.environ.get("USE_VAULT_ACTOR_ID")
+                or ""
+            ).strip()
+            if override:
+                uid = override
+        except Exception:
+            pass
         extras.append(
             "ob-note vault 작업은 use-vault MCP 도구(vault_read, vault_search, "
             "vault_write, vault_append 등)를 사용하세요. "
             f'모든 도구 호출에 actor_id="{uid}" 를 반드시 전달하세요 '
             "(계정 로그인 email). 닉네임·표시 이름을 쓰지 마세요. "
+            "최근/목록/문서 리스트 요청에는 vault_list(또는 vault_search)를 우선 사용하세요. "
+            "vault_tree는 전체 폴더 구조 탐색용이며 인라인에는 요약만 보입니다. "
             "경로는 vault 상대경로(예: Meeting/Note.md)이며 YAML frontmatter는 넣지 마세요. "
             "vault_search/vault_read/vault_list/vault_tree/vault_graph/vault_backlinks 결과는 "
             "채팅에 인터랙티브 UI(MCP Apps)로 표시되므로, 같은 내용을 텍스트로 길게 반복하지 말고 "
