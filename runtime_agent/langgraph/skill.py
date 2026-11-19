@@ -322,7 +322,8 @@ SKILL_SYSTEM_PROMPT = (
     "이미지는 read_file로 읽지 않는다. view_image(filepath, prompt)가 base64 PNG와 prompt로 보고 텍스트를 돌려준다. 이미지를 보려고 upload_file_to_s3를 호출하지 않는다.\n"
     "4. 결과 파일이 있으면 upload_file_to_s3로 업로드하여 URL을 제공한다 "
     "(filepath는 'artifacts/파일명' 또는 ARTIFACTS_DIR 절대경로; "
-    "S3 키는 artifacts/{user_id}/... 로 저장된다)\n"
+    "S3 키는 {user_id}/artifacts/... 로 저장된다. "
+    ".md/.json/.csv는 View URL을 답변에 쓰고, 직접 저장은 Download URL을 쓴다)\n"
     "5. 최종 결과를 사용자에게 전달한다\n\n"
 )
 
