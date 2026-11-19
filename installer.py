@@ -1509,7 +1509,16 @@ def _ecs_agent_runtime_resource_arns() -> List[str]:
                 seen.add(vault_endpoint)
                 arns.append(vault_endpoint)
 
-    # Always allow ob-note (and legacy ob-docs) use-vault MCP Runtime by name pattern.
+        search_runtime_arn = (config.get("search_note_mcp_runtime_arn") or "").strip()
+        if search_runtime_arn and search_runtime_arn not in seen:
+            seen.add(search_runtime_arn)
+            arns.append(search_runtime_arn)
+            search_endpoint = f"{search_runtime_arn}/runtime-endpoint/*"
+            if search_endpoint not in seen:
+                seen.add(search_endpoint)
+                arns.append(search_endpoint)
+
+    # Always allow ob-note (and legacy ob-docs) use-vault / search-note MCP by name.
     for pattern_arn in (
         f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/use_vault_of_ob_note",
         f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/use_vault_of_ob_note-*",
@@ -1530,6 +1539,16 @@ def _ecs_agent_runtime_resource_arns() -> List[str]:
         (
             f"arn:aws:bedrock-agentcore:{region}:{account_id}:"
             f"runtime/use_vault_of_ob_docs-*/runtime-endpoint/*"
+        ),
+        f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/search_note_of_ob_note",
+        f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/search_note_of_ob_note-*",
+        (
+            f"arn:aws:bedrock-agentcore:{region}:{account_id}:"
+            f"runtime/search_note_of_ob_note/runtime-endpoint/*"
+        ),
+        (
+            f"arn:aws:bedrock-agentcore:{region}:{account_id}:"
+            f"runtime/search_note_of_ob_note-*/runtime-endpoint/*"
         ),
     ):
         if pattern_arn not in seen:

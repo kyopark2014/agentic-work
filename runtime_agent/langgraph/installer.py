@@ -58,9 +58,10 @@ def load_config():
     return _merge_application_config(config)
 
 
-def _discover_use_vault_runtime(region: str) -> tuple[str, str] | tuple[None, None]:
-    """Return ``(arn, streamable-http url)`` for ob-note use-vault MCP, if present."""
-    names = ("use_vault_of_ob_note", "use_vault_of_ob_docs")
+def _discover_ob_note_mcp_runtime(
+    region: str, names: tuple[str, ...]
+) -> tuple[str, str] | tuple[None, None]:
+    """Return ``(arn, streamable-http url)`` for an ob-note MCP runtime, if present."""
     try:
         client = boto3.client("bedrock-agentcore-control", region_name=region)
         token = None
@@ -85,12 +86,39 @@ def _discover_use_vault_runtime(region: str) -> tuple[str, str] | tuple[None, No
             if not token:
                 break
     except Exception as e:
-        print(f"Warning: use-vault runtime discovery failed: {e}")
+        print(f"Warning: MCP runtime discovery failed for {names}: {e}")
     return None, None
 
 
+def _discover_use_vault_runtime(region: str) -> tuple[str, str] | tuple[None, None]:
+    """Return ``(arn, streamable-http url)`` for ob-note use-vault MCP, if present."""
+    return _discover_ob_note_mcp_runtime(
+        region, ("use_vault_of_ob_note", "use_vault_of_ob_docs")
+    )
+
+
+def _discover_search_note_runtime(region: str) -> tuple[str, str] | tuple[None, None]:
+    """Return ``(arn, streamable-http url)`` for ob-note search-note MCP, if present."""
+    return _discover_ob_note_mcp_runtime(region, ("search_note_of_ob_note",))
+
+
+def _persist_app_mcp_keys(keys: dict[str, str]) -> None:
+    try:
+        app_path = os.path.join(_repo_root(), "application", "config.json")
+        if not os.path.isfile(app_path):
+            return
+        with open(app_path, "r", encoding="utf-8") as f:
+            app_data = json.load(f)
+        app_data.update(keys)
+        with open(app_path, "w", encoding="utf-8") as f:
+            json.dump(app_data, f, indent=2)
+            f.write("\n")
+    except Exception as e:
+        print(f"Warning: failed to sync MCP keys to application/config.json: {e}")
+
+
 def _merge_application_config(config: dict) -> dict:
-    """Pull S3 Files / use-vault keys from application/config.json (discover if missing)."""
+    """Pull S3 Files / use-vault / search-note keys from application/config.json."""
     app_config = _load_application_config()
     updated = dict(config)
     changed = False
@@ -103,6 +131,9 @@ def _merge_application_config(config: dict) -> dict:
         "use_vault_mcp_url",
         "use_vault_mcp_runtime_arn",
         "use_vault_mcp_region",
+        "search_note_mcp_url",
+        "search_note_mcp_runtime_arn",
+        "search_note_mcp_region",
         "agentcore_websearch_gateway_url",
     ):
         app_value = app_config.get(key)
@@ -110,13 +141,15 @@ def _merge_application_config(config: dict) -> dict:
             updated[key] = app_value
             changed = True
 
+    vault_region = (
+        updated.get("use_vault_mcp_region")
+        or updated.get("search_note_mcp_region")
+        or updated.get("region")
+        or "us-west-2"
+    )
+
     # Ensure use-vault MCP endpoint is present for the agent runtime image.
     if not (updated.get("use_vault_mcp_url") or updated.get("use_vault_mcp_runtime_arn")):
-        vault_region = (
-            updated.get("use_vault_mcp_region")
-            or updated.get("region")
-            or "us-west-2"
-        )
         arn, url = _discover_use_vault_runtime(vault_region)
         if arn and url:
             updated["use_vault_mcp_runtime_arn"] = arn
@@ -124,20 +157,32 @@ def _merge_application_config(config: dict) -> dict:
             updated["use_vault_mcp_region"] = vault_region
             changed = True
             print(f"✓ Discovered use-vault MCP runtime: {arn}")
-            # Persist into application/config.json so ECS MCP Apps + future merges share it.
-            try:
-                app_path = os.path.join(_repo_root(), "application", "config.json")
-                if os.path.isfile(app_path):
-                    with open(app_path, "r", encoding="utf-8") as f:
-                        app_data = json.load(f)
-                    app_data["use_vault_mcp_runtime_arn"] = arn
-                    app_data["use_vault_mcp_url"] = url
-                    app_data["use_vault_mcp_region"] = vault_region
-                    with open(app_path, "w", encoding="utf-8") as f:
-                        json.dump(app_data, f, indent=2)
-                        f.write("\n")
-            except Exception as e:
-                print(f"Warning: failed to sync use-vault keys to application/config.json: {e}")
+            _persist_app_mcp_keys(
+                {
+                    "use_vault_mcp_runtime_arn": arn,
+                    "use_vault_mcp_url": url,
+                    "use_vault_mcp_region": vault_region,
+                }
+            )
+
+    # Ensure search-note MCP endpoint is present for the agent runtime image.
+    if not (
+        updated.get("search_note_mcp_url") or updated.get("search_note_mcp_runtime_arn")
+    ):
+        arn, url = _discover_search_note_runtime(vault_region)
+        if arn and url:
+            updated["search_note_mcp_runtime_arn"] = arn
+            updated["search_note_mcp_url"] = url
+            updated["search_note_mcp_region"] = vault_region
+            changed = True
+            print(f"✓ Discovered search-note MCP runtime: {arn}")
+            _persist_app_mcp_keys(
+                {
+                    "search_note_mcp_runtime_arn": arn,
+                    "search_note_mcp_url": url,
+                    "search_note_mcp_region": vault_region,
+                }
+            )
 
     if changed:
         with open(config_path, "w", encoding="utf-8") as f:
@@ -414,7 +459,7 @@ def _project_agent_runtime_resource_arns(config) -> list:
     ``{name}*`` covers the unsuffixed name and ``{name}-{id}``. Endpoint ARNs
     stay separate because IAM ``*`` does not need to span the slash. This keeps
     the managed policy under the 6144-byte PolicySize quota.
-    Also includes ob-note use-vault MCP Runtime when configured.
+    Also includes ob-note use-vault / search-note MCP Runtimes when configured.
     """
     region = config["region"]
     account_id = config["accountId"]
@@ -434,6 +479,16 @@ def _project_agent_runtime_resource_arns(config) -> list:
     if vault_arn and vault_arn not in arns:
         arns.append(vault_arn)
         endpoint = f"{vault_arn}/runtime-endpoint/*"
+        if endpoint not in arns:
+            arns.append(endpoint)
+
+    # Remote search-note MCP (Notes graph query)
+    search_arn = (config.get("search_note_mcp_runtime_arn") or "").strip()
+    for search_name in ("search_note_of_ob_note",):
+        arns.extend(_runtime_arns(search_name))
+    if search_arn and search_arn not in arns:
+        arns.append(search_arn)
+        endpoint = f"{search_arn}/runtime-endpoint/*"
         if endpoint not in arns:
             arns.append(endpoint)
     return arns

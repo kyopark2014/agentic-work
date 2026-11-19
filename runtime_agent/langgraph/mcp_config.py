@@ -57,10 +57,11 @@ def get_agentcore_gateway_mcp_url(gateway_name: str, gateway_region: str) -> str
 
 
 _VAULT_RUNTIME_NAMES = ("use_vault_of_ob_note", "use_vault_of_ob_docs")
+_SEARCH_NOTE_RUNTIME_NAMES = ("search_note_of_ob_note",)
 
 
-def _find_use_vault_runtime_arn(vault_region: str) -> str | None:
-    """Discover the ob-note use-vault AgentCore Runtime ARN by name prefix."""
+def _find_agent_runtime_arn(vault_region: str, names: tuple[str, ...]) -> str | None:
+    """Discover an AgentCore Runtime ARN by exact name or name prefix."""
     try:
         client = boto3.client("bedrock-agentcore-control", region_name=vault_region)
         token = None
@@ -71,7 +72,7 @@ def _find_use_vault_runtime_arn(vault_region: str) -> str | None:
             page = client.list_agent_runtimes(**kwargs)
             for item in page.get("agentRuntimes", []):
                 name = item.get("agentRuntimeName", "")
-                if any(name == n or name.startswith(n) for n in _VAULT_RUNTIME_NAMES):
+                if any(name == n or name.startswith(n) for n in names):
                     arn = (item.get("agentRuntimeArn") or "").strip()
                     if arn:
                         return arn
@@ -79,8 +80,26 @@ def _find_use_vault_runtime_arn(vault_region: str) -> str | None:
             if not token:
                 return None
     except Exception as e:
-        logger.error(f"Error discovering use-vault AgentCore runtime: {e}")
+        logger.error(f"Error discovering AgentCore runtime {names}: {e}")
         return None
+
+
+def _find_use_vault_runtime_arn(vault_region: str) -> str | None:
+    """Discover the ob-note use-vault AgentCore Runtime ARN by name prefix."""
+    return _find_agent_runtime_arn(vault_region, _VAULT_RUNTIME_NAMES)
+
+
+def _find_search_note_runtime_arn(vault_region: str) -> str | None:
+    """Discover the ob-note search-note AgentCore Runtime ARN by name prefix."""
+    return _find_agent_runtime_arn(vault_region, _SEARCH_NOTE_RUNTIME_NAMES)
+
+
+def _runtime_mcp_url_from_arn(arn: str, vault_region: str) -> str:
+    encoded = arn.replace(":", "%3A").replace("/", "%2F")
+    return (
+        f"https://bedrock-agentcore.{vault_region}.amazonaws.com/runtimes/"
+        f"{encoded}/invocations?qualifier=DEFAULT"
+    )
 
 
 def get_use_vault_mcp_url() -> str | None:
@@ -119,11 +138,42 @@ def get_use_vault_mcp_url() -> str | None:
             config["use_vault_mcp_region"] = r
     if not arn:
         return None
-    encoded = arn.replace(":", "%3A").replace("/", "%2F")
-    return (
-        f"https://bedrock-agentcore.{r}.amazonaws.com/runtimes/"
-        f"{encoded}/invocations?qualifier=DEFAULT"
+    return _runtime_mcp_url_from_arn(arn, r)
+
+
+def get_search_note_mcp_url() -> str | None:
+    """Streamable-HTTP URL for ob-note search-note AgentCore Runtime MCP (IAM SigV4)."""
+    configured = (
+        config.get("search_note_mcp_url")
+        or os.environ.get("search_note_mcp_url")
+        or os.environ.get("SEARCH_NOTE_MCP_URL")
+        or ""
+    ).strip()
+    if configured:
+        return configured
+
+    r = (
+        config.get("search_note_mcp_region")
+        or config.get("use_vault_mcp_region")
+        or config.get("region")
+        or region
+        or "us-west-2"
     )
+    arn = (
+        config.get("search_note_mcp_runtime_arn")
+        or os.environ.get("search_note_mcp_runtime_arn")
+        or os.environ.get("SEARCH_NOTE_MCP_RUNTIME_ARN")
+        or ""
+    ).strip()
+    if not arn:
+        arn = _find_search_note_runtime_arn(r) or ""
+        if arn:
+            logger.info(f"Discovered search-note runtime: {arn}")
+            config["search_note_mcp_runtime_arn"] = arn
+            config["search_note_mcp_region"] = r
+    if not arn:
+        return None
+    return _runtime_mcp_url_from_arn(arn, r)
 
 
 def load_config(mcp_type):
@@ -313,6 +363,33 @@ def load_config(mcp_type):
         return {
             "mcpServers": {
                 "use-vault": {
+                    "type": "streamable_http",
+                    "url": mcp_url,
+                    "auth_type": "aws_sigv4",
+                    "auth_region": auth_region,
+                    "auth_service": "bedrock-agentcore",
+                }
+            }
+        }
+
+    elif mcp_type == "search-note":
+        mcp_url = get_search_note_mcp_url()
+        if not mcp_url:
+            logger.info(
+                "search-note MCP skipped: could not resolve search_note_mcp_url "
+                "(config/env ARN/URL missing and ListAgentRuntimes discovery failed)."
+            )
+            return {}
+        auth_region = (
+            config.get("search_note_mcp_region")
+            or config.get("use_vault_mcp_region")
+            or config.get("region")
+            or region
+            or "us-west-2"
+        )
+        return {
+            "mcpServers": {
+                "search-note": {
                     "type": "streamable_http",
                     "url": mcp_url,
                     "auth_type": "aws_sigv4",

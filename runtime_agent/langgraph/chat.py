@@ -2387,7 +2387,7 @@ def append_tool_guidance_to_prompt(system_prompt: str, mcp_servers: list) -> str
             "aws와 관련된 내용이 있다면, search_documentation tool을 이용해 필요한 정보를 수집하세요."
         )
 
-    if "use-vault" in selected:
+    if "use-vault" in selected or "search-note" in selected:
         uid = (user_id or "").strip() or "default"
         try:
             cfg = utils.load_config() or {}
@@ -2401,25 +2401,35 @@ def append_tool_guidance_to_prompt(system_prompt: str, mcp_servers: list) -> str
                 uid = override
         except Exception:
             pass
-        extras.append(
-            "ob-note vault 작업은 use-vault MCP 도구(vault_read, vault_search, "
-            "vault_write, vault_append 등)를 사용하세요. "
-            f'모든 도구 호출에 actor_id="{uid}" 를 반드시 전달하세요 '
-            "(계정 로그인 email). 닉네임·표시 이름을 쓰지 마세요. "
-            "최근/목록/문서 리스트 요청에는 vault_list(또는 vault_search)를 우선 사용하세요. "
-            "vault_tree는 전체 폴더 구조 탐색용입니다. "
-            "경로는 vault 상대경로(예: Meeting/Note.md)이며 YAML frontmatter는 넣지 마세요. "
-            "도구 JSON의 url은 로그인 후 노트로 이동하는 deep link입니다 "
-            "(/s/ 공개 공유가 아님). 노트 path를 말할 때는 반드시 "
-            "[제목](url) 마크다운 링크로 함께 보여 주세요. "
-            "list/search/tree 결과는 본문 전체를 붙여넣지 말고, 핵심 요약 + "
-            "클릭 가능한 목차(또는 path·url 표)로 정리하세요. MCP Apps UI가 "
-            "있어도 채팅 목차의 링크는 생략하지 마세요. "
-            "쓰기 성공 시 path·url·ok를 짧게 확인하세요. "
-            "긴 노트는 하나의 .md에 모으고 제목 아래 ## 목차를 두며, "
-            "다른 vault 노트 참조는 [제목](url)을 쓰세요. "
-            "노트 본문은 합니다체, 이미지는 vault 상대경로만 사용하세요."
-        )
+        if "use-vault" in selected:
+            extras.append(
+                "ob-note vault 작업은 use-vault MCP 도구(vault_read, vault_search, "
+                "vault_write, vault_append 등)를 사용하세요. "
+                f'모든 도구 호출에 actor_id="{uid}" 를 반드시 전달하세요 '
+                "(계정 로그인 email). 닉네임·표시 이름을 쓰지 마세요. "
+                "최근/목록/문서 리스트 요청에는 vault_list(또는 vault_search)를 우선 사용하세요. "
+                "vault_tree는 전체 폴더 구조 탐색용입니다. "
+                "경로는 vault 상대경로(예: Meeting/Note.md)이며 YAML frontmatter는 넣지 마세요. "
+                "도구 JSON의 url은 로그인 후 노트로 이동하는 deep link입니다 "
+                "(/s/ 공개 공유가 아님). 노트 path를 말할 때는 반드시 "
+                "[제목](url) 마크다운 링크로 함께 보여 주세요. "
+                "list/search/tree 결과는 본문 전체를 붙여넣지 말고, 핵심 요약 + "
+                "클릭 가능한 목차(또는 path·url 표)로 정리하세요. MCP Apps UI가 "
+                "있어도 채팅 목차의 링크는 생략하지 마세요. "
+                "쓰기 성공 시 path·url·ok를 짧게 확인하세요. "
+                "긴 노트는 하나의 .md에 모으고 제목 아래 ## 목차를 두며, "
+                "다른 vault 노트 참조는 [제목](url)을 쓰세요. "
+                "이미지는 vault 상대경로만 사용하세요."
+            )
+        if "search-note" in selected:
+            extras.append(
+                "ob-note Notes Knowledge Graph 검색은 search-note MCP의 "
+                "`search_note` 도구를 사용하세요 (BFS/DFS + excerpt). "
+                f'호출 시 actor_id="{uid}" 와 question을 반드시 전달하세요. '
+                "주제·엔티티·관계 맥락이 필요할 때 vault_search(전문 검색)보다 "
+                "search_note를 우선하세요. 결과가 비면 Graph Sync가 필요할 수 있습니다. "
+                "excerpt에 url이 있으면 [제목](url)로 인용하세요."
+            )
 
     if "weather" in selected:
         extras.append(
