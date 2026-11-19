@@ -2407,11 +2407,18 @@ def append_tool_guidance_to_prompt(system_prompt: str, mcp_servers: list) -> str
             f'모든 도구 호출에 actor_id="{uid}" 를 반드시 전달하세요 '
             "(계정 로그인 email). 닉네임·표시 이름을 쓰지 마세요. "
             "최근/목록/문서 리스트 요청에는 vault_list(또는 vault_search)를 우선 사용하세요. "
-            "vault_tree는 전체 폴더 구조 탐색용이며 인라인에는 요약만 보입니다. "
+            "vault_tree는 전체 폴더 구조 탐색용입니다. "
             "경로는 vault 상대경로(예: Meeting/Note.md)이며 YAML frontmatter는 넣지 마세요. "
-            "vault_search/vault_read/vault_list/vault_tree/vault_graph/vault_backlinks 결과는 "
-            "채팅에 인터랙티브 UI(MCP Apps)로 표시되므로, 같은 내용을 텍스트로 길게 반복하지 말고 "
-            "핵심만 요약하세요."
+            "도구 JSON의 url은 로그인 후 노트로 이동하는 deep link입니다 "
+            "(/s/ 공개 공유가 아님). 노트 path를 말할 때는 반드시 "
+            "[제목](url) 마크다운 링크로 함께 보여 주세요. "
+            "list/search/tree 결과는 본문 전체를 붙여넣지 말고, 핵심 요약 + "
+            "클릭 가능한 목차(또는 path·url 표)로 정리하세요. MCP Apps UI가 "
+            "있어도 채팅 목차의 링크는 생략하지 마세요. "
+            "쓰기 성공 시 path·url·ok를 짧게 확인하세요. "
+            "긴 노트는 하나의 .md에 모으고 제목 아래 ## 목차를 두며, "
+            "다른 vault 노트 참조는 [제목](url)을 쓰세요. "
+            "노트 본문은 합니다체, 이미지는 vault 상대경로만 사용하세요."
         )
 
     if "weather" in selected:
