@@ -475,3 +475,45 @@ if notion_api_key:
 else:
     logger.info("notion_api_key is not set.")
 
+
+def _load_scrapecreators_api_key(app_config: dict) -> str:
+    """Load ScrapeCreators API key from env, config.json, or Secrets Manager.
+
+    Used by the last30days skill for TikTok / Instagram (and optional Reddit /
+    YouTube backfill). Process env wins so local overrides work without SM.
+    """
+    key = (os.environ.get("SCRAPECREATORS_API_KEY") or "").strip()
+    if key:
+        return key
+
+    key = (app_config.get("scrapecreators_api_key") or "").strip()
+    if key:
+        return key
+
+    region = app_config.get("region", "us-west-2")
+    secret_name = "scrapecreatorsapikey"
+    secrets_client = boto3.client("secretsmanager", region_name=region)
+    try:
+        response = secrets_client.get_secret_value(SecretId=secret_name)
+        secret_data = json.loads(response["SecretString"])
+        key = (secret_data.get("scrapecreators_api_key") or "").strip()
+        if key:
+            logger.info(f"scrapecreators_api_key loaded from Secrets Manager: {secret_name}")
+            return key
+    except Exception as e:
+        logger.debug(f"Could not load ScrapeCreators secret {secret_name}: {e}")
+    return ""
+
+
+scrapecreators_key = _load_scrapecreators_api_key(config)
+if scrapecreators_key:
+    os.environ["SCRAPECREATORS_API_KEY"] = scrapecreators_key
+    # last30days: TikTok/Instagram activate on key alone; comments need INCLUDE_SOURCES.
+    if not (os.environ.get("INCLUDE_SOURCES") or "").strip():
+        os.environ["INCLUDE_SOURCES"] = (
+            "tiktok,instagram,youtube_comments,tiktok_comments,instagram_comments"
+        )
+    logger.info("scrapecreators_api_key is configured")
+else:
+    logger.info("scrapecreators_api_key is not set.")
+

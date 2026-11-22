@@ -1030,11 +1030,11 @@ def ensure_alb_listener_origin_protection(
 
 
 def create_secrets() -> Dict[str, str]:
-    """Create shared Secrets Manager secrets for Tavily, Notion, and LiteLLM keys.
+    """Create shared Secrets Manager secrets for Tavily, Notion, LiteLLM, ScrapeCreators.
 
-    Secret names are project-agnostic (tavilyapikey / notionapikey / litellmmapikey)
-    so they can be reused across projects in the same AWS account/region.
-    Existing secrets are skipped (no overwrite, no re-prompt).
+    Secret names are project-agnostic (tavilyapikey / notionapikey / litellmmapikey /
+    scrapecreatorsapikey) so they can be reused across projects in the same AWS
+    account/region. Existing secrets are skipped (no overwrite, no re-prompt).
     """
     logger.info("Creating Secrets Manager secrets (shared across projects)")
     logger.info("Please enter API keys when prompted (press Enter to skip and leave empty):")
@@ -1061,6 +1061,13 @@ def create_secrets() -> Dict[str, str]:
                 "litellm_master_key": "",
             }
         },
+        "scrapecreators": {
+            "name": "scrapecreatorsapikey",
+            "description": "shared secret for ScrapeCreators API key (last30days TikTok/Instagram)",
+            "secret_value": {
+                "scrapecreators_api_key": "",
+            }
+        },
     }
 
     secret_arns = {}
@@ -1084,6 +1091,10 @@ def create_secrets() -> Dict[str, str]:
                     logger.info(f"Enter credential of {secret_config['name']} (LiteLLM Master Key):")
                     api_key = input(f"Creating {secret_config['name']} - LiteLLM Master Key: ").strip()
                     secret_config["secret_value"]["litellm_master_key"] = api_key
+                elif key == "scrapecreators":
+                    logger.info(f"Enter credential of {secret_config['name']} (ScrapeCreators API Key):")
+                    api_key = input(f"Creating {secret_config['name']} - ScrapeCreators API Key: ").strip()
+                    secret_config["secret_value"]["scrapecreators_api_key"] = api_key
 
                 try:
                     response = secrets_client.create_secret(

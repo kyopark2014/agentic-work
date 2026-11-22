@@ -638,11 +638,12 @@ def _project_s3_resource_arns(config) -> tuple:
 
 
 def _project_secret_resource_arns(config) -> list:
-    """Shared Secrets Manager ARNs used by Runtime (Tavily / Notion / vault).
+    """Shared Secrets Manager ARNs used by Runtime (Tavily / Notion / ScrapeCreators / vault).
 
     Names match root ``installer.create_secrets`` and ``utils._load_*_api_key``:
-    account/region shared secrets ``tavilyapikey`` / ``notionapikey`` (not
-    ``tavilyapikey-{project}``). LiteLLM master / signing keys are never granted.
+    account/region shared secrets ``tavilyapikey`` / ``notionapikey`` /
+    ``scrapecreatorsapikey`` (not ``tavilyapikey-{project}``). LiteLLM master /
+    signing keys are never granted.
 
     ``{project}/vault-agent-token``, ``ob-note/vault-agent-token``, and legacy
     ``ob-docs/vault-agent-token`` are allowed so my-vaults can call standalone
@@ -658,6 +659,7 @@ def _project_secret_resource_arns(config) -> list:
     return [
         f"arn:aws:secretsmanager:{region}:{account_id}:secret:tavilyapikey*",
         f"arn:aws:secretsmanager:{region}:{account_id}:secret:notionapikey*",
+        f"arn:aws:secretsmanager:{region}:{account_id}:secret:scrapecreatorsapikey*",
         (
             f"arn:aws:secretsmanager:{region}:{account_id}:"
             f"secret:{project_name}/vault-agent-token*"

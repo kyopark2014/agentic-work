@@ -23,14 +23,14 @@ CDK 스택과 동등한 AWS 인프라를 프로그래밍 방식으로 배포합�
 - **LangGraph Agent**: AgentCore Runtime (`runtime_agent/langgraph/installer.py`) — 추론·MCP·Skill 실행
 - MCP 서버는 Runtime 컨테이너 **내부 stdio subprocess**로 기동됩니다. (`runtime_mcp/` 별도 MCP Runtime은 이 저장소에서 사용하지 않습니다.)
 - **S3 Files**: AgentCore 세션 checkpoint 영속화를 위해 S3 버킷을 NFS로 마운트 (태스크·메시지는 DynamoDB)
-- **공유 Secrets**: Tavily·Notion API Key를 계정/리전 공용 Secret(`tavilyapikey`, `notionapikey`)으로 관리
+- **공유 Secrets**: Tavily·Notion·ScrapeCreators API Key를 계정/리전 공용 Secret(`tavilyapikey`, `notionapikey`, `scrapecreatorsapikey`)으로 관리
 
 ### 주요 특징
 - **완전 자동화**: 단일 스크립트로 ECS·RAG·네트워킹 인프라 배포
 - **멱등성**: 이미 존재하는 리소스는 재사용
 - **에러 핸들링**: 각 단계별 예외 처리, 실패 시에도 `application/config.json`에 부분 정보 저장
 - **로깅**: 상세한 배포 진행 상황 출력
-- **Secrets Manager**: 프로젝트 비의존 공유 Secret (`tavilyapikey`, `notionapikey`)
+- **Secrets Manager**: 프로젝트 비의존 공유 Secret (`tavilyapikey`, `notionapikey`, `scrapecreatorsapikey`)
 - **S3 Vectors 기반 RAG**: Bedrock Knowledge Base가 OpenSearch Serverless 대신 S3 Vectors를 벡터 스토어로 사용
 - **S3 Files 세션 스토리지**: AgentCore `/mnt/workspace` + ECS `/mnt/app-data` 영속 마운트
 - **ECS Fargate 배포**: multi-stage Dockerfile 이미지를 ECR에 push한 뒤 ECS Fargate(ARM64) 서비스로 실행
@@ -102,6 +102,7 @@ ALB_ORIGIN_HEADER_SECRET_NAME = f"{project_name}/cloudfront-alb-origin-header"
 |--------|------|------|
 | Tavily API Key | `tavilyapikey` | `{"tavily_api_key": "..."}` |
 | Notion API Key | `notionapikey` | `{"notion_api_key": "..."}` |
+| ScrapeCreators API Key | `scrapecreatorsapikey` | `{"scrapecreators_api_key": "..."}` |
 
 - **최초 생성 시**: 설치 프롬프트에서 API Key 입력 (Enter로 건너뛰면 빈 값 저장)
 - **이미 존재할 때**: 기존 Secret을 재사용하며 **값을 갱신하지 않음**

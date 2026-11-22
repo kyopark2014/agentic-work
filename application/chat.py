@@ -101,6 +101,25 @@ def _build_kimi_chat(profile: dict, max_output_tokens: int):
         max_tokens=max_output_tokens,
     )
 
+def get_max_output_tokens(model_id: str = "") -> int:
+    """Return max output tokens matching agentic-work runtime caps."""
+    mid = (model_id or "").lower()
+    if "fable" in mid:
+        return 128000
+    if "claude-sonnet-5" in mid or "claude-5-sonnet" in mid:
+        return 128000
+    if "claude-opus-5" in mid or "claude-5-opus" in mid:
+        return 128000
+    if "claude-opus-4-6" in mid or "claude-opus-4-7" in mid:
+        return 128000
+    if "claude-opus-4-5" in mid:
+        return 64000
+    if "claude-opus-4" in mid or "claude-4-opus" in mid:
+        return 32000
+    if "claude-sonnet-4" in mid or "claude-4-sonnet" in mid or "claude-haiku-4" in mid:
+        return 64000
+    return 8192
+
 def get_chat(extended_thinking=None):
     # Set default value if not provided or invalid
     if extended_thinking is None or extended_thinking not in ['Enable', 'Disable']:
@@ -111,9 +130,12 @@ def get_chat(extended_thinking=None):
     bedrock_region =  profile['bedrock_region']
     modelId = profile['model_id']
     model_type = profile['model_type']
-    maxOutputTokens = 4096 # 4k
-    if model_type == "kimi":
+    if model_type == "claude":
+        maxOutputTokens = get_max_output_tokens(modelId)
+    elif model_type == "kimi":
         maxOutputTokens = 16384
+    else:
+        maxOutputTokens = 5120
     logger.info(f"LLM: bedrock_region: {bedrock_region}, modelId: {modelId}, model_type: {model_type}")
 
     if profile["model_type"] == "openai":

@@ -654,7 +654,7 @@ def get_max_output_tokens(model_id: str = "") -> int:
         return 128000
     if "claude-opus-5" in mid or "claude-5-opus" in mid:
         return 128000
-    if "claude-opus-4-6" in mid:
+    if "claude-opus-4-6" in mid or "claude-opus-4-7" in mid:
         return 128000
     if "claude-opus-4-5" in mid:
         return 64000
