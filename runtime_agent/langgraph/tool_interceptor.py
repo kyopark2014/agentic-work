@@ -40,6 +40,11 @@ def wrap_mcp_tools(tools: list) -> list:
 
     Replaces langchain_mcp_adapters tool_interceptors (removed with MCPAdapter).
     Tools with no matching sanitizer are returned unchanged.
+
+    StructuredTool (Pydantic) rejects plain ``tool.ainvoke = ...`` with
+    ``object has no field "ainvoke"``, which previously aborted the whole
+    Tavily MCP server load. Use ``object.__setattr__`` and fall back to the
+    unwrapped tool if patching still fails.
     """
     if not _SANITIZERS:
         return tools
@@ -78,8 +83,16 @@ def wrap_mcp_tools(tools: list) -> list:
                 input = sanitize_tool_args(_name, input)
             return _orig(input, config=config, **kwargs)
 
-        tool.ainvoke = ainvoke
-        tool.invoke = invoke
+        try:
+            # Pydantic BaseModel/StructuredTool blocks normal attribute sets.
+            object.__setattr__(tool, "ainvoke", ainvoke)
+            object.__setattr__(tool, "invoke", invoke)
+        except Exception as e:
+            logger.warning(
+                "tool interceptor wrap skipped for %s (%s); using unwrapped tool",
+                name,
+                e,
+            )
         wrapped.append(tool)
     return wrapped
 
