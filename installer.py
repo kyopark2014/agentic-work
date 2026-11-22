@@ -7858,10 +7858,15 @@ def _ecs_az_rebalancing_enabled(service: Dict[str, object]) -> bool:
 def _ecs_single_task_deployment_config(
     service: Optional[Dict[str, object]] = None,
 ) -> Optional[Dict[str, int]]:
-    """Return 0/100 deployment config when compatible, else None (keep service default)."""
+    """Return 0/200 deployment config when compatible, else None (keep service default).
+
+    maximumPercent=200 lets a replacement task start while the previous one drains
+    (ALB deregistration delay / S3 Files unmount). With 100, desired=1 blocks the
+    new task until the old one is fully STOPPED → temporary 503.
+    """
     if service and _ecs_az_rebalancing_enabled(service):
         return None
-    return {"minimumHealthyPercent": 0, "maximumPercent": 100}
+    return {"minimumHealthyPercent": 0, "maximumPercent": 200}
 
 
 def _update_ecs_service_task_definition(
@@ -8188,7 +8193,7 @@ def deploy_ecs_service(
             launchType="FARGATE",
             deploymentConfiguration={
                 "minimumHealthyPercent": 0,
-                "maximumPercent": 100,
+                "maximumPercent": 200,
             },
             availabilityZoneRebalancing="DISABLED",
             networkConfiguration={

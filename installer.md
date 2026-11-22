@@ -229,7 +229,8 @@ VPC 생성 직후 **두 개의** S3 Files FS를 **멱등**으로 프로비저닝
 - **배포 위치**: Private Subnet (퍼블릭 IP 없음)
 - **컨테이너 헬스체크**: `curl -f http://localhost:8501/api/health`
 - **볼륨**: S3 Files → `/mnt/app-data` (설정 시)
-- **배포 설정**: `minimumHealthyPercent=0`, `maximumPercent=100`, AZ rebalancing DISABLED
+- **배포 설정**: `minimumHealthyPercent=0`, `maximumPercent=200`, AZ rebalancing DISABLED  
+  (`maximumPercent=200`: 구 태스크 drain/S3 Files unmount 중에도 교체 태스크를 기동해 일시 503을 줄임. `100`이면 desired=1일 때 구 태스크가 STOPPED될 때까지 새 태스크를 띄우지 못함.)
 - **로그**: CloudWatch Logs `/ecs/app-for-{project_name}`
 
 ### 9. Bedrock Knowledge Base
