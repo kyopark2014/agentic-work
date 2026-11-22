@@ -1506,6 +1506,60 @@ Human(Q2) → AI(A2) → Human(Q3) → AI(tool_calls) → ToolMessage → AI(A3)
 - trim은 LLM 컨텍스트 윈도우 관리용이며, 저장된 history를 삭제하지 않습니다.
 - CloudWatch 로그에서 `trimmed messages from X to Y (max_turns=5)`로 trim 여부를 확인할 수 있습니다.
 
+### Tool Result Cap
+
+턴 수 trim만으로는 **한 턴 안의 거대 `ToolMessage`**(예: `web_fetch`의 `get_raw_text`)를 막지 못합니다. MCP/builtin 도구 결과가 그대로 checkpointer와 다음 `call_model`에 쌓이면 Claude/GPT의 **~1M 컨텍스트 한도**를 넘겨 `ValidationException: prompt is too long` → UI에는 `"답변을 찾지 못하였습니다."`로만 보일 수 있습니다. (모델 업그레이드로는 해결되지 않습니다. 최신 Claude/GPT도 ≤ ~1.05M입니다.)
+
+이를 막기 위해 [runtime_agent/langgraph/langgraph_agent.py](./runtime_agent/langgraph/langgraph_agent.py)에서 **문자 기준 hard cap**을 적용합니다.
+
+**기본값**
+
+| 한도 | 상수 | 값 |
+|------|------|-----|
+| 도구 결과 1개 | `TOOL_RESULT_MAX_CHARS` | **32,000** chars |
+| 같은 Human 턴의 tool 결과 합 | `TOOL_RESULTS_TURN_MAX_CHARS` | **120,000** chars |
+
+**삽입 위치**
+
+1. **`_action_node`** — `ToolNode.ainvoke` 직후, state/checkpointer에 넣기 **전** (`_cap_tool_node_result`). MCP·`execute_code` 등 모든 도구에 적용.
+2. **`call_model`** — Bedrock용 메시지 정규화 후 `cap_tool_messages` 재적용. 예전에 잘리지 않은 체크포인트에 대한 방어선.
+
+UI/SSE의 `truncate_for_stream`(약 8k)과 **별개**입니다. SSE는 화면용으로만 줄이고, LLM·checkpointer용 cap은 위 상수를 씁니다.
+
+**초과 시**
+
+앞부분만 남기고 꼬리에 안내를 붙입니다.
+
+```text
+…[truncated tool result: kept 31880/1850000 chars (~1%).
+Ask for a narrower URL/section if you need more.]
+```
+
+턴 합 예산이 소진되면 이후 `ToolMessage`는 짧은 `turn tool-result budget exhausted` 문구만 남깁니다.
+
+**관련 함수**
+
+```python
+# runtime_agent/langgraph/langgraph_agent.py
+TOOL_RESULT_MAX_CHARS = 32_000
+TOOL_RESULTS_TURN_MAX_CHARS = 120_000
+
+def truncate_tool_result_text(content, *, max_chars=..., budget_remaining=...) -> str: ...
+def cap_tool_messages(messages, *, per_result_max=..., turn_max=...) -> list: ...
+def _cap_tool_node_result(result) -> dict: ...
+```
+
+단위 테스트: [runtime_agent/langgraph/test_tool_result_cap.py](./runtime_agent/langgraph/test_tool_result_cap.py)
+
+**Message Trim과의 관계**
+
+| 보호 | 무엇을 줄이는가 | 무엇을 못 막는가 |
+|------|-----------------|------------------|
+| Message Trim (`max_turns`) | 오래된 **턴** | 한 턴 안의 거대 tool 결과 |
+| Tool Result Cap | **각/합산 tool 결과 크기** | 오래된 턴 자체 |
+
+둘 다 켜 두는 것이 정상 구성입니다. CloudWatch에서 `tool result truncated: tool_call_id=...` 로그로 cap 적용 여부를 확인할 수 있습니다.
+
 ### Prompt Caching
 
 LangGraph tool loop마다 반복되는 **system prompt + tool schema**에 [Amazon Bedrock prompt caching](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html)을 적용합니다.

@@ -1524,6 +1524,136 @@ BASE_SYSTEM_PROMPT = (
 
 MAX_CONTEXT_TURNS = 5
 
+# Cap ToolMessage payloads before they enter LLM context / checkpointer.
+# Char-based (deterministic, no tokenizer on the hot path). Prevents web_fetch
+# get_raw_text and similar MCP tools from blowing past the ~1M model window.
+TOOL_RESULT_MAX_CHARS = 32_000
+TOOL_RESULTS_TURN_MAX_CHARS = 120_000
+
+
+def _tool_content_to_text(content) -> str:
+    """Normalize ToolMessage.content to a single string for size checks."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                if "text" in item:
+                    parts.append(str(item["text"]))
+                elif "content" in item:
+                    parts.append(str(item["content"]))
+                else:
+                    parts.append(str({k: v for k, v in item.items() if k != "id"}))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+    return str(content)
+
+
+def truncate_tool_result_text(
+    content: str,
+    *,
+    max_chars: int = TOOL_RESULT_MAX_CHARS,
+    budget_remaining: int | None = None,
+) -> str:
+    """Hard-cap a single tool result; leave a short notice when truncated."""
+    if not content:
+        return content
+    limit = max_chars
+    if budget_remaining is not None:
+        limit = min(limit, max(0, budget_remaining))
+    if len(content) <= limit:
+        return content
+    if limit <= 0:
+        # Stay within budget strictly (no notice that would push past 0).
+        return ""
+    # Reserve room for the notice so total stays within limit when possible.
+    notice_template = (
+        "\n\n…[truncated tool result: kept {kept}/{total} chars "
+        "(~{pct}%). Ask for a narrower URL/section if you need more.]"
+    )
+    # Estimate notice length with actual digits.
+    sample = notice_template.format(
+        kept=limit, total=len(content), pct=100
+    )
+    kept = max(0, limit - len(sample))
+    notice = notice_template.format(
+        kept=kept,
+        total=len(content),
+        pct=max(1, 100 * kept // max(len(content), 1)),
+    )
+    # If notice alone exceeds limit, return a short hard notice.
+    if len(notice) >= limit:
+        short = f"…[truncated: 0/{len(content)} chars]"
+        return short[:limit] if len(short) > limit else short
+    kept = max(0, limit - len(notice))
+    return content[:kept] + notice
+
+
+def cap_tool_messages(
+    messages: list,
+    *,
+    per_result_max: int = TOOL_RESULT_MAX_CHARS,
+    turn_max: int = TOOL_RESULTS_TURN_MAX_CHARS,
+) -> list:
+    """Truncate ToolMessage contents; enforce a per-turn aggregate budget."""
+    if not messages:
+        return messages
+    budget = turn_max
+    out: list = []
+    for msg in messages:
+        if not isinstance(msg, ToolMessage):
+            out.append(msg)
+            continue
+        text = _tool_content_to_text(msg.content)
+        if budget <= 0:
+            capped = (
+                f"…[truncated tool result: kept 0/{len(text)} chars "
+                "(turn tool-result budget exhausted)]"
+            )
+        else:
+            capped = truncate_tool_result_text(
+                text, max_chars=per_result_max, budget_remaining=budget
+            )
+            # Never exceed remaining turn budget (notice length edge cases).
+            if len(capped) > budget:
+                capped = capped[:budget]
+        if capped != text:
+            logger.info(
+                "tool result truncated: tool_call_id=%s %s→%s chars "
+                "(per_result_max=%s turn_budget_left=%s)",
+                getattr(msg, "tool_call_id", None),
+                len(text),
+                len(capped),
+                per_result_max,
+                budget,
+            )
+        if budget > 0:
+            budget = max(0, budget - len(capped))
+        kwargs = {"content": capped, "tool_call_id": msg.tool_call_id}
+        name = getattr(msg, "name", None)
+        if name:
+            kwargs["name"] = name
+        out.append(ToolMessage(**kwargs))
+    return out
+
+
+def _cap_tool_node_result(result):
+    """Apply tool-result caps to a ToolNode return value ({messages: [...]})."""
+    if not isinstance(result, dict):
+        return result
+    msgs = result.get("messages")
+    if not msgs:
+        return result
+    capped = cap_tool_messages(list(msgs))
+    updated = dict(result)
+    updated["messages"] = capped
+    return updated
+
+
 # Bedrock Anthropic/Nova prompt caching (ephemeral, 1h TTL).
 # Bedrock supports "5m" (default) or "1h" for Claude cache_control.ttl; all
 # Claude models currently in info.py (Fable/Mythos 5.x, Opus 4.5-5, Sonnet
@@ -1711,6 +1841,9 @@ async def call_model(state: State, config):
             else:
                 messages.append(msg)
 
+        # Cap again so older checkpointer payloads cannot blow the window.
+        messages = cap_tool_messages(messages)
+
         max_turns = (
             config.get("configurable", {}).get("max_turns")
             or config.get("max_turns")
@@ -1877,9 +2010,10 @@ async def _action_node(state: State, config, tool_node: ToolNode):
     try:
         while True:
             try:
-                return await asyncio.wait_for(
+                result = await asyncio.wait_for(
                     asyncio.shield(invoke_task), timeout=0.25
                 )
+                return _cap_tool_node_result(result)
             except asyncio.TimeoutError:
                 if run_cancel.is_cancelled(cancel_id):
                     logger.info(
