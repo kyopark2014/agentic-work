@@ -603,10 +603,8 @@ async def agent_langgraph(payload):
 
                 normalized = mcp_apps_host.normalize_tool_result_text(tool_result_text)
                 artifact = getattr(chunk, "artifact", None)
-                structured = (
-                    artifact.get("structured_content")
-                    if isinstance(artifact, dict)
-                    else None
+                structured = mcp_apps_host.extract_structured_content(
+                    artifact, normalized, tool_name, app_tool_input
                 )
                 mcp_app = mcp_apps_host.build_app_payload(
                     tool_name, normalized, structured, app_tool_input

@@ -80,6 +80,119 @@ def _fallback_weather_app(tool_name: str) -> dict[str, Any] | None:
     return get_tool_app(tool_name)
 
 
+# use-vault MCP App viewer switches on structuredContent.kind.
+_VAULT_TOOL_KIND = {
+    "vault_search": "search",
+    "vault_read": "note",
+    "vault_list": "list",
+    "vault_tree": "tree",
+    "vault_graph": "graph",
+    "vault_backlinks": "backlinks",
+}
+
+
+def _merge_tool_input_fields(
+    out: dict[str, Any], tool_input: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Fill path/title/query from the tool call args when the result body omitted them."""
+    if not isinstance(tool_input, dict):
+        return out
+    path = tool_input.get("path")
+    if isinstance(path, str) and path.strip() and not out.get("path"):
+        cleaned = path.strip()
+        out["path"] = cleaned
+        if not out.get("title"):
+            out["title"] = cleaned.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    query = tool_input.get("query")
+    if isinstance(query, str) and query.strip() and not out.get("query"):
+        out["query"] = query.strip()
+    prefix = tool_input.get("prefix")
+    if isinstance(prefix, str) and not out.get("prefix") and "prefix" in tool_input:
+        out["prefix"] = prefix
+    return out
+
+
+def extract_structured_content(
+    artifact: Any,
+    tool_result_text: str,
+    tool_name: str | None = None,
+    tool_input: dict[str, Any] | None = None,
+) -> Any:
+    """Build UI ``structuredContent`` from ToolMessage artifact and/or text.
+
+    Remote MCP over AgentCore sometimes omits ``ToolMessage.artifact``. The vault
+    viewer then parses content JSON; if that JSON is truncated it has no ``kind``
+    and shows an empty state. Recover kind from the tool name when needed, and
+    slim large note bodies so mcpApp fits in the SSE/srcdoc path.
+    """
+    import json
+    import re
+
+    structured: Any = None
+    if isinstance(artifact, dict):
+        structured = artifact.get("structured_content") or artifact.get(
+            "structuredContent"
+        )
+
+    parsed: dict[str, Any] | None = None
+    if isinstance(structured, dict):
+        parsed = dict(structured)
+    elif isinstance(tool_result_text, str):
+        stripped = tool_result_text.strip()
+        if stripped.startswith("{"):
+            try:
+                value = json.loads(stripped)
+            except json.JSONDecodeError:
+                value = None
+            if isinstance(value, dict):
+                parsed = value
+            else:
+                # Truncated JSON: salvage path / title / a short content preview.
+                salvaged: dict[str, Any] = {}
+                for key in ("path", "title", "query", "prefix"):
+                    m = re.search(
+                        rf'"{key}"\s*:\s*"((?:\\.|[^"\\])*)"', stripped
+                    )
+                    if m:
+                        try:
+                            salvaged[key] = json.loads(f'"{m.group(1)}"')
+                        except json.JSONDecodeError:
+                            salvaged[key] = m.group(1)
+                m = re.search(r'"content"\s*:\s*"((?:\\.|[^"\\]){0,800})', stripped)
+                if m:
+                    try:
+                        salvaged["content"] = json.loads(f'"{m.group(1)}"')
+                    except json.JSONDecodeError:
+                        salvaged["content"] = m.group(1)
+                if salvaged:
+                    parsed = salvaged
+
+    kind = None
+    if isinstance(parsed, dict):
+        kind = parsed.get("kind")
+    if not kind:
+        kind = _VAULT_TOOL_KIND.get((tool_name or "").strip())
+
+    if not isinstance(parsed, dict):
+        out = {"ok": True, "kind": kind} if kind else structured
+        if isinstance(out, dict):
+            return _merge_tool_input_fields(out, tool_input)
+        return out
+
+    if parsed.get("ok") is False:
+        return parsed
+
+    out = {**parsed, "ok": parsed.get("ok", True)}
+    if kind:
+        out["kind"] = kind
+    out.pop("content_html", None)
+    if out.get("kind") == "note" and isinstance(out.get("content"), str):
+        content = out["content"]
+        if len(content) > 2000:
+            out["content"] = content[:2000]
+    return _merge_tool_input_fields(out, tool_input)
+
+
 def build_app_payload(
     tool_name: str | None,
     tool_result_text: str,
@@ -91,12 +204,38 @@ def build_app_payload(
     )
     if not app:
         return None
-    tool_result: dict[str, Any] = {
-        "content": [{"type": "text", "text": tool_result_text}],
-    }
-    # MCP Apps UIs (e.g. Canva) read the tool's ``structuredContent`` directly.
-    if structured_content is not None:
-        tool_result["structuredContent"] = structured_content
+    import json
+
+    # Always try to produce a kind-bearing structuredContent for vault tools.
+    structured_content = extract_structured_content(
+        {"structured_content": structured_content}
+        if structured_content is not None
+        else None,
+        tool_result_text,
+        tool_name,
+        tool_input,
+    )
+    # Prefer structuredContent for the iframe. Do not also embed the full model
+    # text (vault_read notes can be 50KB+); duplicating it in SSE/srcdoc makes
+    # the vault viewer fall back to an empty state.
+    if isinstance(structured_content, dict) and structured_content.get("kind"):
+        stub: dict[str, Any] = {"ok": True}
+        for key in ("ok", "kind", "path", "query", "prefix"):
+            if key in structured_content:
+                stub[key] = structured_content[key]
+        tool_result: dict[str, Any] = {
+            "content": [{"type": "text", "text": json.dumps(stub, ensure_ascii=False)}],
+            "structuredContent": structured_content,
+        }
+    elif structured_content is not None:
+        tool_result = {
+            "content": [{"type": "text", "text": tool_result_text}],
+            "structuredContent": structured_content,
+        }
+    else:
+        tool_result = {
+            "content": [{"type": "text", "text": tool_result_text}],
+        }
     payload: dict[str, Any] = {**app, "toolResult": tool_result}
     if payload.get("mcpServer") in HOST_FETCHED_SERVERS:
         # The web host reads the ui:// resource itself (and applies its _meta.ui.csp).

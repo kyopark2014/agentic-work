@@ -98,12 +98,64 @@ def build_app_payload(
     )
     if not app:
         return None
-    tool_result: dict[str, Any] = {
-        "content": [{"type": "text", "text": tool_result_text}],
+    import json
+
+    # Mirror runtime_agent/langgraph/mcp_apps_host.py (recover kind when artifact dropped).
+    _VAULT_TOOL_KIND = {
+        "vault_search": "search",
+        "vault_read": "note",
+        "vault_list": "list",
+        "vault_tree": "tree",
+        "vault_graph": "graph",
+        "vault_backlinks": "backlinks",
     }
-    # MCP Apps UIs (e.g. use-vault) read ``structuredContent`` (kind/list/files).
-    if structured_content is not None:
-        tool_result["structuredContent"] = structured_content
+
+    if not (isinstance(structured_content, dict) and structured_content.get("kind")):
+        parsed = structured_content if isinstance(structured_content, dict) else None
+        if parsed is None and isinstance(tool_result_text, str):
+            stripped = tool_result_text.strip()
+            if stripped.startswith("{"):
+                try:
+                    value = json.loads(stripped)
+                except json.JSONDecodeError:
+                    value = None
+                if isinstance(value, dict):
+                    parsed = value
+        kind = (parsed or {}).get("kind") if isinstance(parsed, dict) else None
+        if not kind:
+            kind = _VAULT_TOOL_KIND.get((tool_name or "").strip())
+        if isinstance(parsed, dict):
+            structured_content = {**parsed, "ok": parsed.get("ok", True)}
+            if kind:
+                structured_content["kind"] = kind
+            structured_content.pop("content_html", None)
+            if (
+                structured_content.get("kind") == "note"
+                and isinstance(structured_content.get("content"), str)
+                and len(structured_content["content"]) > 2000
+            ):
+                structured_content["content"] = structured_content["content"][:2000]
+        elif kind:
+            structured_content = {"ok": True, "kind": kind}
+
+    if isinstance(structured_content, dict) and structured_content.get("kind"):
+        stub: dict[str, Any] = {"ok": True}
+        for key in ("ok", "kind", "path", "query", "prefix"):
+            if key in structured_content:
+                stub[key] = structured_content[key]
+        tool_result: dict[str, Any] = {
+            "content": [{"type": "text", "text": json.dumps(stub, ensure_ascii=False)}],
+            "structuredContent": structured_content,
+        }
+    elif structured_content is not None:
+        tool_result = {
+            "content": [{"type": "text", "text": tool_result_text}],
+            "structuredContent": structured_content,
+        }
+    else:
+        tool_result = {
+            "content": [{"type": "text", "text": tool_result_text}],
+        }
     payload: dict[str, Any] = {**app, "toolResult": tool_result}
     if isinstance(tool_input, dict):
         payload["toolInput"] = tool_input
