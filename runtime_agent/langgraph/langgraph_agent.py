@@ -60,7 +60,9 @@ USER_SKILLS_DIR = utils.get_user_skills_dir("default")
 CURRENT_USER_ID: str | None = None
 _ALLOWED_S3_PREFIXES = ("artifacts/", "images/", "docs/")
 
-# Fixed/per-user roots for bash ($SKILLS_DIR etc.). Per-skill paths use skill.SKILL_DIRS.
+# Fixed/per-user roots for bash ($WORKING_DIR / $SKILLS_DIR etc.).
+# Per-skill paths use skill.SKILL_DIRS.
+os.environ["WORKING_DIR"] = WORKING_DIR
 os.environ["SKILLS_DIR"] = SKILLS_DIR
 os.environ["ARTIFACTS_DIR"] = ARTIFACTS_DIR
 os.environ["USER_SKILLS_DIR"] = USER_SKILLS_DIR
@@ -996,7 +998,7 @@ def execute_code(code: str) -> str:
     - PDF → '.pdf', Excel → '.xlsx' 등 실제 형식에 맞는 확장자를 사용하세요.
 
     Path variables (pre-defined, do NOT redefine):
-    - WORKING_DIR: absolute path to application directory
+    - WORKING_DIR: absolute path to application directory; also $WORKING_DIR / os.environ["WORKING_DIR"]
     - SKILLS_DIR: absolute path to builtin skills (WORKING_DIR/skills); also $SKILLS_DIR in bash
     - ARTIFACTS_DIR: absolute path to this user's artifacts ({SESSION_STORAGE_DIR}/{user_id}/artifacts)
     - USER_SKILLS_DIR: absolute path to this user's skills ({SESSION_STORAGE_DIR}/{user_id}/skills)
@@ -1232,6 +1234,7 @@ def bash(command: str) -> str:
 
     Path env already set by the runtime (do not guess or search USER_SKILLS_DIR
     for builtin engines):
+    - $WORKING_DIR: application/runtime root (fixed; cwd for this tool)
     - $SKILLS_DIR: builtin skills parent (fixed)
     - $USER_SKILLS_DIR: this user's skills root
     - $ARTIFACTS_DIR: this user's artifacts

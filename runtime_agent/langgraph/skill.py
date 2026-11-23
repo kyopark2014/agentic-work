@@ -30,11 +30,14 @@ sharing_url = config.get("sharing_url")
 
 def _export_workspace_path_env(
     *,
+    working_dir: str | None = None,
     skills_dir: str | None = None,
     user_skills_dir: str | None = None,
     artifacts_dir: str | None = None,
 ) -> None:
     """Expose fixed/per-user roots to bash via os.environ (not per-skill SKILL_DIR)."""
+    if working_dir is not None:
+        os.environ["WORKING_DIR"] = working_dir
     if skills_dir is not None:
         os.environ["SKILLS_DIR"] = skills_dir
     if user_skills_dir is not None:
@@ -52,6 +55,7 @@ def register_skill_path(name: str, path: str) -> None:
 
 # Builtin parent is fixed for the process lifetime.
 _export_workspace_path_env(
+    working_dir=WORKING_DIR,
     skills_dir=SKILLS_DIR,
     user_skills_dir=USER_SKILLS_DIR,
     artifacts_dir=ARTIFACTS_DIR,
@@ -357,7 +361,7 @@ def build_skill_prompt(skill_info: list) -> str:
         
     path_info = (
         f"## Paths (use absolute paths for write_file, read_file)\n"
-        f"- WORKING_DIR: {WORKING_DIR}\n"
+        f"- WORKING_DIR: {WORKING_DIR} (also exported as $WORKING_DIR)\n"
         f"- SKILLS_DIR: {SKILLS_DIR} "
         f"(builtin skills; also exported as $SKILLS_DIR; "
         f"e.g. last30days → {os.path.join(SKILLS_DIR, 'last30days')})\n"
@@ -432,7 +436,7 @@ def build_command_prompt(plugin_name: str, command: str) -> str:
 
     path_info = (
         f"## Paths (use absolute paths for write_file, read_file)\n"
-        f"- WORKING_DIR: {WORKING_DIR}\n"
+        f"- WORKING_DIR: {WORKING_DIR} (also exported as $WORKING_DIR)\n"
         f"- SKILLS_DIR: {SKILLS_DIR} "
         f"(builtin skills; also exported as $SKILLS_DIR; "
         f"e.g. last30days → {os.path.join(SKILLS_DIR, 'last30days')})\n"
