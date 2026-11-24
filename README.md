@@ -1510,7 +1510,7 @@ Human(Q2) → AI(A2) → Human(Q3) → AI(tool_calls) → ToolMessage → AI(A3)
 
 턴 수 trim만으로는 **한 턴 안의 거대 `ToolMessage`**(예: `web_fetch`의 `get_raw_text`)를 막지 못합니다. MCP/builtin 도구 결과가 그대로 checkpointer와 다음 `call_model`에 쌓이면 Claude/GPT의 **~1M 컨텍스트 한도**를 넘겨 `ValidationException: prompt is too long` → UI에는 `"답변을 찾지 못하였습니다."`로만 보일 수 있습니다. (모델 업그레이드로는 해결되지 않습니다. 최신 Claude/GPT도 ≤ ~1.05M입니다.)
 
-이를 막기 위해 [runtime_agent/langgraph/langgraph_agent.py](./runtime_agent/langgraph/langgraph_agent.py)에서 **문자 기준 hard cap**을 적용합니다.
+이를 막기 위해 [runtime_agent/langgraph/langgraph_agent.py](./runtime_agent/langgraph/langgraph_agent.py)에서 **문자 기준 cap**을 적용합니다. 한도를 넘는 결과는 먼저 **LLM 요약**하고, 요약 실패 시에만 **hard truncate**합니다.
 
 **기본값**
 
@@ -1518,6 +1518,8 @@ Human(Q2) → AI(A2) → Human(Q3) → AI(tool_calls) → ToolMessage → AI(A3)
 |------|------|-----|
 | 도구 결과 1개 | `TOOL_RESULT_MAX_CHARS` | **32,000** chars |
 | 같은 Human 턴의 tool 결과 합 | `TOOL_RESULTS_TURN_MAX_CHARS` | **120,000** chars |
+| 요약 목표 길이 | `TOOL_RESULT_SUMMARY_TARGET_CHARS` | **8,000** chars |
+| 요약 청크 크기 | `TOOL_RESULT_SUMMARY_CHUNK_CHARS` | **60,000** chars |
 
 **삽입 위치**
 
@@ -1526,16 +1528,24 @@ Human(Q2) → AI(A2) → Human(Q3) → AI(tool_calls) → ToolMessage → AI(A3)
 
 UI/SSE의 `truncate_for_stream`(약 8k)과 **별개**입니다. SSE는 화면용으로만 줄이고, LLM·checkpointer용 cap은 위 상수를 씁니다.
 
-**초과 시**
+**초과 시 (우선순위)**
 
-앞부분만 남기고 꼬리에 안내를 붙입니다.
+1. **Summarize** — `summarize_oversized_tool_result`가 내용을 압축합니다. 입력이 크면 60k 단위 map-reduce 요약 후 병합합니다. 결과 형태:
+
+```text
+[summarized tool result: 1850000→7200 chars, tool=get_raw_text]
+
+(핵심 사실·경로·에러·숫자 위주 요약)
+```
+
+2. **Hard truncate (폴백)** — 요약 실패·타임아웃·이미 요약된 payload 재처리 시 앞부분만 남기고 꼬리에 안내를 붙입니다.
 
 ```text
 …[truncated tool result: kept 31880/1850000 chars (~1%).
 Ask for a narrower URL/section if you need more.]
 ```
 
-턴 합 예산이 소진되면 이후 `ToolMessage`는 짧은 `turn tool-result budget exhausted` 문구만 남깁니다.
+턴 합 예산이 소진되면 이후 `ToolMessage`는 짧은 `turn tool-result budget exhausted` 문구만 남깁니다. `tool_call_id`는 유지되므로 Bedrock tool_use/tool_result 쌍은 깨지지 않습니다.
 
 **관련 함수**
 
@@ -1543,10 +1553,12 @@ Ask for a narrower URL/section if you need more.]
 # runtime_agent/langgraph/langgraph_agent.py
 TOOL_RESULT_MAX_CHARS = 32_000
 TOOL_RESULTS_TURN_MAX_CHARS = 120_000
+TOOL_RESULT_SUMMARY_TARGET_CHARS = 8_000
 
+def summarize_oversized_tool_result(content, *, target_chars=..., tool_name=...) -> str | None: ...
 def truncate_tool_result_text(content, *, max_chars=..., budget_remaining=...) -> str: ...
-def cap_tool_messages(messages, *, per_result_max=..., turn_max=...) -> list: ...
-def _cap_tool_node_result(result) -> dict: ...
+def cap_tool_messages(messages, *, per_result_max=..., turn_max=..., summarize=True) -> list: ...
+def _cap_tool_node_result(result, *, summarize=True) -> dict: ...
 ```
 
 단위 테스트: [runtime_agent/langgraph/test_tool_result_cap.py](./runtime_agent/langgraph/test_tool_result_cap.py)
@@ -1556,9 +1568,9 @@ def _cap_tool_node_result(result) -> dict: ...
 | 보호 | 무엇을 줄이는가 | 무엇을 못 막는가 |
 |------|-----------------|------------------|
 | Message Trim (`max_turns`) | 오래된 **턴** | 한 턴 안의 거대 tool 결과 |
-| Tool Result Cap | **각/합산 tool 결과 크기** | 오래된 턴 자체 |
+| Tool Result Cap (+ summarize) | **각/합산 tool 결과 크기** | 오래된 턴 자체 |
 
-둘 다 켜 두는 것이 정상 구성입니다. CloudWatch에서 `tool result truncated: tool_call_id=...` 로그로 cap 적용 여부를 확인할 수 있습니다.
+둘 다 켜 두는 것이 정상 구성입니다. CloudWatch에서 `tool result summarized:` / `tool result truncated:` 로그로 적용 여부를 확인할 수 있습니다.
 
 ### Prompt Caching
 
