@@ -2,17 +2,41 @@
 
 from __future__ import annotations
 
+import copy
 import json
+import math
 import re
 import unicodedata
 from collections import Counter
+from contextlib import nullcontext
+from threading import Event
 
-from . import categories, competitors, entity_extract, http, providers, query, relevance, schema
+from . import (
+    categories, competitors, entity_extract, http, jobs_story, log, polymarket, providers, query, relevance,
+    schema,
+)
 
 # Hebrew Unicode block: U+0590–U+05FF
 _HEBREW_RE = re.compile(r'[\u0590-\u05FF]')
 
 DISCOVERY_SOURCE_ORDER = ("reddit", "hackernews", "digg", "x")
+
+# Installed/opted-in lanes that can be backfilled into a host plan.
+HOST_PLAN_BACKFILL_SOURCES = (
+    "digg",
+    "arxiv",
+    "techmeme",
+    "bluesky",
+    "truthsocial",
+    "stocktwits",
+    "linkedin",
+    "dripstack",
+    "devto",
+    "v2ex",
+    "juejin",
+    "telegram",
+    "trustpilot",
+)
 
 
 def detect_language(text: str) -> str | None:
@@ -141,8 +165,12 @@ SOURCE_CAPABILITIES = {
     "tiktok": {"video", "video_shortform", "social"},
     "instagram": {"video", "video_shortform", "social"},
     "hackernews": {"discussion", "link"},
+    "devto": {"discussion", "link", "reference"},
+    "v2ex": {"discussion"},
+    "juejin": {"discussion", "link", "reference"},
     "bluesky": {"discussion", "social"},
     "truthsocial": {"discussion", "social"},
+    "linkedin": {"discussion", "social"},
     "polymarket": {"market"},
     "stocktwits": {"social", "market", "finance_social"},
     "dripstack": {"reference", "analysis", "link"},
@@ -150,13 +178,93 @@ SOURCE_CAPABILITIES = {
     "arxiv": {"reference", "analysis", "link"},
     "techmeme": {"discussion", "link", "reference"},
     "trustpilot": {"reference", "company_signal", "social"},
+    "amazon": {"reference", "company_signal", "product_signal"},
+    "meta_ads": {"reference", "company_signal", "product_signal"},
     "xiaohongshu": {"video", "video_shortform", "social"},
+    "telegram": {"discussion", "social"},
     "github": {"discussion", "link"},
     "grounding": {"web", "reference", "link"},
     "perplexity": {"web", "reference", "analysis"},
     "jobs": {"jobs", "company_signal", "link"},
     "corpus": {"reference", "analysis"},
 }
+KNOWN_SOURCES: frozenset[str] = frozenset(SOURCE_CAPABILITIES) | {
+    "threads",
+    "pinterest",
+    "linkedin_profile",
+}
+
+
+def _is_identity_anchor(anchor: object) -> bool:
+    return isinstance(anchor, str) and re.search(r"\w", anchor) is not None
+
+
+POLYMARKET_HINT_KINDS = ("team", "company", "person", "product", "other")
+POLYMARKET_HINT_RELATIONS = ("player", "person", "product")
+POLYMARKET_HINT_CAP = polymarket.HINT_CAP
+POLYMARKET_HINT_NAME_MAX = 80
+
+
+def _hint_name(value: object) -> str | None:
+    if isinstance(value, str) and value.strip() and len(value.strip()) <= POLYMARKET_HINT_NAME_MAX:
+        return value.strip()
+    return None
+
+
+def polymarket_hints(value: object) -> dict | None:
+    """Validate and normalize a plan's ``polymarket_hints``.
+
+    Returns None when absent; raises ValueError naming the bad part otherwise.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("polymarket_hints must be an object with kind, aliases, related")
+    unknown = sorted(set(value) - {"kind", "aliases", "related"})
+    if unknown:
+        raise ValueError(f"polymarket_hints has unknown fields {unknown}")
+    hints: dict = {}
+    kind = value.get("kind")
+    if kind is not None:
+        if not isinstance(kind, str) or kind.strip().casefold() not in POLYMARKET_HINT_KINDS:
+            raise ValueError(
+                f"polymarket_hints.kind must be one of {', '.join(POLYMARKET_HINT_KINDS)}"
+            )
+        hints["kind"] = kind.strip().casefold()
+    aliases = value.get("aliases", [])
+    if (
+        not isinstance(aliases, list)
+        or len(aliases) > POLYMARKET_HINT_CAP
+        or not all(_hint_name(alias) for alias in aliases)
+    ):
+        raise ValueError(
+            f"polymarket_hints.aliases must be an array of at most {POLYMARKET_HINT_CAP} "
+            f"non-empty strings of up to {POLYMARKET_HINT_NAME_MAX} characters"
+        )
+    hints["aliases"] = [_hint_name(alias) for alias in aliases]
+    related = value.get("related", [])
+    if (
+        not isinstance(related, list)
+        or len(related) > POLYMARKET_HINT_CAP
+        or not all(
+            isinstance(entry, dict)
+            and set(entry) <= {"name", "relation"}
+            and _hint_name(entry.get("name"))
+            and isinstance(entry.get("relation"), str)
+            and entry["relation"].strip().casefold() in POLYMARKET_HINT_RELATIONS
+            for entry in related
+        )
+    ):
+        raise ValueError(
+            f"polymarket_hints.related must be an array of at most {POLYMARKET_HINT_CAP} "
+            "{name, relation} objects with relation one of "
+            + ", ".join(POLYMARKET_HINT_RELATIONS)
+        )
+    hints["related"] = [
+        {"name": _hint_name(entry["name"]), "relation": entry["relation"].strip().casefold()}
+        for entry in related
+    ]
+    return hints
 
 
 def validate_external_plan(raw: dict) -> None:
@@ -173,6 +281,22 @@ def validate_external_plan(raw: dict) -> None:
     for field in ("intent", "freshness_mode", "cluster_mode"):
         if not isinstance(raw[field], str) or not raw[field].strip():
             raise ValueError(f"field '{field}' must be a non-empty string")
+
+    anchors = raw.get("person_identity_anchors", [])
+    if not isinstance(anchors, list) or not all(_is_identity_anchor(a) for a in anchors):
+        raise ValueError("person_identity_anchors must be an array of non-empty strings")
+    polymarket_hints(raw.get("polymarket_hints"))
+
+    omit_sources = raw.get("omit_sources", [])
+    if not isinstance(omit_sources, list) or not all(
+        isinstance(source, str) and source in HOST_PLAN_BACKFILL_SOURCES
+        for source in omit_sources
+    ):
+        raise ValueError(
+            "omit_sources must be an array of source names eligible for host-plan backfill: "
+            + ", ".join(HOST_PLAN_BACKFILL_SOURCES)
+        )
+    omitted = set(omit_sources)
 
     source_weights = raw.get("source_weights")
     if source_weights is not None and not isinstance(source_weights, dict):
@@ -199,6 +323,11 @@ def validate_external_plan(raw: dict) -> None:
             isinstance(source, str) and source.strip() for source in sources
         ):
             raise ValueError(f"subqueries[{index}].sources must be a non-empty string array")
+        if overlap := omitted.intersection(sources):
+            raise ValueError(
+                f"omit_sources conflicts with subqueries[{index}].sources: "
+                + ", ".join(sorted(overlap))
+            )
         weight = subquery.get("weight")
         if weight is not None and (
             isinstance(weight, bool) or not isinstance(weight, (int, float))
@@ -284,25 +413,39 @@ def build_drill_plan(
             for source in schema.candidate_sources(candidate):
                 if source and source not in sources:
                     sources.append(source)
-    if not sources:
-        raise DrillTargetError(target, report.clusters)
-
-    titles: list[str] = []
-    entity_counts: Counter[str] = Counter()
+    cluster_titles: list[str] = []
+    representative_titles: list[str] = []
     for cluster in matched:
-        titles.append(cluster.title)
-        entity_counts.update(entity_extract.extract_text_entities(cluster.title))
+        cluster_titles.append(cluster.title)
         for candidate_id in cluster.representative_ids:
             candidate = candidates.get(candidate_id)
             if candidate:
-                titles.append(candidate.title)
-                entity_counts.update(entity_extract.extract_text_entities(candidate.title))
+                representative_titles.append(candidate.title)
 
+    if schema.report_has_corpus(report):
+        public_titles, public_sources = _public_drill_evidence(matched, candidates)
+        if public_titles:
+            # A cached cluster title may have come from a private representative.
+            cluster_titles = public_titles[:1]
+            representative_titles = public_titles[1:]
+            sources = list(dict.fromkeys(
+                [source for source in sources if source == "corpus" or source in public_sources]
+                + public_sources
+            ))
+        else:
+            sources = ["corpus"] if "corpus" in sources else []
+
+    if not sources:
+        raise DrillTargetError(target, report.clusters)
+
+    entity_counts: Counter[str] = Counter()
+    for title in [*cluster_titles, *representative_titles]:
+        entity_counts.update(entity_extract.extract_text_entities(title))
     queries: list[str] = []
     for query_text in [
-        " ".join(titles[: len(matched)]),
+        " ".join(cluster_titles),
         " ".join(entity for entity, _ in entity_counts.most_common(8)),
-        *titles[len(matched):],
+        *representative_titles,
     ]:
         query_text = " ".join(query_text.split()).strip()
         if query_text and query_text.lower() not in {item.lower() for item in queries}:
@@ -328,6 +471,9 @@ def build_drill_plan(
         freshness_mode=report.query_plan.freshness_mode,
         cluster_mode=report.query_plan.cluster_mode,
         raw_topic=report.topic,
+        person_identity_anchors=list(report.query_plan.person_identity_anchors),
+        person_run=report.query_plan.person_run,
+        polymarket_hints=copy.deepcopy(report.query_plan.polymarket_hints),
         subqueries=subqueries,
         source_weights={
             source: report.query_plan.source_weights.get(source, 1.0)
@@ -339,6 +485,31 @@ def build_drill_plan(
         ],
     )
 
+
+def _public_drill_evidence(
+    clusters: list[schema.Cluster],
+    candidates: dict[str, schema.Candidate],
+) -> tuple[list[str], list[str]]:
+    titles: list[str] = []
+    sources: list[str] = []
+    for cluster in clusters:
+        for candidate_id in dict.fromkeys([*cluster.representative_ids, *cluster.candidate_ids]):
+            candidate = candidates.get(candidate_id)
+            if candidate is None:
+                continue
+            if schema.candidate_has_corpus(candidate):
+                # A fused candidate can retain public members even when its
+                # chosen title or snippet belongs to a local file.
+                for item in candidate.source_items:
+                    if item.source and item.source != "corpus" and item.title.strip():
+                        titles.append(item.title)
+                        sources.append(item.source)
+            elif candidate.title.strip() and schema.candidate_sources(candidate):
+                titles.append(candidate.title)
+                sources.extend(schema.candidate_sources(candidate))
+    return titles, list(dict.fromkeys(sources))
+
+
 def plan_query(
     *,
     topic: str,
@@ -349,6 +520,8 @@ def plan_query(
     model: str | None,
     context: str = "",
     internal_subrun: bool = False,
+    deadline: float | None = None,
+    cancel: Event | None = None,
 ) -> schema.QueryPlan:
     """Create a query plan. Comparison queries with extractable entities use a
     deterministic plan; other intents prefer the configured reasoning provider.
@@ -356,7 +529,11 @@ def plan_query(
     internal_subrun: when True, suppress the LAW 7 "No --plan passed" stderr
     warning. LAW 7 targets the hosting-reasoning-model path; competitor
     fan-out sub-runs are engine-internal and the warning is a false positive
-    there. Default False preserves the warning on every user-facing invocation.
+    there. Default False preserves the warning on every user-facing invocation
+    that ends on the deterministic fallback, including a failed internal
+    planner. On a detected agent host the CLI stops a plan-less research run
+    before this is reached, apart from its documented exemptions and the
+    ``LAST30DAYS_ALLOW_ENGINE_PLAN`` override (``last30days._law7_host_plan_gate``).
     """
     if _should_force_deterministic_plan(topic):
         return _fallback_plan(
@@ -371,13 +548,25 @@ def plan_query(
         prompt += f"\n\nCurrent context (from web search): {context}"
     if provider and model:
         try:
-            raw = provider.generate_json(model, prompt)
-            plan = _sanitize_plan(raw, topic, available_sources, requested_sources, depth)
+            budget = (
+                provider.request_budget(deadline, cancel, attempts=2)
+                if deadline is not None else nullcontext()
+            )
+            with budget:
+                raw = provider.generate_json(model, prompt)
+            plan = _sanitize_plan(
+                raw, topic, available_sources, requested_sources, depth,
+            )
             if plan.subqueries:
                 return plan
         except (ValueError, KeyError, json.JSONDecodeError, OSError, http.HTTPError) as exc:
             import sys
             print(f"[Planner] LLM planning failed, using deterministic fallback: {type(exc).__name__}: {exc}", file=sys.stderr)
+            # A failed internal planner (e.g. HTTP 402, no credits) degrades
+            # the run exactly like having none, and the host may not be
+            # detectable, so the LAW 7 reminder applies here too.
+            if not internal_subrun:
+                _print_law7_reminder()
             return _fallback_plan(
                 topic, available_sources, requested_sources, depth,
                 note=f"fallback-plan (LLM error: {type(exc).__name__})",
@@ -392,17 +581,22 @@ def plan_query(
     # the hosting reasoning model, YOU are the provider. LAW 7 / 2026-04-19
     # Hermes Agent Use Cases failure mode.
     if not internal_subrun:
-        import sys
-        print(
-            "[Planner] No --plan passed. If you are the reasoning model hosting "
-            "this skill (Claude Code, Codex, Hermes, Gemini, or any agent runtime), "
-            "YOU ARE the planner: generate a JSON query plan yourself and pass it "
-            "via --plan. You do not need an API key or credentials; you ARE the "
-            "LLM. The deterministic fallback below is the headless/cron path only. "
-            "See LAW 7 in SKILL.md and Step 0.75 for the plan schema.",
-            file=sys.stderr,
-        )
+        _print_law7_reminder()
     return _fallback_plan(topic, available_sources, requested_sources, depth)
+
+
+def _print_law7_reminder() -> None:
+    import sys
+    print(
+        "[Planner] No --plan passed. If you are the reasoning model hosting "
+        "this skill (Claude Code, Codex, Hermes, Gemini, or any agent runtime), "
+        "YOU ARE the planner: generate a JSON query plan yourself and pass it "
+        "via --plan. You do not need an API key or credentials; you ARE the "
+        "LLM. The deterministic fallback below is the headless/cron path only. "
+        "See LAW 7 in SKILL.md and Step 0.75 in references/research-runbook.md "
+        "for the plan schema.",
+        file=sys.stderr,
+    )
 
 
 def _build_prompt(
@@ -436,16 +630,19 @@ Return JSON only with this shape:
       "weight": 1.0
     }}
   ],
+  "person_identity_anchors": [],
   "notes": ["optional short notes"]
 }}
 
 Rules:
+- for a collision-prone person, preserve specific company/organization identity anchors explicitly supplied in the topic in person_identity_anchors; for an organization whose first word also names other people or things, use its full name (["Pace Capital"]), never a topic plus a search descriptor ("Stripe payments"); otherwise use []; never invent affiliations or use the shared name/generic role as an anchor
 - emit 1 to 5 subqueries (how_to/opinion/product/breaking_news intents benefit from 4-5; factual/concept from 2)
 - every subquery must include both search_query and ranking_query
 - sources must be drawn from Available sources only
 - use cluster_mode=none for factual or many how-to queries
 - use strict_recent for breaking news and most predictions
 - use debate for comparison/opinion, market for prediction, workflow for how_to, story for breaking_news
+- ENABLEMENT: when the topic asks how to make a named tool or agent control, operate, drive, automate, or use a computer, browser, desktop, laptop, screen, or phone ("X control my computer", "get X to use my browser"), use intent=how_to and cluster_mode=workflow, never comparison. Emit 4-5 subqueries that find what gives the named tool that capability: its own built-in route, plus third-party MCP servers, CLIs, browser or desktop automation tools, and extensions it can use. Keep the named tool in two or three search_query strings, and make at least one search_query capability-only without the named tool (e.g. 'computer use MCP server', 'browser automation CLI agent').
 - search_query should be concise and keyword-heavy
 - ranking_query should read like a natural-language question
 - preserve exact proper nouns and entity strings from the topic
@@ -458,67 +655,180 @@ Rules:
 """.strip()
 
 
+def _sanitize_source_weights(
+    raw_weights: object,
+    *,
+    available: set[str],
+    requested: set[str],
+    eligible_sources: list[str],
+    topic: str,
+    intent_hint: str,
+    depth: str,
+) -> dict[str, float]:
+    recognized_sources = KNOWN_SOURCES | available
+    recognized_raw_positive: list[float] = []
+    explicit_weights: dict[str, float] = {}
+    if isinstance(raw_weights, dict):
+        for source, weight in raw_weights.items():
+            # Skip unknown/typo source keys so they neither join the plan nor
+            # trigger normalized-weight detection; real disabled sources still
+            # count in recognized_raw_positive.
+            if source not in recognized_sources or isinstance(weight, bool):
+                continue
+            try:
+                numeric = float(weight)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not math.isfinite(numeric):
+                continue
+            if numeric > 0:
+                recognized_raw_positive.append(numeric)
+            if source in available and (not requested or source in requested):
+                explicit_weights[source] = numeric
+    source_weights = dict(explicit_weights)
+    if not source_weights:
+        source_weights = _default_source_weights(_infer_intent(topic), eligible_sources)
+    # Preserve the base weight of 1.0 for raw unnormalized boost maps (e.g.
+    # {"reddit": 3.0} keeps Reddit's 3:1 boost over an unweighted source), and
+    # use the mean of the filtered eligible weights whenever either the filtered
+    # weights or the recognized raw plan weights already sum to ~1.0 so omitted
+    # or backfilled sources sit at the planned mean even when a real planned
+    # source is disabled.
+    basis_weights = explicit_weights if explicit_weights else source_weights
+    positive_basis = [weight for weight in basis_weights.values() if weight > 0]
+    normalized_filtered = (
+        len(positive_basis) >= 2 and abs(sum(positive_basis) - 1.0) <= 0.05
+    )
+    normalized_recognized_raw = (
+        bool(explicit_weights)
+        and len(recognized_raw_positive) >= 2
+        and abs(sum(recognized_raw_positive) - 1.0) <= 0.05
+    )
+    if positive_basis and (normalized_filtered or normalized_recognized_raw):
+        default_weight = sum(positive_basis) / len(positive_basis)
+    else:
+        default_weight = 1.0
+    for source in eligible_sources:
+        source_weights.setdefault(source, default_weight)
+    if intent_hint in DEFAULT_INTENT_CAPABILITIES and depth != "quick":
+        for source in _default_sources_for_intent(intent_hint, eligible_sources):
+            source_weights.setdefault(source, default_weight)
+    return _normalize_weights(source_weights)
+
+
 def _sanitize_plan(
     raw: dict,
     topic: str,
     available_sources: list[str],
     requested_sources: list[str] | None,
     depth: str,
+    *,
+    honor_plan_sources: bool = False,
 ) -> schema.QueryPlan:
     intent_hint = str(raw.get("intent") or _infer_intent(topic)).strip()
     if intent_hint not in ALLOWED_INTENTS:
         intent_hint = _infer_intent(topic)
+    # The LLM planner reads "best X to control my computer" as a comparison
+    # and plans a strict-recent debate about X. An enablement topic without an
+    # explicit comparison is a how-to; an explicit --plan keeps its intent.
+    enablement_override = (
+        not honor_plan_sources
+        and intent_hint != "how_to"
+        and _is_enablement(topic)
+        and _infer_intent(topic) == "how_to"
+    )
+    if enablement_override:
+        intent_hint = "how_to"
     requested = set(requested_sources or [])
     available = set(available_sources)
     eligible_sources = [
         source for source in available_sources
         if (not requested or source in requested)
     ]
-    source_weights = {
-        source: float(weight)
-        for source, weight in (raw.get("source_weights") or {}).items()
-        if source in available
-    }
-    if requested:
-        source_weights = {source: weight for source, weight in source_weights.items() if source in requested}
-    if not source_weights:
-        source_weights = _default_source_weights(_infer_intent(topic), eligible_sources)
-    # Ensure all eligible sources are available for subqueries. The LLM may
-    # assign high weights to its preferred sources, but omitted sources still
-    # participate with base weight so retrieval can overfetch and let fusion
-    # decide quality.
-    for source in eligible_sources:
-        source_weights.setdefault(source, 1.0)
-    if intent_hint in DEFAULT_INTENT_CAPABILITIES and depth != "quick":
-        for source in _default_sources_for_intent(intent_hint, eligible_sources):
-            source_weights.setdefault(source, 1.0)
-    source_weights = _normalize_weights(source_weights)
+    source_weights = _sanitize_source_weights(
+        raw.get("source_weights"),
+        available=available,
+        requested=requested,
+        eligible_sources=eligible_sources,
+        topic=topic,
+        intent_hint=intent_hint,
+        depth=depth,
+    )
 
     subqueries: list[schema.SubQuery] = []
-    for index, subquery in enumerate((raw.get("subqueries") or [])[:_max_subqueries(intent_hint, topic)], start=1):
+    raw_subqueries = raw.get("subqueries")
+    if not isinstance(raw_subqueries, list):
+        raw_subqueries = []
+    max_subqueries = _max_subqueries(intent_hint, topic)
+    if honor_plan_sources:
+        raw_subqueries = raw_subqueries[:max_subqueries]
+    # A malformed provider row should not cost a usable query its slot.
+    for index, subquery in enumerate(raw_subqueries, start=1):
         if not isinstance(subquery, dict):
             continue
-        sources = [source for source in subquery.get("sources") or [] if source in source_weights]
+        raw_sources = subquery.get("sources")
+        sources = [
+            source for source in raw_sources
+            if isinstance(source, str) and source in source_weights
+        ] if isinstance(raw_sources, list) else []
         if requested:
             sources = [source for source in sources if source in requested]
         if not sources:
+            if honor_plan_sources:
+                label = str(subquery.get("label") or f"q{index}")
+                log.source_log(
+                    "Planner",
+                    f"Skipping external-plan subquery {label}: none of its planned "
+                    "sources are available under the current source configuration.",
+                    tty_only=False,
+                )
+                continue
             sources = list(source_weights)
-        search_query = str(subquery.get("search_query") or "").strip()
-        ranking_query = str(subquery.get("ranking_query") or "").strip()
+        if not sources:
+            continue
+        search_query = subquery.get("search_query")
+        ranking_query = subquery.get("ranking_query")
+        if not isinstance(search_query, str) or not isinstance(ranking_query, str):
+            continue
+        search_query = search_query.strip()
+        ranking_query = ranking_query.strip()
         if not search_query or not ranking_query:
             continue
+        raw_weight = subquery.get("weight")
+        try:
+            weight = float(raw_weight or 1.0)
+        except (TypeError, ValueError, OverflowError):
+            weight = 1.0
+        if not math.isfinite(weight):
+            weight = 1.0
         subqueries.append(
             schema.SubQuery(
                 label=str(subquery.get("label") or f"q{index}").strip() or f"q{index}",
                 search_query=search_query,
                 ranking_query=ranking_query,
                 sources=sources,
-                weight=max(0.05, float(subquery.get("weight") or 1.0)),
+                weight=max(0.05, weight),
             )
         )
+        if len(subqueries) == max_subqueries:
+            break
+    if (
+        depth != "quick"
+        and subqueries
+        and not honor_plan_sources
+        and intent_hint == "how_to"
+        and _is_enablement(topic)
+        and not _has_capability_subquery(subqueries, _enablement_host(topic))
+    ):
+        subqueries.extend(_enablement_subqueries(topic, list(source_weights), start=len(subqueries) + 1)[:1])
     if depth == "quick" and subqueries:
         subqueries = subqueries[:1]
     if not subqueries:
+        if honor_plan_sources:
+            raise ValueError(
+                "No available planned sources remain. Enable a source named in "
+                "--plan or revise the plan/source configuration; no retrieval was started."
+            )
         return _fallback_plan(topic, available_sources, requested_sources, depth)
 
     intent = intent_hint
@@ -526,9 +836,23 @@ def _sanitize_plan(
     if intent == "how_to":
         freshness_mode = "evergreen_ok"
     cluster_mode = str(raw.get("cluster_mode") or _default_cluster_mode(intent)).strip()
+    if enablement_override:
+        cluster_mode = _default_cluster_mode(intent)
     if cluster_mode not in ALLOWED_CLUSTER_MODES:
         cluster_mode = _default_cluster_mode(intent)
 
+    # --plan input was already validated strictly; a malformed field from the
+    # internal LLM planner degrades to unscoped instead of discarding its plan.
+    anchors = raw.get("person_identity_anchors")
+    if not isinstance(anchors, list):
+        anchors = []
+    try:
+        hints = polymarket_hints(raw.get("polymarket_hints"))
+    except ValueError:
+        hints = None
+    notes = raw.get("notes")
+    if not isinstance(notes, list):
+        notes = []
     return schema.QueryPlan(
         intent=intent,
         freshness_mode=freshness_mode,
@@ -541,10 +865,15 @@ def _sanitize_plan(
                 depth,
                 eligible_sources,
                 requested_sources=requested_sources,
+                honor_plan_sources=honor_plan_sources,
             )
         ),
         source_weights=source_weights,
-        notes=[str(note).strip() for note in raw.get("notes") or [] if str(note).strip()],
+        notes=[note.strip() for note in notes if isinstance(note, str) and note.strip()]
+        + (_enablement_notes(topic) if not honor_plan_sources and intent == "how_to" and _is_enablement(topic) else []),
+        person_identity_anchors=[a.strip() for a in anchors if _is_identity_anchor(a)],
+        polymarket_hints=hints,
+        jobs_queries=jobs_story.clean_terms(raw.get("jobs_queries")),
     )
 
 
@@ -576,12 +905,19 @@ def _trim_subqueries_for_depth(
     depth: str,
     available_sources: list[str],
     requested_sources: list[str] | None = None,
+    honor_plan_sources: bool = False,
 ) -> list[schema.SubQuery]:
     # At non-quick depth, expand sources: use capability routing for intents
     # that define it, or all available sources otherwise. The LLM planner may
     # assign narrow source lists; we override to let fusion decide quality.
-    if depth != "quick":
+    # Operator-supplied --plan is a contract: keep per-subquery sources.
+    if depth != "quick" and not honor_plan_sources:
         expanded_sources = _default_sources_for_intent(intent, available_sources)
+        # Explicit --search sources are a user override: intent routing must not drop them.
+        expanded_sources += [
+            source for source in available_sources
+            if source in (requested_sources or []) and source not in expanded_sources
+        ]
         return [
             schema.SubQuery(
                 label=subquery.label,
@@ -651,15 +987,37 @@ def _fallback_plan(
     note: str = "fallback-plan",
 ) -> schema.QueryPlan:
     intent = _infer_intent(topic)
+    available_set = set(available_sources)
+    if requested_sources:
+        eligible = list(dict.fromkeys(
+            s for s in requested_sources if s in available_set
+        ))
+        effective_requested: list[str] | None = eligible
+    else:
+        eligible = list(dict.fromkeys(available_sources))
+        effective_requested = None
+
     # Hebrew-language topics: elevate web search (grounding) to the front of
     # the source list since Reddit/HN/GitHub are English-dominant platforms.
     # Grounding covers Ynet, Walla, Mako, N12 etc. if a web search key is set.
-    if detect_language(topic) == 'he' and 'grounding' in available_sources:
-        ordered = ['grounding'] + [s for s in available_sources if s != 'grounding']
-        available_sources = ordered
-        if requested_sources:
-            requested_sources = ['grounding'] + [s for s in requested_sources if s != 'grounding']
-    allowed_sources = requested_sources or available_sources
+    # Only reorder when grounding is already eligible — never inject it into an
+    # explicit --search list that omitted grounding.
+    if detect_language(topic) == 'he' and 'grounding' in eligible:
+        eligible = ['grounding'] + [s for s in eligible if s != 'grounding']
+        if effective_requested is not None:
+            effective_requested = list(eligible)
+
+    allowed_sources = eligible
+    if not allowed_sources:
+        return schema.QueryPlan(
+            intent=intent,
+            freshness_mode=_default_freshness(intent),
+            cluster_mode=_default_cluster_mode(intent),
+            raw_topic=topic,
+            subqueries=[],
+            source_weights={},
+            notes=[note] + (_enablement_notes(topic) if intent == "how_to" and _is_enablement(topic) else []),
+        )
     source_weights = _default_source_weights(intent, allowed_sources)
     core = query.extract_core_subject(topic, max_words=6, strip_suffixes=True)
     base_search = _keyword_query(topic, core)
@@ -707,6 +1065,9 @@ def _fallback_plan(
             )
         )
 
+    if depth != "quick" and intent == "how_to" and _is_enablement(topic):
+        subqueries.extend(_enablement_subqueries(topic, list(source_weights)))
+
     # Intent-modifier fanout: when topic contains a phrase like "use cases",
     # "workflows", "examples", "review" (see _INTENT_MODIFIER_PATTERNS),
     # paraphrase the intent across 3 extra subqueries rather than echoing
@@ -727,12 +1088,138 @@ def _fallback_plan(
                 intent,
                 depth,
                 list(source_weights),
-                requested_sources=requested_sources,
+                requested_sources=effective_requested,
             )
         ),
         source_weights=_normalize_weights(source_weights),
-        notes=[note],
+        notes=[note] + (_enablement_notes(topic) if intent == "how_to" and _is_enablement(topic) else []),
     )
+
+
+_SLASH_COMPARISON = re.compile(r"\b[A-Z][a-z]{2,}(?:/[A-Z][a-z]{2,})+\b")
+
+
+# Plan notes marking a topic that asks how to give a named tool (the host) a
+# capability. Rerank reads them to keep capability-only search results, which
+# name the tool that delivers the capability rather than the host, out of the
+# entity cap.
+ENABLEMENT_NOTE = "enablement"
+ENABLEMENT_HOST_NOTE = "enablement-host:"
+_HOST_FILLER = frozenset(
+    "a an the best top good which what how to can i we get make let have that "
+    "who is are for my your our some any".split()
+)
+_GENERIC_HOST = frozenset("ai agent agents bot bots tool tools app apps assistant llm model".split())
+
+_DEVICE = r"(?:my|the|your|our)\s+(?:own\s+)?(?:computer|mac|pc|desktop|laptop|browser|screen|phone|terminal)s?\b"
+# Mirrors the hosted service worker's detect_enablement_intent.
+# A tool acting on a device the person owns: "grok bot control my computer",
+# "agent that automates the browser". Plain "use the browser" is ordinary use.
+_ENABLEMENT_TARGET_RE = re.compile(
+    r"\b(?P<verb>control(?:s|ling)?|operat(?:e|es|ing)|automat(?:e|es|ing))\s+" + _DEVICE,
+    re.IGNORECASE,
+)
+# A named tool made to act on the device: "get claude to control my browser",
+# "make chatgpt use my mac". The lookahead keeps people and idioms out, as in
+# "let my kid use the phone", "make kids use the computer", "make sure I use".
+_ENABLEMENT_AGENT_RE = re.compile(
+    r"\b(?:get|make|let|have)\s+"
+    r"(?!(?:to|me|us|them|you|sure|my|your|our|his|her|their|the\s+most|kids?|children|teens?|users?|people|customers?|employees?|students?|staff|team)\b)"
+    r"[\w.-]+(?:\s+[\w.-]+){0,2}?\s+(?:to\s+)?"
+    r"(?P<verb>control(?:s|ling)?|operat(?:e|es|ing)|drives?|automat(?:e|es|ing)|uses?)\s+" + _DEVICE,
+    re.IGNORECASE,
+)
+# Asking for news about device control is not asking how to enable it. Bare
+# "latest" or "released" stays allowed: "get the latest Claude to use my mac".
+_ENABLEMENT_NEWS_RE = re.compile(
+    r"\b(?:news|headlines?|announce(?:d|s|ment)|breaking"
+    r"|just\s+(?:shipped|launched|released)"
+    r"|(?:launch(?:ed|es)|release[sd]|unveil(?:ed|s)|ships)\s+(?:a|an|its|new)\b)",
+    re.IGNORECASE,
+)
+# A threat as the actor ("malware controlling my browser") is a security topic.
+# Only words before the verb count, so "...my browser without malware" is fine.
+_ENABLEMENT_THREAT_RE = re.compile(
+    r"\b(?:malware|virus(?:es)?|spyware|ransomware|trojans?|keyloggers?|rootkits?"
+    r"|hack(?:ed|er|ers)|scam(?:s|mers?)?|attackers?|someone|somebody|stranger)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_enablement(topic: str) -> bool:
+    """The topic asks how to give a named tool a capability, such as
+    controlling the person's computer. That is a how-to, not a comparison."""
+    if _ENABLEMENT_NEWS_RE.search(topic):
+        return False
+    for pattern in (_ENABLEMENT_TARGET_RE, _ENABLEMENT_AGENT_RE):
+        for match in pattern.finditer(topic):
+            if not _ENABLEMENT_THREAT_RE.search(topic, 0, match.start("verb")):
+                return True
+    return False
+
+
+def _enablement_host(topic: str) -> str:
+    """The named tool an enablement topic wants to give a capability, as one
+    lowercase token ("grok" for "best Grok AI bot to control my computer"), or
+    "" when the topic names no distinctive tool ("agent that automates the
+    desktop")."""
+    match = _ENABLEMENT_AGENT_RE.search(topic) or _ENABLEMENT_TARGET_RE.search(topic)
+    if not match:
+        return ""
+    if match.re is _ENABLEMENT_AGENT_RE:
+        words = re.findall(r"[\w.-]+", match.group(0).lower())[1:]
+    else:
+        words = re.findall(r"[\w.-]+", topic[: match.start()].lower())
+    words = [word for word in words if word not in _HOST_FILLER]
+    if not words or words[0] in _GENERIC_HOST:
+        return ""
+    return words[0]
+
+
+def _enablement_notes(topic: str) -> list[str]:
+    host = _enablement_host(topic)
+    return [ENABLEMENT_NOTE] + ([f"{ENABLEMENT_HOST_NOTE}{host}"] if host else [])
+
+
+def _enablement_capability_queries(topic: str) -> list[str]:
+    """Capability-only searches for an enablement topic, without the named tool.
+
+    General tools (MCP servers, agent CLIs) rarely appear in posts that name
+    the host, so the plan searches for the capability itself as well.
+    """
+    match = _ENABLEMENT_TARGET_RE.search(topic) or _ENABLEMENT_AGENT_RE.search(topic)
+    device = match.group(0).lower() if match else ""
+    if "browser" in device:
+        return ["browser automation MCP server", "browser automation CLI for AI agents"]
+    if "phone" in device:
+        return ["phone automation MCP server for AI agents", "AI agent control phone app automation"]
+    if "terminal" in device:
+        return ["terminal MCP server for AI agents", "AI agent shell CLI tool"]
+    if "mac" in device.split():
+        return ["macOS computer use MCP server", "macOS automation CLI for AI agents"]
+    return ["computer use MCP server", "desktop automation CLI for AI agents"]
+
+
+def _has_capability_subquery(subqueries, host: str) -> bool:
+    # Must leave out the host: fusion.capability_labels ignores searches that name it.
+    return any(
+        re.search(r"\b(?:mcp|cli|computer[- ]use|automation)\b", sq.search_query, re.IGNORECASE)
+        and not (host and re.search(rf"\b{re.escape(host)}", sq.search_query, re.IGNORECASE))
+        for sq in subqueries
+    )
+
+
+def _enablement_subqueries(topic: str, sources: list[str], start: int = 1) -> list[schema.SubQuery]:
+    return [
+        schema.SubQuery(
+            label=f"capability-{index}",
+            search_query=search,
+            ranking_query=f"Which tools, MCP servers, or CLIs give an AI agent this capability, as asked in '{topic}'?",
+            sources=list(sources),
+            weight=0.7,
+        )
+        for index, search in enumerate(_enablement_capability_queries(topic), start=start)
+    ]
 
 
 def _infer_intent(topic: str) -> str:
@@ -740,11 +1227,11 @@ def _infer_intent(topic: str) -> str:
     if re.search(r"\b(vs|versus|compare|compared to|difference between)\b", text):
         return "comparison"
     # Slash-separated proper nouns: "React/Vue/Svelte" (not URLs, not acronyms like CI/CD or I/O)
-    if not re.search(r"https?://", topic) and re.search(r"\b[A-Z][a-z]{2,}(?:/[A-Z][a-z]{2,})+\b", topic):
+    if not re.search(r"https?://", topic) and _SLASH_COMPARISON.search(topic):
         return "comparison"
     if re.search(r"\b(odds|predict|prediction|forecast|chance|probability|will .* win)\b", text):
         return "prediction"
-    if re.search(r"\b(how to|tutorial|guide|setup|step by step|deploy|install)\b", text):
+    if _is_enablement(topic) or re.search(r"\b(how to|tutorial|guide|setup|step by step|deploy|install)\b", text):
         return "how_to"
     if re.search(r"\b(what is|what are|who is|who acquired|when did|parameter count|release date)\b", text):
         return "factual"
@@ -829,14 +1316,32 @@ def _keyword_query(topic: str, core: str) -> str:
     that exact phrase. See 2026-04-19 Hermes Agent Use Cases failure.
     """
     compounds = query.extract_compound_terms(topic)
-    # Only quote title-cased proper nouns (multi-word names). Hyphenated
+    # Only quote short (2-3 word) capitalized/brand proper nouns. Hyphenated
     # compounds go unquoted so platform tokenizers can split and match.
     title_cased = [
         term for term in compounds
-        if re.match(r"^(?:[A-Z][a-z]+\s+){1,}[A-Z][a-z]+$", term)
+        if query.COMPOUND_ENTITY_PHRASE_RE.fullmatch(term)
     ]
-    quoted = " ".join(f'"{term}"' for term in title_cased[:2])
-    keywords = [quoted.strip(), core.strip() or topic.strip()]
+    selected = title_cased[:2]
+    quoted = " ".join(f'"{term}"' for term in selected)
+    remainder = core.strip() or topic.strip()
+    # Drop words already carried by a quoted phrase. Emitting both produced
+    # '"Peter Steinberger" peter steinberger steipete', which reads to a
+    # provider as the phrase AND each of its words again -- strictly narrower
+    # than the phrase alone, and on X it degraded to a bare token conjunction
+    # once the quotes were stripped downstream. Distinct tokens (here
+    # "steipete") are preserved.
+    if selected and remainder:
+        phrase_words = {
+            word.lower()
+            for term in selected
+            for word in term.split()
+        }
+        remainder = " ".join(
+            word for word in remainder.split()
+            if word.strip('"').lower() not in phrase_words
+        )
+    keywords = [quoted.strip(), remainder.strip()]
     return " ".join(part for part in keywords if part).strip()
 
 
@@ -859,7 +1364,13 @@ def _comparison_entities(topic: str, *, uncapped: bool = False) -> list[str]:
 
     Caps at ``competitors.COMPARISON_ENTITY_MAX`` unless ``uncapped`` (caller
     truncates and may warn about dropped entities).
+
+    Standalone comparator tokens are syntax, including repeated tokens.
+    Compact ``vs.`` separates entities only after a nonempty left entity.
     """
+    if _infer_intent(topic) != "comparison":
+        return []
+
     # "difference between X and Y" -> "X vs Y" (replace "and" only in this context)
     normalized = re.sub(
         r"\bdifference between\s+(.+?)\s+and\s+",
@@ -868,11 +1379,25 @@ def _comparison_entities(topic: str, *, uncapped: bool = False) -> list[str]:
         flags=re.I,
     )
     normalized = re.sub(r"\b(compared to)\b", " vs ", normalized, flags=re.I)
-    parts = [
-        part.strip(" \t\r\n?.,:;!()[]{}\"'")
-        for part in re.split(r"\bvs\.?\b|\bversus\b|/", normalized, flags=re.I)
-        if part.strip(" \t\r\n?.,:;!()[]{}\"'")
-    ]
+    separator = r"(?<!\S)(?:(?P<standalone>vs\.?|versus)(?!\S)|vs\.(?=\S))"
+    if not re.search(separator, normalized, flags=re.I):
+        if re.search(r"https?://", normalized):
+            return []
+        normalized = _SLASH_COMPARISON.sub(
+            lambda match: match.group(0).replace("/", " vs "), normalized,
+        )
+    trim = " \t\r\n?.,:;!()[]{}\"'"
+    parts = []
+    part_start = 0
+    for match in re.finditer(separator, normalized, flags=re.I):
+        part = normalized[part_start:match.start()].strip(trim)
+        if part:
+            parts.append(part)
+        if part or match.group("standalone") is not None:
+            part_start = match.end()
+    last_part = normalized[part_start:].strip(trim)
+    if last_part:
+        parts.append(last_part)
     # Strip trailing context from parts ("Svelte for frontend in 2026" -> "Svelte")
     if len(parts) < 2:
         return []

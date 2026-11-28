@@ -1,8 +1,9 @@
 """GitHub Issues/PRs search via the public GitHub Search API.
 
-Uses api.github.com/search/issues for issue/PR discovery and
-per-item comment enrichment. Auth via GITHUB_TOKEN env var or
-`gh auth token` subprocess fallback.
+Uses api.github.com/search/issues for issue/PR discovery and per-item comment
+enrichment. Search and repository metadata can use GITHUB_TOKEN or
+`gh auth token` for higher limits. Comments, READMEs, and releases use the
+anonymous REST tier because those responses do not certify repository visibility.
 """
 
 import json
@@ -11,17 +12,20 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait as futures_wait
+from http.client import HTTPException
+from typing import Any, Callable, Dict, List, Optional
 
 from . import dates, env, http, log, schema
 from .query import extract_core_subject
 from .relevance import token_overlap_relevance
 
 SEARCH_URL = "https://api.github.com/search/issues"
+_REPO_SLUG = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 
 DEPTH_LIMITS = {
     "quick": 15,
@@ -69,10 +73,7 @@ def _resolve_token(token: Optional[str] = None) -> Optional[str]:
 def resolve_token(token: Optional[str] = None) -> Optional[str]:
     """Public alias for ``_resolve_token``.
 
-    The pipeline calls this once before ``search_github`` and
-    ``enrich_with_comments`` so the ``gh auth token`` subprocess fallback
-    only fires once per query when ``GITHUB_TOKEN`` is unset, instead of
-    twice (once per call site).
+    The pipeline uses this to select the authenticated search tier.
     """
     return _resolve_token(token)
 
@@ -80,7 +81,7 @@ def resolve_token(token: Optional[str] = None) -> Optional[str]:
 def _fetch_json(
     url: str,
     token: Optional[str] = None,
-    timeout: int = 15,
+    timeout: float = 15,
     failure_out: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Fetch JSON from GitHub API. Returns None on failure.
@@ -102,7 +103,7 @@ def _fetch_json(
 
     req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with http.open_request(req, timeout) as resp:
             body = resp.read().decode("utf-8")
             return json.loads(body)
     except urllib.error.HTTPError as e:
@@ -117,11 +118,11 @@ def _fetch_json(
         _log(f"HTTP {e.code}: {e.reason}")
         _note(f"HTTP {e.code}: {e.reason}")
         return None
-    except (urllib.error.URLError, OSError, TimeoutError) as e:
+    except (urllib.error.URLError, OSError, TimeoutError, HTTPException) as e:
         _log(f"Network error: {e}")
         _note(f"network error: {e}")
         return None
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
         _log(f"JSON decode error: {e}")
         _note(f"invalid JSON: {e}")
         return None
@@ -166,26 +167,113 @@ def _compute_relevance(
     return round(relevance, 2)
 
 
+# Issue search matches body text, so an off-topic query still returns a full
+# page: keyword-stuffed spam issues and passing mentions in unrelated repos.
+# Their search rank is as good as a real hit's, so the blended score above
+# cannot separate them. A keyword result is kept only when its title names the
+# topic or its repo is named for it. 0.25 sits just above the 0.24 cap that
+# token_overlap_relevance gives a match on generic words alone.
+TOPICAL_FLOOR = 0.25
+
+
+def _clears_topical_floor(topic: str, title: str, repo: str) -> bool:
+    """True when a keyword-search result is about ``topic``.
+
+    Rank and engagement play no part. Person and project modes never call this.
+    """
+    repo_words = re.sub(r"[/_.\-]+", " ", repo)
+    return max(
+        token_overlap_relevance(topic, title),
+        token_overlap_relevance(topic, repo_words),
+    ) >= TOPICAL_FLOOR
+
+
 # GitHub search qualifiers the planner sometimes writes straight into the topic
 # string (e.g. "open source AI stars:>1000 created:>2025-03-20"). They must not
 # reach the query builder in `search_github`: it appends its own
-# `created:>{from_date}`, and when two `created:` qualifiers collide GitHub
+# `created:{from_date}..{to_date}`, and when two `created:` qualifiers collide GitHub
 # honours the FIRST and silently ignores ours. The API then returns
 # out-of-window items that `parse_github_response`'s date filter drops
 # wholesale — a source that fetches results and reports zero (issue #949).
+# Qualifiers may also arrive fully wrapped in one pair of parens/brackets/
+# quotes ("(created:>2025-03-20)", '"stars:>1000"'), which an LLM planner
+# plausibly emits; _WRAPPED_QUALIFIER_RE consumes the whole wrapper pair with
+# the qualifier so no stray `()`/`""` residue reaches the query (issue #952).
+# The plain regex's boundary also accepts wrapper openers so a qualifier with
+# a missing closer ("(created:>2025-03-20") is still stripped rather than
+# leaking into the query; qualifier-only wrapper residue is discarded below.
 QUALIFIER_KEYS = frozenset({
-    "archived", "assignee", "author", "base", "closed", "comments", "commenter",
-    "created", "fork", "forks", "head", "in", "interactions", "involves", "is",
-    "label", "language", "license", "linked", "mentions", "merged", "milestone",
-    "no", "org", "project", "pushed", "reactions", "repo", "review",
-    "review-requested", "reviewed-by", "size", "sort", "stars", "state", "team",
-    "topic", "topics", "type", "updated", "user",
+    "answered", "archived", "assignee", "author", "base", "category", "closed",
+    "comments", "commenter", "created", "draft", "fork", "forks", "head", "in",
+    "interactions", "involves", "is", "label", "language", "license", "linked",
+    "mentions", "merged", "milestone", "no", "org", "owner", "parent-issue",
+    "project", "pushed", "reactions", "reason", "repo", "review",
+    "review-requested", "reviewed-by", "sha", "size", "sort", "stars", "state",
+    "status", "sub-issue", "team", "topic", "topics", "type", "updated", "user",
+    "visibility",
 })
 
+_QUALIFIER_KEYS_ALT = "|".join(sorted(QUALIFIER_KEYS, key=lambda k: (-len(k), k)))
+
 _QUALIFIER_RE = re.compile(
-    r"(?:(?<=[\s,;])|^)(?:" + "|".join(sorted(QUALIFIER_KEYS)) + r"):(?:[<>]=?)?(?:\"[^\"]*\"|[^\s,;()\[\]]+)[,;]?",
+    r"(?:(?<=[\s,;(\)\[\]\"'])|^)[-+]*?(?:"
+    + _QUALIFIER_KEYS_ALT
+    + r"):(?:[<>]=?)?(?:\([^)]*\)|\"[^\"]*\"|\([^\s,;()\[\]]+|[^\s,;()\[\]]+)[,;]?",
     re.IGNORECASE,
 )
+
+# A qualifier fully wrapped in a single pair of parens/brackets/quotes. The
+# wrapper pair is consumed with the qualifier, so stripping leaves no residue.
+# Optional leading +/- negation before the wrapper (e.g. `-(is:public)`,
+# `-"is:public"`) is consumed when bounded by whitespace/punctuation.
+# An unbalanced quote (e.g. `label:"bug`) is not a wrapper shape and is left
+# to _QUALIFIER_RE, which strips the qualifier as before.
+_WRAPPED_QUALIFIER_RE = re.compile(
+    r"(?:(?:(?<=[\s,;(\)\[\]\"'])|^)[-+]+)?[\(\[\"'][-+]*(?:"
+    + _QUALIFIER_KEYS_ALT
+    + r"):(?:[<>]=?)?(?:\([^)]*\)|\"[^\"]*\"|[^\s,;()\[\]\"']+)[\)\]\"']",
+    re.IGNORECASE,
+)
+
+_ESCAPED_QUOTE_RE = re.compile(r'(?<!\\)\\+(?=")')
+_BRACKET_OPEN_FOR_CLOSE = {")": "(", "]": "["}
+
+
+def _collapse_empty_wrappers(text: str) -> str:
+    """Collapse nested empty (), [], "", '' pairs (ignoring inner whitespace) in O(N)."""
+    out: list[str] = []
+    non_ws_indices: list[int] = []
+    in_dquote = False
+    in_squote = False
+    for ch in text:
+        bracket_opener = _BRACKET_OPEN_FOR_CLOSE.get(ch)
+        if bracket_opener is not None:
+            if non_ws_indices and out[non_ws_indices[-1]] == bracket_opener:
+                open_idx = non_ws_indices.pop()
+                del out[open_idx:]
+                continue
+        elif ch == '"':
+            if in_dquote:
+                in_dquote = False
+                if non_ws_indices and out[non_ws_indices[-1]] == '"':
+                    open_idx = non_ws_indices.pop()
+                    del out[open_idx:]
+                    continue
+            else:
+                in_dquote = True
+        elif ch == "'":
+            if in_squote:
+                in_squote = False
+                if non_ws_indices and out[non_ws_indices[-1]] == "'":
+                    open_idx = non_ws_indices.pop()
+                    del out[open_idx:]
+                    continue
+            else:
+                in_squote = True
+        if not ch.isspace():
+            non_ws_indices.append(len(out))
+        out.append(ch)
+    return "".join(out)
 
 
 def strip_search_qualifiers(text: str) -> str:
@@ -195,7 +283,50 @@ def strip_search_qualifiers(text: str) -> str:
     but qualifiers; callers must handle that rather than searching on an empty
     term, which would match the entire site.
     """
-    return " ".join(_QUALIFIER_RE.sub(" ", text).split())
+    stripped = _ESCAPED_QUOTE_RE.sub("", text)
+    had_qualifier = False
+
+    def _strip_to_fixpoint(value: str) -> tuple[str, bool]:
+        changed_qualifier = False
+        cur = _collapse_empty_wrappers(value)
+        while True:
+            after_wrap = _WRAPPED_QUALIFIER_RE.sub(" ", cur)
+            after_plain = _QUALIFIER_RE.sub(" ", after_wrap)
+            if after_plain != cur:
+                changed_qualifier = True
+            cleaned = _collapse_empty_wrappers(after_plain)
+            if cleaned == cur:
+                return cur, changed_qualifier
+            cur = cleaned
+
+    stripped, found = _strip_to_fixpoint(stripped)
+    had_qualifier = had_qualifier or found
+
+    # Drop an unmatched trailing double quote so an unclosed phrase in `core`
+    # cannot swallow engine-added qualifiers (`created:...`, `is:issue`).
+    if stripped.count('"') % 2 == 1:
+        idx = stripped.rfind('"')
+        stripped = stripped[:idx] + stripped[idx + 1:]
+        stripped, found = _strip_to_fixpoint(stripped)
+        had_qualifier = had_qualifier or found
+
+    # Malformed/nested wrappers can leave only punctuation after a qualifier
+    # is removed (#969). There is no subject to search in that case. Keep
+    # wrappers around actual topic text, including unbalanced ones like "ai (foo".
+    if had_qualifier and re.fullmatch(r"[\s()\[\]\"'-]*", stripped):
+        return ""
+    return " ".join(stripped.split())
+
+
+# Bound topic fragments in logs/error envelopes so fanout cannot blow them up (#954).
+_DIAGNOSTIC_TOPIC_LIMIT = 120
+
+
+def _truncate_diagnostic(text: str, limit: int = _DIAGNOSTIC_TOPIC_LIMIT) -> str:
+    """Cap a topic fragment used in logs or error envelopes."""
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}..."
 
 
 def search_github(
@@ -204,6 +335,10 @@ def search_github(
     to_date: str,
     depth: str = "default",
     token: Optional[str] = None,
+    *,
+    title_only: bool = True,
+    deadline: Optional[float] = None,
+    stopped: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, Any]:
     """Search GitHub Issues and PRs (HTTP fetch only).
 
@@ -226,22 +361,24 @@ def search_github(
     count = DEPTH_LIMITS.get(depth, DEPTH_LIMITS["default"])
     core = extract_core_subject(topic)
     plain_core = strip_search_qualifiers(core)
-    if plain_core != core:
-        _log(f"Stripped search qualifiers: '{core}' -> '{plain_core}'")
     if not plain_core:
         # A qualifier-only (or empty) topic leaves nothing to search on.
-        # Report it instead of querying an empty term, which would match the
-        # whole site and then be discarded by the date filter as a bogus
-        # "no results" (issue #949).
+        # Skip the network rather than querying an empty term, which would
+        # match the whole site (#949). Return a clean empty envelope, not an
+        # error, so the pipeline records NO_RESULTS instead of ERROR (#953)
+        # and GitHub is not marked as a failed attempt. Mixed-topic strip
+        # logs below stay bounded by _truncate_diagnostic (#954).
         _log("Topic contained only search qualifiers or was empty; nothing to search")
         return {
             "items": [],
             "context": {"core": core, "from_date": from_date,
                         "to_date": to_date, "count": count},
-            "error": (
-                f"GitHub topic contained only search qualifiers or was empty: {topic!r}"
-            ),
         }
+    if plain_core != core:
+        _log(
+            "Stripped search qualifiers: "
+            f"'{_truncate_diagnostic(core)}' -> '{_truncate_diagnostic(plain_core)}'"
+        )
     core = plain_core
     resolved_token = _resolve_token(token)
     authed = bool(resolved_token)
@@ -252,22 +389,99 @@ def search_github(
         _log("No GitHub token; using the unauthenticated REST tier (low rate limit)")
     _log(f"Searching for '{core}' (raw: '{topic}', since {from_date}, count={count})")
 
-    # Build search query with date filter
-    q = f"{core} created:>{from_date}"
-    params = {
-        "q": q,
-        "sort": "reactions",
-        "order": "desc",
-        "per_page": str(min(count, 100)),
-    }
-    url = f"{SEARCH_URL}?{urllib.parse.urlencode(params)}"
+    # Only results whose title names the topic survive the topical floor, so
+    # search titles first: a body search fills the page with popular issues that
+    # merely mention the topic, and the floor then drops all of them. Callers
+    # pass title_only=False as a fallback when planner-expanded queries yield
+    # no title matches.
+    base_q = f"is:public {core} created:{from_date}..{to_date}"
+    if title_only:
+        base_q += " in:title"
+
+    def _search(qualifier: Optional[str]) -> Optional[Dict[str, Any]]:
+        if stopped is not None and stopped():
+            fetch_failures.append("cancelled")
+            return None
+        req_timeout: float = 30.0
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fetch_failures.append("deadline exceeded")
+                return None
+            req_timeout = min(req_timeout, remaining)
+        q = f"{base_q} {qualifier}" if qualifier else base_q
+        params = {
+            "q": q,
+            "sort": "reactions",
+            "order": "desc",
+            "per_page": str(min(count, 100)),
+        }
+        url = f"{SEARCH_URL}?{urllib.parse.urlencode(params)}"
+        return _fetch_json(url, token=resolved_token, timeout=req_timeout,
+                           failure_out=fetch_failures)
 
     fetch_failures: List[str] = []
-    data = _fetch_json(url, token=resolved_token, timeout=30, failure_out=fetch_failures)
+    partition_failure: Optional[str] = None
+    if authed:
+        # GitHub rejects AUTHENTICATED /search/issues queries that carry
+        # neither `is:issue` nor `is:pull-request` (HTTP 422). Anonymous
+        # queries are still grandfathered, which is why this only bites once
+        # a token is present -- including via the `gh auth token` fallback.
+        #
+        # Appending a single qualifier would silently halve the corpus: for
+        # "rust async created:>2026-08-02" GitHub reports 1,072 issues and
+        # 7,044 pull requests against 8,115 combined, so `is:issue` alone
+        # drops ~87% of matches. Query both and merge instead, which keeps
+        # coverage AND the authenticated rate limit.
+        merged: List[Dict[str, Any]] = []
+        seen_ids = set()
+        failed_qualifiers: List[str] = []
+        for qualifier in ("is:issue", "is:pull-request"):
+            if stopped is not None and stopped():
+                fetch_failures.append("cancelled")
+                failed_qualifiers.append(qualifier)
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                fetch_failures.append("deadline exceeded")
+                failed_qualifiers.append(qualifier)
+                break
+            part = _search(qualifier)
+            if part is None:
+                failed_qualifiers.append(qualifier)
+                continue
+            for item in part.get("items", []):
+                item_id = item.get("id")
+                if item_id in seen_ids:
+                    continue
+                seen_ids.add(item_id)
+                merged.append(item)
+        # Both sub-queries are reaction-sorted; the merge is not, so re-sort
+        # before truncating or the second query's tail would outrank the
+        # first query's head.
+        merged.sort(key=lambda i: (i.get("reactions") or {}).get("total_count", 0),
+                    reverse=True)
+        data = {"items": merged[:count]} if merged else None
+        if failed_qualifiers:
+            partition_failure = (
+                f"GitHub partition(s) failed: {', '.join(failed_qualifiers)}"
+                + (f" ({fetch_failures[-1]})" if fetch_failures else "")
+            )
+    else:
+        data = _search(None)
+    stop_reason = (
+        fetch_failures[-1]
+        if fetch_failures and fetch_failures[-1] in {"cancelled", "deadline exceeded"}
+        else None
+    )
     if not data:
         envelope = {"items": [], "context": {"core": core, "from_date": from_date,
                                              "to_date": to_date, "count": count}}
-        if authed and fetch_failures:
+        if stop_reason is not None:
+            envelope["stopped_reason"] = stop_reason
+            envelope["error"] = f"GitHub search timed out ({stop_reason})"
+        elif authed and partition_failure:
+            envelope["error"] = partition_failure
+        elif authed and fetch_failures:
             # Authenticated transport failures must not be laundered into a
             # clean no-results outcome (issue #384).
             envelope["error"] = f"GitHub API request failed: {fetch_failures[-1]}"
@@ -284,7 +498,7 @@ def search_github(
     raw_items = data.get("items", [])
     _log(f"Found {len(raw_items)} issues/PRs")
 
-    return {
+    envelope: Dict[str, Any] = {
         "items": raw_items,
         "context": {
             "core": core,
@@ -293,13 +507,25 @@ def search_github(
             "count": count,
         },
     }
+    if stop_reason is not None:
+        envelope["stopped_reason"] = stop_reason
+    if partition_failure:
+        envelope["error"] = partition_failure
+    return envelope
 
 
-def parse_github_response(response: Dict[str, Any]) -> List[Dict[str, Any]]:
+def parse_github_response(
+    response: Dict[str, Any],
+    topic: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Normalize a ``search_github`` envelope into the skill's item shape.
 
-    Pure function: no I/O, no token, no enrichment. Applies the date
-    filter using the search context and sorts by relevance.
+    Pure function: no I/O, no token, no enrichment. Drops results that are
+    not about the topic, applies the date filter using the search context and
+    sorts by relevance.
+
+    ``topic`` is the research topic the results are judged against. It
+    defaults to the subject the search ran on.
     """
     if not isinstance(response, dict):
         return []
@@ -311,12 +537,17 @@ def parse_github_response(response: Dict[str, Any]) -> List[Dict[str, Any]]:
     from_date = context.get("from_date") or ""
     to_date = context.get("to_date") or ""
     count = context.get("count") or DEPTH_LIMITS["default"]
+    floor_topic = strip_search_qualifiers(extract_core_subject(topic or "")) or core
 
     items: List[Dict[str, Any]] = []
+    off_topic = 0
     for i, item in enumerate(raw_items[:count]):
         html_url = item.get("html_url", "")
         repo = _parse_repo_from_url(html_url)
         title = item.get("title", "")
+        if not _clears_topical_floor(floor_topic, title, repo):
+            off_topic += 1
+            continue
         body_text = item.get("body") or ""
         reactions_total = item.get("reactions", {}).get("total_count", 0) if isinstance(item.get("reactions"), dict) else 0
         comment_count = item.get("comments") or 0
@@ -355,6 +586,12 @@ def parse_github_response(response: Dict[str, Any]) -> List[Dict[str, Any]]:
             },
         })
 
+    if off_topic:
+        _log(
+            f"Dropped {off_topic} of {off_topic + len(items)} results not about "
+            f"'{_truncate_diagnostic(floor_topic)}'"
+        )
+
     # Date filter
     if from_date and to_date:
         items = [
@@ -369,30 +606,21 @@ def parse_github_response(response: Dict[str, Any]) -> List[Dict[str, Any]]:
 def enrich_with_comments(
     items: List[Dict[str, Any]],
     depth: str = "default",
-    token: Optional[str] = None,
+    *,
+    deadline: Optional[float] = None,
+    stopped: Optional[Callable[[], bool]] = None,
 ) -> List[Dict[str, Any]]:
-    """Fetch top comments for top-K items by reactions and attach to metadata.
-
-    Mutates and returns ``items``. Resolves ``token`` via env/gh CLI when
-    not supplied, matching ``search_github``'s fallback chain.
-    """
+    """Fetch public comments for top items by reactions and attach to metadata."""
     if not items:
         return items
-    resolved_token = _resolve_token(token)
-    if not resolved_token:
-        _log("No GitHub token available for comment enrichment")
+    if stopped is not None and stopped():
         return items
-    return _enrich_top_items(items, depth, resolved_token)
-
-
-def _enrich_top_items(
-    items: List[Dict[str, Any]],
-    depth: str,
-    token: str,
-) -> List[Dict[str, Any]]:
-    """Fetch comments for top N items by reactions."""
-    if not items:
-        return items
+    req_timeout = 15.0
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return items
+        req_timeout = min(req_timeout, remaining)
 
     limit = ENRICH_LIMITS.get(depth, ENRICH_LIMITS["default"])
 
@@ -405,58 +633,95 @@ def _enrich_top_items(
 
     _log(f"Enriching top {len(to_enrich)} items with comments")
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    executor = ThreadPoolExecutor(max_workers=5)
+    try:
         futures = {
             executor.submit(
                 _fetch_item_comments,
                 items[idx]["url"],
-                token,
+                timeout=req_timeout,
             ): idx
             for idx in to_enrich
         }
 
-        for future in as_completed(futures):
-            idx = futures[future]
-            try:
-                comments = future.result(timeout=15)
-                items[idx]["metadata"]["top_comments"] = comments
-            except (KeyError, TypeError, OSError) as exc:
-                _log(f"Comment enrichment failed for {items[idx].get('url', '?')}: {type(exc).__name__}: {exc}")
-                items[idx]["metadata"]["top_comments"] = []
+        if deadline is None and stopped is None:
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    comments = future.result(timeout=15)
+                    items[idx]["metadata"]["top_comments"] = comments
+                except (KeyError, TypeError, OSError) as exc:
+                    _log(f"Comment enrichment failed for {items[idx].get('url', '?')}: {type(exc).__name__}: {exc}")
+                    items[idx]["metadata"]["top_comments"] = []
+        else:
+            pending = set(futures)
+            while pending:
+                if stopped is not None and stopped():
+                    break
+                if deadline is not None:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        break
+                    step = min(0.1, left)
+                else:
+                    step = 0.1
+                done, pending = futures_wait(pending, timeout=step, return_when=FIRST_COMPLETED)
+                for future in done:
+                    idx = futures[future]
+                    try:
+                        comments = future.result(timeout=0)
+                        items[idx]["metadata"]["top_comments"] = comments
+                    except (KeyError, TypeError, OSError) as exc:
+                        _log(f"Comment enrichment failed for {items[idx].get('url', '?')}: {type(exc).__name__}: {exc}")
+                        items[idx]["metadata"]["top_comments"] = []
+            for future in pending:
+                future.cancel()
+    finally:
+        executor.shutdown(wait=(deadline is None and stopped is None), cancel_futures=True)
 
     return items
 
 
 def _fetch_item_comments(
     issue_url: str,
-    token: str,
     max_comments: int = 5,
+    timeout: float = 15,
 ) -> List[Dict[str, Any]]:
     """Fetch comments for a GitHub issue/PR.
 
     Args:
         issue_url: HTML URL like https://github.com/owner/repo/issues/123
-        token: GitHub auth token
         max_comments: Max comments to return
+        timeout: Request timeout in seconds
 
     Returns:
         List of comment dicts with score, excerpt, author.
     """
+    if max_comments <= 0:
+        return []
+
     path = issue_url.replace("https://github.com/", "")
     path = path.replace("/pull/", "/issues/")
-    api_url = f"https://api.github.com/repos/{path}/comments?per_page={max_comments}&sort=reactions&direction=desc"
+    # GitHub's per-issue comments endpoint orders by ascending ID and does not
+    # support reaction sorting, so fetch its largest page and rank locally.
+    api_url = f"https://api.github.com/repos/{path}/comments?per_page=100"
 
-    data = _fetch_json(api_url, token=token, timeout=15)
+    data = _fetch_json(api_url, timeout=timeout)
     if not data or not isinstance(data, list):
         return []
 
     comments = []
-    for c in data[:max_comments]:
+    for c in data:
+        if not isinstance(c, dict):
+            continue
+        user = c.get("user")
+        if _is_bot_user(user):
+            continue
         body = c.get("body") or ""
         excerpt = body[:300] + "..." if len(body) > 300 else body
         reactions = c.get("reactions", {})
         reaction_count = reactions.get("total_count", 0) if isinstance(reactions, dict) else 0
-        author = c.get("user", {}).get("login", "") if isinstance(c.get("user"), dict) else ""
+        author = user.get("login", "") if isinstance(user, dict) else ""
 
         comments.append({
             "score": reaction_count,
@@ -464,7 +729,28 @@ def _fetch_item_comments(
             "author": author,
         })
 
-    return comments
+    # Python's sort is stable, preserving API order for reaction-count ties.
+    comments.sort(key=lambda comment: comment["score"], reverse=True)
+    return comments[:max_comments]
+
+
+def _is_bot_user(user: Any) -> bool:
+    """Return whether a GitHub comment author is recognizably automated.
+
+    GitHub's REST payload marks bot accounts with ``user.type == "Bot"``.
+    Some compatible or partial payloads omit that field but retain the
+    conventional ``[bot]`` suffix on the login or display name. Missing user
+    metadata represents an unknown/deleted author, not evidence of automation.
+    """
+    if not isinstance(user, dict):
+        return False
+    if str(user.get("type") or "").casefold() == "bot":
+        return True
+    return any(
+        isinstance(user.get(field), str)
+        and user[field].strip().casefold().endswith("[bot]")
+        for field in ("login", "name")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -480,19 +766,16 @@ PERSON_DEPTH_LIMITS = {
 PERSON_EVENTS_PER_PAGE = 100
 
 
-def _fetch_readme_snippet(repo: str, token: str, max_chars: int = 500) -> Optional[str]:
+def _fetch_readme_snippet(repo: str, max_chars: int = 500) -> Optional[str]:
     """Fetch README content for a repo, truncated to first ~max_chars."""
     url = f"https://api.github.com/repos/{repo}/readme"
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "application/vnd.github.raw+json",
     }
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
     req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with http.open_request(req, 10) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
     except (urllib.error.HTTPError, urllib.error.URLError, OSError, TimeoutError):
         return None
@@ -510,11 +793,11 @@ def _fetch_readme_snippet(repo: str, token: str, max_chars: int = 500) -> Option
 
 
 def _fetch_latest_releases(
-    repo: str, token: str, count: int = 3, max_body: int = 300,
+    repo: str, count: int = 3, max_body: int = 300,
 ) -> List[Dict[str, str]]:
     """Fetch latest releases for a repo."""
     url = f"https://api.github.com/repos/{repo}/releases?per_page={count}"
-    data = _fetch_json(url, token=token, timeout=10)
+    data = _fetch_json(url, timeout=10)
     if not data or not isinstance(data, list):
         return []
     releases = []
@@ -532,7 +815,8 @@ def _fetch_top_issues(repo: str, token: str) -> Dict[str, Any]:
     result: Dict[str, Any] = {}
 
     # Top feature request: issues with enhancement label, sorted by reactions
-    feat_q = urllib.parse.quote(f"repo:{repo} is:issue is:open label:enhancement")
+    issue_query = f"is:public repo:{repo} is:issue is:open"
+    feat_q = urllib.parse.quote(f"{issue_query} label:enhancement")
     feat_url = f"{SEARCH_URL}?q={feat_q}&sort=reactions&order=desc&per_page=1"
     feat_data = _fetch_json(feat_url, token=token, timeout=10)
     if feat_data and feat_data.get("items"):
@@ -545,7 +829,7 @@ def _fetch_top_issues(repo: str, token: str) -> Dict[str, Any]:
         }
     elif feat_data and feat_data.get("total_count", 0) == 0:
         # No enhancement label; fall back to top issue by reactions
-        fallback_q = urllib.parse.quote(f"repo:{repo} is:issue is:open")
+        fallback_q = urllib.parse.quote(issue_query)
         fallback_url = f"{SEARCH_URL}?q={fallback_q}&sort=reactions&order=desc&per_page=1"
         fallback_data = _fetch_json(fallback_url, token=token, timeout=10)
         if fallback_data and fallback_data.get("items"):
@@ -558,7 +842,7 @@ def _fetch_top_issues(repo: str, token: str) -> Dict[str, Any]:
             }
 
     # Top complaint: most-discussed open issue (by comments)
-    bug_q = urllib.parse.quote(f"repo:{repo} is:issue is:open")
+    bug_q = urllib.parse.quote(issue_query)
     bug_url = f"{SEARCH_URL}?q={bug_q}&sort=comments&order=desc&per_page=1"
     bug_data = _fetch_json(bug_url, token=token, timeout=10)
     if bug_data and bug_data.get("items"):
@@ -573,11 +857,21 @@ def _fetch_top_issues(repo: str, token: str) -> Dict[str, Any]:
     return result
 
 
+def _is_public_repo(data: Any) -> bool:
+    return (
+        isinstance(data, dict)
+        and data.get("visibility") == "public"
+        and data.get("private") is not True
+    )
+
+
 def _fetch_repo_info(repo: str, token: str) -> Optional[Dict[str, Any]]:
-    """Fetch repo metadata (stars, forks, description, language)."""
+    """Fetch metadata for a public repository."""
+    if not _REPO_SLUG.fullmatch(repo):
+        return None
     url = f"https://api.github.com/repos/{repo}"
     data = _fetch_json(url, token=token, timeout=10)
-    if not data or not isinstance(data, dict):
+    if not _is_public_repo(data):
         return None
     return {
         "stars": data.get("stargazers_count", 0),
@@ -605,7 +899,7 @@ def refetch_datum(item: schema.SourceItem | None, datum_key: str) -> dict[str, A
     (candidate-enrichment claim; the repo itself is the refetch subject and
     the item is not consulted, so it may be ``None``).
     """
-    if re.fullmatch(r"[^/\s]+/[^/\s]+", datum_key):
+    if _REPO_SLUG.fullmatch(datum_key):
         repo = datum_key
     elif datum_key != "stars":
         raise KeyError(f"Unsupported GitHub datum: {datum_key}")
@@ -613,10 +907,10 @@ def refetch_datum(item: schema.SourceItem | None, datum_key: str) -> dict[str, A
         if item is None:
             raise ValueError("Item-level star refetch requires the grounding item")
         repo = item.container or ""
-        if not re.fullmatch(r"[^/\s]+/[^/\s]+", repo):
+        if not _REPO_SLUG.fullmatch(repo):
             match = re.match(r"https?://github\.com/([^/]+/[^/#?]+)", item.url)
-            repo = match.group(1).removesuffix(".git") if match else ""
-        if not repo:
+            repo = _normalize_repo_slug(match.group(1)) if match else ""
+        if not _REPO_SLUG.fullmatch(repo):
             raise ValueError("GitHub item has no owner/repository reference")
     headers = {"Accept": "application/vnd.github+json"}
     token = _resolve_token()
@@ -626,8 +920,8 @@ def refetch_datum(item: schema.SourceItem | None, datum_key: str) -> dict[str, A
         "GET", f"https://api.github.com/repos/{repo}",
         headers=headers, timeout=10, retries=2,
     )
-    if not isinstance(data, dict) or not isinstance(data.get("stargazers_count"), int):
-        raise KeyError("GitHub star count was not returned")
+    if not _is_public_repo(data) or not isinstance(data.get("stargazers_count"), int):
+        raise KeyError("Public GitHub star count was not returned")
     fallback_url = item.url if item is not None else f"https://github.com/{repo}"
     return {
         "value": data["stargazers_count"],
@@ -650,6 +944,8 @@ def search_github_person(
     - Per-repo items for top external repos (with stars + release notes)
     - Per-repo items for own repos (with stars + README + top issues + releases)
     """
+    if not re.fullmatch(r"[A-Za-z0-9_-]+(?:\[bot\])?", username):
+        return []
     resolved_token = _resolve_token(token)
     if not resolved_token:
         _log("No GitHub token available for person-mode search")
@@ -659,8 +955,9 @@ def search_github_person(
     _log(f"Person-mode search for @{username} (since {from_date})")
 
     # Phase 1: PR velocity via search API
-    total_q = urllib.parse.quote(f"author:{username} type:pr created:>{from_date}")
-    merged_q = urllib.parse.quote(f"author:{username} type:pr is:merged created:>{from_date}")
+    author_query = f"is:public author:{username} type:pr created:{from_date}..{to_date}"
+    total_q = urllib.parse.quote(author_query)
+    merged_q = urllib.parse.quote(f"{author_query} is:merged")
 
     total_url = f"{SEARCH_URL}?q={total_q}&per_page=1"
     merged_url = f"{SEARCH_URL}?q={merged_q}&sort=reactions&order=desc&per_page=100"
@@ -689,25 +986,34 @@ def search_github_person(
         _log("No PRs found, falling back to keyword search")
         return []
 
+    open_q = urllib.parse.quote(f"{author_query} is:open")
+    open_data = _fetch_json(f"{SEARCH_URL}?q={open_q}&per_page=1", token=resolved_token, timeout=20)
+    open_count = (
+        open_data.get("total_count")
+        if isinstance(open_data, dict) and not open_data.get("incomplete_results")
+        else None
+    )
+
     # Phase 2: Group merged PRs by repo
     repo_pr_counts: Dict[str, int] = {}
     for item in merged_items:
         repo = _parse_repo_from_url(item.get("html_url", ""))
-        if repo:
+        if _REPO_SLUG.fullmatch(repo):
             repo_pr_counts[repo] = repo_pr_counts.get(repo, 0) + 1
 
     # Sort repos by PR count (most active first)
     sorted_repos = sorted(repo_pr_counts.items(), key=lambda x: x[1], reverse=True)
 
     # Phase 3: Fetch own repos
-    own_repos_url = f"https://api.github.com/users/{username}/repos?sort=stars&per_page={limits['own_repos']}&direction=desc"
+    encoded_username = urllib.parse.quote(username, safe="")
+    own_repos_url = f"https://api.github.com/users/{encoded_username}/repos?sort=stars&per_page={limits['own_repos']}&direction=desc"
     own_repos_data = _fetch_json(own_repos_url, token=resolved_token, timeout=15)
     own_repo_names = set()
     own_repos_info: List[Dict[str, Any]] = []
     if own_repos_data and isinstance(own_repos_data, list):
         for r in own_repos_data:
             full_name = r.get("full_name", "")
-            if full_name and not r.get("fork"):
+            if _REPO_SLUG.fullmatch(full_name or "") and not r.get("fork"):
                 own_repo_names.add(full_name)
                 own_repos_info.append({
                     "full_name": full_name,
@@ -727,14 +1033,16 @@ def search_github_person(
     idx = 0
 
     # Build velocity summary
-    open_prs = total_prs - merged_count
+    submitted_line = f"- {total_prs} total PRs submitted"
+    if type(open_count) is int and 0 <= open_count <= total_prs:
+        submitted_line += f", {open_count} still open"
     merge_rate = round(100 * merged_count / total_prs) if total_prs > 0 else 0
     num_repos = len(repo_pr_counts)
     velocity_text = (
         f"GitHub Person Profile: @{username}\n\n"
-        f"CONTRIBUTION VELOCITY (last {(to_date > from_date) and 30 or 30} days)\n"
+        f"CONTRIBUTION VELOCITY (last {dates.days_ago(from_date, to_date)} days)\n"
         f"- {merged_count} PRs merged across {num_repos} repos ({merge_rate}% merge rate)\n"
-        f"- {total_prs} total PRs submitted, {open_prs} still open\n"
+        f"{submitted_line}\n"
     )
 
     idx += 1
@@ -750,7 +1058,7 @@ def search_github_person(
         "snippet": velocity_text,
         "relevance": 0.95,
         "why_relevant": f"GitHub profile: @{username} - {merged_count} PRs merged across {num_repos} repos",
-        "engagement": {"merged_prs": merged_count, "comments": total_prs},
+        "engagement": {"merged_prs": merged_count, "total_prs": total_prs},
         "metadata": {
             "labels": ["person-profile", "velocity"],
             "state": "open",
@@ -803,7 +1111,7 @@ def search_github_person(
                 "id": f"GH{idx}",
                 "title": f"{repo} ({stars_str} stars) - {pr_count} PRs merged",
                 "url": f"https://github.com/{repo}",
-                "date": releases[0]["date"] if releases and releases[0].get("date") else to_date,
+                "date": _snapshot_date(releases, from_date, to_date),
                 "author": username,
                 "source": "github",
                 "score": stars,
@@ -811,13 +1119,14 @@ def search_github_person(
                 "snippet": "\n".join(snippet_parts),
                 "relevance": min(0.9, 0.6 + math.log1p(stars) / 30 + min(0.15, pr_count / 20)),
                 "why_relevant": f"GitHub contribution: {pr_count} PRs merged to {repo} ({stars_str} stars)",
-                "engagement": {"stars": stars, "comments": pr_count},
+                "engagement": {"stars": stars, "contributed_prs": pr_count},
                 "metadata": {
                     "labels": ["person-profile", "external-repo"],
                     "state": "open",
-                    "comment_count": pr_count,
+                    "comment_count": 0,
                     "reactions": stars,
                     "is_pr": False,
+                    "date_is_snapshot": not _has_in_window_release(releases, from_date, to_date),
                 },
             })
 
@@ -861,7 +1170,7 @@ def search_github_person(
                 "id": f"GH{idx}",
                 "title": f"{repo_name} ({stars_str} stars) - own project, {open_issues} open issues",
                 "url": f"https://github.com/{repo_name}",
-                "date": releases[0]["date"] if releases and releases[0].get("date") else to_date,
+                "date": _snapshot_date(releases, from_date, to_date),
                 "author": username,
                 "source": "github",
                 "score": stars,
@@ -869,13 +1178,14 @@ def search_github_person(
                 "snippet": "\n".join(snippet_parts),
                 "relevance": min(0.95, 0.7 + math.log1p(stars) / 25),
                 "why_relevant": f"GitHub own project: {repo_name} ({stars_str} stars)",
-                "engagement": {"stars": stars, "comments": open_issues},
+                "engagement": {"stars": stars, "open_issues": open_issues},
                 "metadata": {
                     "labels": ["person-profile", "own-repo"],
                     "state": "open",
-                    "comment_count": open_issues,
+                    "comment_count": 0,
                     "reactions": stars,
                     "is_pr": False,
+                    "date_is_snapshot": not _has_in_window_release(releases, from_date, to_date),
                 },
             })
 
@@ -925,7 +1235,7 @@ def _person_recent_pushes(
 
             repo = event.get("repo")
             full_name = repo.get("name", "") if isinstance(repo, dict) else ""
-            if not re.fullmatch(r"[^/\s]+/[^/\s]+", full_name):
+            if not _REPO_SLUG.fullmatch(full_name or ""):
                 continue
 
             previous = latest_by_repo.get(full_name)
@@ -1031,11 +1341,11 @@ def _person_recent_pushes(
                 f"GitHub activity: @{repo['actor']} pushed {name} on {repo['pushed']} "
                 f"({stars_str} stars)"
             ),
-            "engagement": {"stars": stars, "comments": open_issues},
+            "engagement": {"stars": stars, "open_issues": open_issues},
             "metadata": {
                 "labels": ["person-profile", "recent-push"],
                 "state": "open",
-                "comment_count": open_issues,
+                "comment_count": 0,
                 "reactions": stars,
                 "is_pr": False,
                 "event_type": "PushEvent",
@@ -1049,14 +1359,14 @@ def _person_recent_pushes(
 def _enrich_external_repo(repo: str, token: str) -> Dict[str, Any]:
     """Fetch star count + releases for an external repo."""
     info = _fetch_repo_info(repo, token)
-    releases = _fetch_latest_releases(repo, token, count=3)
+    releases = _fetch_latest_releases(repo, count=3)
     return {"info": info, "releases": releases}
 
 
 def _enrich_own_repo(repo: str, token: str) -> Dict[str, Any]:
     """Fetch README + releases + top issues for an own repo."""
-    readme = _fetch_readme_snippet(repo, token, max_chars=500)
-    releases = _fetch_latest_releases(repo, token, count=3)
+    readme = _fetch_readme_snippet(repo, max_chars=500)
+    releases = _fetch_latest_releases(repo, count=3)
     top_issues = _fetch_top_issues(repo, token)
     return {"readme": readme, "releases": releases, "top_issues": top_issues}
 
@@ -1064,6 +1374,29 @@ def _enrich_own_repo(repo: str, token: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Project-mode search: fetch comprehensive data for specific repos
 # ---------------------------------------------------------------------------
+
+def _snapshot_date(releases: List[Dict[str, Any]], from_date: str, to_date: str) -> str:
+    """Date for a live repo snapshot item (stars, issues, PRs read now).
+
+    The newest release's date when it falls in the window, else ``to_date``.
+    An older release date would make the report's date filter drop a repo the
+    user pinned: Ghostty's newest release object is its 2022 "tip" nightly.
+    """
+    if _has_in_window_release(releases, from_date, to_date):
+        return releases[0]["date"]
+    return to_date
+
+
+def _has_in_window_release(releases: List[Dict[str, Any]], from_date: str, to_date: str) -> bool:
+    """True when the newest release date is a real in-window event.
+
+    False means ``_snapshot_date`` fell back to ``to_date``: that date keeps the
+    item through the date filter but says nothing about recency, so the item is
+    marked ``date_is_snapshot`` and ranks on neutral freshness.
+    """
+    release_date = releases[0].get("date") if releases else None
+    return bool(release_date and from_date <= release_date <= to_date)
+
 
 def search_github_project(
     repos: List[str],
@@ -1084,6 +1417,9 @@ def search_github_project(
     Returns:
         List of SourceItems, one per repo.
     """
+    repos = [repo for repo in repos if _REPO_SLUG.fullmatch(repo)]
+    if not repos:
+        return []
     resolved_token = _resolve_token(token)
     if not resolved_token:
         _log("No GitHub token available for project-mode search")
@@ -1142,7 +1478,7 @@ def search_github_project(
                 "id": f"GH{idx + 1}",
                 "title": f"{repo} ({stars_str} stars) - {open_issues} open issues",
                 "url": f"https://github.com/{repo}",
-                "date": releases[0]["date"] if releases and releases[0].get("date") else to_date,
+                "date": _snapshot_date(releases, from_date, to_date),
                 "author": repo.split("/")[0],
                 "source": "github",
                 "score": stars,
@@ -1150,13 +1486,14 @@ def search_github_project(
                 "snippet": "\n".join(snippet_parts),
                 "relevance": min(0.95, 0.7 + math.log1p(stars) / 25),
                 "why_relevant": f"GitHub project: {repo} ({stars_str} stars, live)",
-                "engagement": {"stars": stars, "comments": open_issues},
+                "engagement": {"stars": stars, "open_issues": open_issues},
                 "metadata": {
                     "labels": ["project-mode"],
                     "state": "open",
-                    "comment_count": open_issues,
+                    "comment_count": 0,
                     "reactions": stars,
                     "is_pr": False,
+                    "date_is_snapshot": not _has_in_window_release(releases, from_date, to_date),
                     "github_stars": {repo: stars},
                 },
             })
@@ -1169,10 +1506,9 @@ def search_github_project(
 def _enrich_project_repo(repo: str, token: str) -> Dict[str, Any]:
     """Fetch all project data for a repo: info + README + releases + top issues."""
     info = _fetch_repo_info(repo, token)
-    readme = _fetch_readme_snippet(repo, token, max_chars=500)
-    releases = _fetch_latest_releases(repo, token, count=3)
-    top_issues = _fetch_top_issues(repo, token)
-    return {"info": info, "readme": readme, "releases": releases, "top_issues": top_issues}
+    if not info:
+        return {}
+    return {"info": info, **_enrich_own_repo(repo, token)}
 
 
 # ---------------------------------------------------------------------------
@@ -1181,6 +1517,14 @@ def _enrich_project_repo(repo: str, token: str) -> Dict[str, Any]:
 
 _REPO_URL_PATTERN = re.compile(r"github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)")
 _SKIP_PATHS = {"topics", "search", "orgs", "settings", "features", "about", "pricing", "enterprise", "explore", "marketplace", "sponsors"}
+
+
+def _normalize_repo_slug(match: str) -> str:
+    """Strip trailing sentence punctuation and a literal case-insensitive .git suffix."""
+    slug = (match or "").rstrip(".")
+    if slug.lower().endswith(".git"):
+        slug = slug[:-4]
+    return slug.rstrip(".")
 
 
 def extract_repo_refs(candidates: List[Any]) -> List[str]:
@@ -1198,14 +1542,16 @@ def extract_repo_refs(candidates: List[Any]) -> List[str]:
             texts.append(str(evidence))
         for text in texts:
             for match in _REPO_URL_PATTERN.findall(text):
-                # Normalize: strip trailing .git, lowercase
-                repo = match.rstrip(".git").lower()
+                slug = _normalize_repo_slug(match)
+                if not _REPO_SLUG.fullmatch(slug):
+                    continue
+                repo = slug.lower()
                 owner = repo.split("/")[0]
                 if owner in _SKIP_PATHS:
                     continue
                 if repo not in seen:
                     seen.add(repo)
-                    repos.append(match)  # preserve original case
+                    repos.append(slug)  # preserve original case
     return repos
 
 
@@ -1273,7 +1619,10 @@ def apply_star_map(candidates: List[Any], star_map: Dict[str, int]) -> int:
             texts.append(str(evidence))
         combined = " ".join(texts)
         for match in _REPO_URL_PATTERN.findall(combined):
-            repo_lower = match.rstrip(".git").lower()
+            slug = _normalize_repo_slug(match)
+            if not _REPO_SLUG.fullmatch(slug):
+                continue
+            repo_lower = slug.lower()
             if repo_lower in star_map:
                 stars = star_map[repo_lower]
                 stars_str = _format_stars(stars)
@@ -1282,7 +1631,7 @@ def apply_star_map(candidates: List[Any], star_map: Dict[str, int]) -> int:
                     continue
                 if "github_stars" not in c.metadata:
                     c.metadata["github_stars"] = {}
-                c.metadata["github_stars"][match] = stars
+                c.metadata["github_stars"][slug] = stars
                 # Append to evidence if present
                 if hasattr(c, "evidence") and c.evidence and f"(live:" not in c.evidence:
                     c.evidence = c.evidence + f" (live: {stars_str} stars)"

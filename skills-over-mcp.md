@@ -2,12 +2,12 @@
 
 use-vault MCP에 Agent Skills를 실어 보내고, agentic-work Runtime이 이를 소비하는 설계·구현 문서입니다.
 
-스펙 배경: [Skills-over-MCP 란?](https://vault.my-agentic-ai.click/s/uSe3Cs_Q5drQUICrc9e0Bb5f) · [skills/overview](https://modelcontextprotocol.io/extensions/skills/overview)
+배경: [skills/overview](https://modelcontextprotocol.io/extensions/skills/overview)
 
 관련 코드:
 
-- 서버: `ob-note/MCP/use-vault/` (`vault_skills.py`, `skills/use-vault/SKILL.md`)
-- 클라이언트: `runtime_agent/langgraph/mcp_skills.py`, `skill.py`, `chat.py`
+- 서버: [ob-note/MCP/use-vault/](https://github.com/kyopark2014/ob-note/tree/main/MCP/use-vault) (`vault_skills.py`, `skills/use-vault/SKILL.md`)
+- 클라이언트: [runtime_agent/langgraph/mcp_skills.py](https://github.com/kyopark2014/agentic-work/blob/main/runtime_agent/langgraph/mcp_skills.py), `skill.py`, `chat.py`
 - 이전 로컬 스킬 `runtime_agent/langgraph/skills/my-vaults/` 는 **삭제됨** (2절은 이력)
 
 ---
@@ -88,7 +88,7 @@ Claude / Claude Code에 퍼블릭 베타로 노출되었고, Pro/Max/Ultra는 �
 
 - Skill = `SKILL.md` + (선택) 부속 파일 디렉터리
 - YAML frontmatter 필수: `name`, `description`
-- **상위 폴더명의 마지막 세그먼트 = `name`** (예: `skills/use-vault/` → `name: use-vault`)
+- **상위 폴더명의 마지막 세그먼트 =** `name` (예: `skills/use-vault/` → `name: use-vault`)
 - 상대경로 참조는 스킬 루트 기준 (예: `references/a.md` → `skill://use-vault/references/a.md`)
 - 발견·조회는 기존 **Resources** 프리미티브를 그대로 사용
 
@@ -183,7 +183,7 @@ Host → Model: 검증된 지침 + origin 태그
 > Digest establishes consistency with the server's manifest, not trust in its content.  
 > (digest는 manifest와의 **일치성**만 보장하며, 콘텐츠 **신뢰**를 보장하지 않음)
 
-**`"dynamic"` 리소스**
+`"dynamic"` **리소스**
 
 - 안정 digest가 없는 생성 콘텐츠는 manifest에 `"dynamic"`으로 표시
 - 호스트는 거부해도 됨(MAY). 수용해도 frontmatter는 검증하고, 저장 승인이 이후 임의 콘텐츠를 커버한다고 보면 안 됨
@@ -539,7 +539,7 @@ use-vault MCP
 
 모델은 skill/guidance대로 본문 덤프 대신 요약 + `[제목](url)` 링크를 사용자에게 씁니다. 읽기 결과는 MCP App UI로도 뜰 수 있지만, 채팅 쪽 링크는 모델이 넣습니다.
 
-정리: **skill = 언제/어떻게 쓸지 규칙**, **실제 I/O = MCP `vault_*` `tools/call` ↔ JSON(+선택적 App UI)**.
+정리: **skill = 언제/어떻게 쓸지 규칙**, **실제 I/O = MCP** `vault_`* ****`tools/call` **↔ JSON(+선택적 App UI)**.
 
 ---
 
@@ -597,7 +597,6 @@ use-vault MCP
 
 ## 참고 링크
 
-- [Skills-over-MCP 란?](https://vault.my-agentic-ai.click/s/uSe3Cs_Q5drQUICrc9e0Bb5f) (공유 노트)
 - [SEP-2640](https://modelcontextprotocol.io/seps/2640-skills-extension) · [ext-skills](https://github.com/modelcontextprotocol/ext-skills)
 - [Agent Skills specification](https://agentskills.io/specification)
 - [skills/overview](https://modelcontextprotocol.io/extensions/skills/overview)

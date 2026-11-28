@@ -3,25 +3,33 @@
 The subreddit listing partial
 ``/svc/shreddit/community-more-posts/{sort}/?name={sub}[&t={range}]`` serves
 HTTP 200 with no API key and **server-renders each post's upvote score**, which
-neither RSS nor the comments endpoint provides. Each post is a
+the comments endpoint does not provide. Each post is a
 ``<shreddit-post>`` element whose start-tag attributes carry ``score``,
 ``comment-count``, ``post-title``, ``permalink``, ``author``, ``subreddit-name``
 and ``created-timestamp``.
 
 This is the keyless source of post-level upvotes. It works for normal users on
 ordinary connections (verified), so reddit_keyless uses it both as a scored
-discovery source and to backfill scores onto RSS-discovered posts.
+discovery source and to backfill scores onto posts discovered elsewhere.
 """
 
 import html as _html
 import re
+import time
 import sys
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
+from urllib.parse import quote, urlencode
 
-from . import http
-from .relevance import token_overlap_relevance
+from . import http, reddit_refs
+from .relevance import token_overlap_relevance, tokenize
+
+# Generic domain terms that are excluded from the keyword gate — matches
+# pipeline._DISCOVERY_GENERIC_DOMAIN_TERMS (duplicated to avoid circular import).
+_DISCOVERY_GENERIC_DOMAIN_TERMS: Set[str] = {
+    "ai", "artificial", "intelligence", "tech", "technology", "trending", "trend",
+}
 
 # Listing sorts pulled per subreddit, by depth.
 LISTING_SORTS = {
@@ -34,7 +42,26 @@ TIMEFRAME = "month"
 MAX_WORKERS = 4
 LISTING_TIMEOUT = 15
 
-_POST_CARD = re.compile(r"<shreddit-post(?=[\s>])[^>]*>")
+_TAG_BODY = r'(?:"[^"]*"|\'[^\']*\'|[^>"\'])*'
+_POST_CARD = re.compile(rf"<shreddit-post(?=[\s>]){_TAG_BODY}>", re.IGNORECASE)
+_TAG_HEAD = re.compile(r"^<\s*[^\s>/]+")
+_TAG_ATTR = re.compile(
+    r'(?<![A-Za-z0-9_.:-])([A-Za-z_:][A-Za-z0-9_.:-]*)'
+    r'(?:\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s"\'=<>`]+)))?'
+)
+_BLOCK_MARKERS = (
+    "verify you are human",
+    "confirm you are a human",
+    "just a moment",
+    "attention required",
+    "cf-browser-verification",
+    "challenge-platform",
+    "/svc/shreddit/js-challenge",
+    "please wait for verification",
+    "enable javascript and reload",
+    "you've been blocked",
+    "whoa there",
+)
 
 
 def _log(msg: str) -> None:
@@ -42,9 +69,46 @@ def _log(msg: str) -> None:
     sys.stderr.flush()
 
 
+def _matches_discovery_domain(domain: str, text: str) -> bool:
+    """Require a distinctive domain term, not a generic token such as ``AI``.
+
+    Duplicated from pipeline._matches_discovery_domain to avoid circular imports.
+    The rule must stay in sync: pipeline.py owns the authoritative version and
+    test_reddit_listing.py verifies parity.
+    """
+    def terms(value: str) -> Set[str]:
+        words: Set[str] = set()
+        for word in tokenize(value):
+            words.add(word)
+            if len(word) > 4 and word.endswith("s") and not word.endswith("ss"):
+                words.add(word[:-1])
+        return words
+
+    domain_terms = terms(domain)
+    anchors = domain_terms - _DISCOVERY_GENERIC_DOMAIN_TERMS
+    return bool((anchors or domain_terms) & terms(text))
+
+
 def _attr(tag: str, name: str) -> Optional[str]:
-    m = re.search(rf'\b{name}="([^"]*)"', tag)
-    return _html.unescape(m.group(1)) if m else None
+    if not tag or not name:
+        return None
+    wanted = name.lower()
+    body = _TAG_HEAD.sub("", tag.strip())
+    if body.endswith(">"):
+        body = body[:-1].rstrip()
+        if body.endswith("/"):
+            body = body[:-1]
+    for m in _TAG_ATTR.finditer(body):
+        if m.group(1).lower() != wanted:
+            continue
+        raw = (
+            m.group(2)
+            if m.group(2) is not None
+            else (m.group(3) if m.group(3) is not None else m.group(4))
+        )
+        if raw is not None:
+            return _html.unescape(raw)
+    return None
 
 
 def _to_date(value: Optional[str]) -> Optional[str]:
@@ -73,6 +137,21 @@ def _post_id(permalink: str) -> str:
     return m.group(1) if m else ""
 
 
+_ERROR_PATTERN = re.compile(r"^r/(\S+)\s+(\S+):", re.IGNORECASE)
+
+
+def _shreddit_error_recovered(error: str, successes: Set[tuple[str, str]]) -> bool:
+    """Return True if the error's (sub, sort) pair is in the successes set.
+
+    Error format: "r/{sub} {sort}: {message}".
+    """
+    m = _ERROR_PATTERN.match(error)
+    if not m:
+        return False
+    sub, sort = m.group(1).lower(), m.group(2).lower()
+    return (sub, sort) in successes
+
+
 def parse_cards(html_text: str, query: str = "") -> List[Dict[str, Any]]:
     """Parse <shreddit-post> cards into normalized post dicts with real scores."""
     posts: List[Dict[str, Any]] = []
@@ -81,8 +160,11 @@ def parse_cards(html_text: str, query: str = "") -> List[Dict[str, Any]]:
         permalink = _attr(tag, "permalink") or ""
         if "/comments/" not in permalink:
             continue
+        score_raw = _attr(tag, "score")
+        has_live_score = False
         try:
-            score = int(_attr(tag, "score") or 0)
+            score = int(score_raw or 0)
+            has_live_score = score_raw is not None and score_raw.strip() != ""
         except ValueError:
             score = 0
         try:
@@ -95,7 +177,7 @@ def parse_cards(html_text: str, query: str = "") -> List[Dict[str, Any]]:
         created = _attr(tag, "created-timestamp")
         url = f"https://www.reddit.com{permalink}"
 
-        posts.append({
+        card: Dict[str, Any] = {
             "id": "",
             "title": title,
             "url": url,
@@ -114,21 +196,64 @@ def parse_cards(html_text: str, query: str = "") -> List[Dict[str, Any]]:
             "relevance": round(token_overlap_relevance(query, title), 3) if query else 0.0,
             "why_relevant": "Reddit listing",
             "metadata": {"post_id": _post_id(permalink)},
-        })
+        }
+        card["engagement_source"] = (
+            reddit_refs.LIVE if has_live_score else reddit_refs.UNKNOWN
+        )
+        posts.append(card)
     return posts
 
 
+_VALID_SORTS = frozenset({"top", "hot", "new", "rising", "controversial", "best"})
+_VALID_TIMEFRAMES = frozenset({"hour", "day", "week", "month", "year", "all"})
+
+
+def _valid_subreddits(subreddits: List[str]) -> List[str]:
+    valid: List[str] = []
+    seen: Set[str] = set()
+    for raw in subreddits or []:
+        sub = reddit_refs.normalize_subreddit(raw, allow_all=True)
+        if sub and sub.lower() not in seen:
+            seen.add(sub.lower())
+            valid.append(sub)
+    return valid
+
+
 def _listing_url(subreddit: str, sort: str, timeframe: str = TIMEFRAME) -> str:
-    sub = subreddit.removeprefix("r/").strip()
+    sub = reddit_refs.normalize_subreddit(subreddit, allow_all=True)
+    if not sub:
+        raise ValueError(f"Invalid subreddit for listing URL: {subreddit!r}")
+    clean_sort = str(sort or "").strip().lower()
+    if clean_sort not in _VALID_SORTS:
+        raise ValueError(f"Invalid sort for listing URL: {sort!r}")
+    clean_tf = str(timeframe or TIMEFRAME).strip().lower()
+    if clean_sort == "top" and clean_tf not in _VALID_TIMEFRAMES:
+        raise ValueError(f"Invalid timeframe for listing URL: {timeframe!r}")
     if sub.lower() == "all":
-        url = f"https://www.reddit.com/r/all/{sort}/"
-        if sort == "top":
-            url += f"?t={timeframe}"
+        url = f"https://www.reddit.com/r/all/{quote(clean_sort, safe='')}/"
+        if clean_sort == "top":
+            url += f"?{urlencode({'t': clean_tf})}"
         return url
-    url = f"https://www.reddit.com/svc/shreddit/community-more-posts/{sort}/?name={sub}"
-    if sort == "top":
-        url += f"&t={timeframe}"
-    return url
+    params = [("name", sub)]
+    if clean_sort == "top":
+        params.append(("t", clean_tf))
+    return (
+        f"https://www.reddit.com/svc/shreddit/community-more-posts/"
+        f"{quote(clean_sort, safe='')}/?{urlencode(params)}"
+    )
+
+
+def _listing_body_problem(subreddit: str, body: str) -> Optional[str]:
+    lower = body.lower()
+    is_blocked = any(marker in lower for marker in _BLOCK_MARKERS)
+    is_all = (reddit_refs.normalize_subreddit(subreddit, allow_all=True) or "").lower() == "all"
+    if not is_all and not is_blocked:
+        return None
+    if parse_cards(body):
+        return None
+    if is_blocked:
+        return "Reddit listing interstitial: HTTP 2xx with no post cards"
+    return "Reddit r/all listing schema drift: HTTP 2xx with no post cards"
 
 
 def _fetch_one(
@@ -148,20 +273,30 @@ def _fetch_one_with_status(
     timeframe: str = TIMEFRAME,
 ) -> tuple[List[Dict[str, Any]], Optional[str]]:
     try:
-        # tee_failures, not capture_failures: the latter would replace the
-        # pipeline's sink and hide this failure from it. get_text launders a
-        # terminal HTTP failure into None, so the tee is how this lane recovers
-        # the status code it needs to report (issue #899).
-        with http.tee_failures() as swallowed:
-            text = http.reddit_keyless_get_text(_listing_url(subreddit, sort, timeframe), timeout=LISTING_TIMEOUT,
-                                                accept="text/html")
+        # retry_429 records a terminal miss into the pipeline sink (issue #899)
+        # and retries a 429 once through the limiter (issue #985). Empty
+        # dedicated-subreddit fragments can be valid; r/all cannot be empty.
+        with http.tee_failures() as local_failures:
+            text, error = http.reddit_keyless_get_text_retry_429(
+                _listing_url(subreddit, sort, timeframe),
+                timeout=LISTING_TIMEOUT,
+                accept="text/html",
+                validate=lambda body: _listing_body_problem(subreddit, body),
+            )
         if text is None:
-            # An empty body ("") is a real empty listing; None never is.
-            return [], (str(swallowed[-1]) if swallowed else "no response")
+            if not local_failures:
+                http._record_failure(http.HTTPError(error or "no response"))
+            return [], (error or "no response")
         return parse_cards(text, query), None
     except Exception as e:
+        http._record_failure(e if isinstance(e, http.HTTPError) else http.HTTPError(str(e)))
         _log(f"listing fetch failed r/{subreddit} {sort}: {e}")
         return [], str(e)
+
+
+def _result_timeout(batch_size: int) -> float:
+    """Per-future wait: the fetch's own timeout plus the bucket's queue depth."""
+    return LISTING_TIMEOUT + 5 + http.reddit_keyless_wait_allowance(batch_size)
 
 
 def fetch_listings(
@@ -170,8 +305,12 @@ def fetch_listings(
     query: str = "",
     sorts: Optional[List[str]] = None,
     timeframe: str = TIMEFRAME,
+    deadline: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """Fetch scored post cards across subreddits × sorts.
+
+    ``deadline`` is a ``time.monotonic()`` bound: feeds still running then are
+    left behind and the cards of the feeds that answered are returned.
 
     Returns deduped normalized posts (with real scores), unranked/unsliced —
     the caller merges these with other sources, ranks, and slices.
@@ -180,21 +319,33 @@ def fetch_listings(
     pass ``["top", "hot", "new"]`` so fresh threads (which the top-of-month
     listing misses) are caught with their scores regardless of depth.
     """
-    if not subreddits:
+    valid_subs = _valid_subreddits(subreddits)
+    if not valid_subs:
         return []
     sorts = sorts or LISTING_SORTS.get(depth, LISTING_SORTS["default"])
-    jobs = [(sub, sort) for sub in subreddits for sort in sorts]
+    jobs = [(sub, sort) for sub in valid_subs for sort in sorts]
     all_posts: List[Dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(jobs)) or 1) as executor:
+    executor = ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(jobs)) or 1)
+    try:
         # submit_with_context, not executor.submit — see the note in
         # fetch_discovery_listings below (issue #899).
         futures = {http.submit_with_context(executor, _fetch_one, sub, sort, query, timeframe): (sub, sort)
                    for sub, sort in jobs}
         for future in futures:
+            wait = _result_timeout(len(jobs))
+            if deadline is not None:
+                wait = max(0.0, min(wait, deadline - time.monotonic()))
             try:
-                all_posts.extend(future.result(timeout=LISTING_TIMEOUT + 5))
-            except (Exception, FuturesTimeoutError) as e:
-                _log(f"listing future failed: {e}")
+                all_posts.extend(future.result(timeout=wait))
+            except FuturesTimeoutError as e:
+                http._record_failure(http.DeadlineExceeded())
+                _log(f"listing future failed: {e or 'still running at the deadline'}")
+            except Exception as e:
+                http._record_failure(e if isinstance(e, http.HTTPError) else http.HTTPError(str(e)))
+                _log(f"listing future failed: {e or 'still running at the deadline'}")
+    finally:
+        # Under a deadline a feed still queued or running is not waited for.
+        executor.shutdown(wait=deadline is None, cancel_futures=deadline is not None)
 
     seen: set = set()
     unique: List[Dict[str, Any]] = []
@@ -211,12 +362,23 @@ def fetch_discovery_listings(
     query: str,
     depth: str = "default",
 ) -> Dict[str, Any]:
-    """Fetch rising/top-week listings while preserving per-feed failures."""
-    if not subreddits:
+    """Fetch rising/top-week listings while preserving per-feed failures.
+
+    When shreddit fails and arctic-shift recovers, errors are cleared only for
+    subreddits whose posts survive the keyword gate. If query is empty (global
+    ``--discover`` with no domain), the gate is skipped and any arctic result
+    counts as recovery.
+    """
+    valid_subs = _valid_subreddits(subreddits)
+    if not valid_subs:
         return {"items": [], "errors": []}
-    jobs = [(subreddit, sort) for subreddit in subreddits for sort in ("rising", "top")]
+    jobs = [(subreddit, sort) for subreddit in valid_subs for sort in ("rising", "top")]
     items: List[Dict[str, Any]] = []
     errors: List[str] = []
+    # Track which (sub, sort) pairs shreddit successfully delivered posts for.
+    # Used to decide which errors to clear — Arctic can supplement but cannot
+    # "recover" a failed hot/top/new/rising lane (it's recency-only).
+    shreddit_successes: Set[tuple[str, str]] = set()
     with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(jobs)) or 1) as executor:
         # submit_with_context, not executor.submit: a plain submit starts the
         # worker with an empty context, dropping the pipeline's
@@ -230,13 +392,16 @@ def fetch_discovery_listings(
         }
         for future, (subreddit, sort) in futures.items():
             try:
-                fetched, error = future.result(timeout=LISTING_TIMEOUT + 5)
+                fetched, error = future.result(timeout=_result_timeout(len(jobs)))
             except (Exception, FuturesTimeoutError) as exc:
                 errors.append(f"r/{subreddit} {sort}: {exc}")
                 continue
             items.extend(fetched)
             if error:
                 errors.append(f"r/{subreddit} {sort}: {error}")
+            elif fetched:
+                # Shreddit succeeded for this (sub, sort) lane.
+                shreddit_successes.add((subreddit.lower(), sort.lower()))
 
     seen: set[str] = set()
     unique = []
@@ -245,13 +410,54 @@ def fetch_discovery_listings(
             continue
         seen.add(item["url"])
         unique.append(item)
+
+    # Supplement with arctic-shift for all requested subreddits. Shreddit's
+    # per-sort success/failure is opaque (individual rising/top lanes can fail
+    # while others succeed), so arctic provides coverage for any failed lanes.
+    # Deduplication ensures no redundant posts when shreddit fully succeeded.
+    from . import reddit_arctic
+    arctic_items = reddit_arctic.fetch_listings(
+        valid_subs, depth=depth, query=query, sorts=("rising", "top")
+    )
+    if arctic_items:
+        _log(f"discovery arctic supplement: {len(arctic_items)} posts")
+        # Apply the same keyword gate that pipeline._fetch_discovery_source
+        # uses downstream. When query is empty (global --discover), skip the
+        # gate — there's no keyword to match, and the river feed IS the signal.
+        if query:
+            arctic_items = [
+                item for item in arctic_items
+                if _matches_discovery_domain(
+                    query,
+                    f"{item.get('title') or ''} {item.get('selftext') or ''}",
+                )
+            ]
+        # Merge arctic items into unique list, deduping by URL.
+        added = 0
+        for item in arctic_items:
+            if item["url"] not in seen:
+                seen.add(item["url"])
+                unique.append(item)
+                added += 1
+        if added:
+            _log(f"discovery arctic supplement added {added} new posts")
+
+    # Clear errors only for (sub, sort) pairs where shreddit succeeded.
+    # Arctic supplements recency posts but cannot "recover" a failed hot/top/
+    # rising lane — it has no sort lanes. Errors for failed shreddit lanes are
+    # preserved even when another sort for the same subreddit succeeded.
+    if errors and shreddit_successes:
+        errors = [
+            e for e in errors
+            if not _shreddit_error_recovered(e, shreddit_successes)
+        ]
     return {"items": unique, "errors": errors}
 
 
 def score_index(subreddits: List[str], depth: str = "default") -> Dict[str, Dict[str, int]]:
     """Build a {post_id: {score, num_comments}} map from subreddit listings.
 
-    Used to backfill real scores onto posts discovered via RSS, which carries
+    Used to backfill real scores onto posts discovered by a lane that carries
     no engagement numbers.
     """
     index: Dict[str, Dict[str, int]] = {}

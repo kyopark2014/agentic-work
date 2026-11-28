@@ -10,6 +10,7 @@ import math
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from http.client import HTTPException
 from typing import Any, Dict, List, Optional
 
 import re
@@ -24,6 +25,9 @@ _HN_PREFIXES = re.compile(r"^(Tell HN|Show HN|Ask HN|Launch HN)\s*:\s*", re.IGNO
 ALGOLIA_SEARCH_URL = "https://hn.algolia.com/api/v1/search"
 ALGOLIA_SEARCH_BY_DATE_URL = "https://hn.algolia.com/api/v1/search_by_date"
 ALGOLIA_ITEM_URL = "https://hn.algolia.com/api/v1/items"
+# Official HN Firebase item API — `kids` is in the order the thread displays
+# top-level comments (Algolia's /items children do not carry useful points).
+FIREBASE_ITEM_URL = "https://hacker-news.firebaseio.com/v0/item"
 
 DEPTH_CONFIG = {
     "quick": 15,
@@ -92,11 +96,10 @@ def search_hackernews(
     from_ts = _date_to_unix(from_date)
     to_ts = _date_to_unix(to_date) + 86400  # Include the end date
 
-    # Use extracted core subject instead of raw topic for cleaner Algolia matching
-    core = extract_core_subject(topic)
-    # Hyphens and commas tokenize awkwardly in Algolia; flatten them so themed
-    # queries like "ts-bun-node" or "claude, personal agents" become plain words.
-    core_flat = _flatten_query_for_algolia(core)
+    # Use extracted core subject instead of raw topic for cleaner Algolia matching.
+    # Strip quotes/edge punctuation before and after core extraction so planner-quoted
+    # proper nouns like '"Claude Code"' never leak unbalanced quotes into optionalWords.
+    core_flat = _normalize_query(topic)
     _log(f"Searching for '{core_flat}' (raw: '{topic}', since {from_date}, count={count})")
 
     # Use relevance-sorted search. The HN Algolia index only allows
@@ -189,24 +192,59 @@ def fetch_discovery_listings(
 
 
 _WORD_BOUNDARY_RE_CACHE: Dict[str, "re.Pattern[str]"] = {}
+_EDGE_PUNCT_LEFT = '"\'?!;:()[]{}“”‘’'
+_EDGE_PUNCT_RIGHT = '"\'?!.;:()[]{}“”‘’'
+
+
+def _clean_query_token(token: str) -> str:
+    """Strip quotes and edge punctuation while keeping tech symbols (C++, C#, .NET)."""
+    cleaned = token.lstrip(_EDGE_PUNCT_LEFT).rstrip(_EDGE_PUNCT_RIGHT)
+    if cleaned.startswith(".."):
+        cleaned = cleaned.lstrip(".")
+    return "" if cleaned == "." else cleaned
 
 
 def _flatten_query_for_algolia(text: str) -> str:
     """Normalise query for Algolia + post-filter comparison.
 
-    Multi-keyword theme queries frequently contain commas (delimiters) or
-    hyphens (compound terms like ``ts-bun-node``); both tokenize awkwardly.
-    Flatten them to spaces and collapse runs of whitespace so the search
-    parameter and the post-filter operate on the same shape.
+    Multi-keyword theme queries frequently contain commas (delimiters),
+    hyphens (compound terms like ``ts-bun-node``), planner quotes
+    (``"Claude Code"``), or trailing punctuation (``What is Rust?``).
+    Flatten them to spaces and strip quotes/edge punctuation so the search
+    parameter and the post-filter operate on the same shape while preserving
+    symbol-edged tech terms like ``C++``, ``C#``, ``F#``, and ``.NET``.
     """
-    return " ".join(text.replace(",", " ").replace("-", " ").split())
+    raw_tokens = text.replace(",", " ").replace("-", " ").split()
+    tokens = [cleaned for tok in raw_tokens if (cleaned := _clean_query_token(tok))]
+    return " ".join(tokens)
+
+
+def _normalize_query(text: str) -> str:
+    """Extract core subject and flatten/strip quotes and edge punctuation."""
+    flat = _flatten_query_for_algolia(text)
+    if not flat:
+        return ""
+    return _flatten_query_for_algolia(extract_core_subject(flat))
+
+
+def _word_boundary_pattern(word: str) -> "re.Pattern[str]":
+    """Build a cached whole-token regex that works on symbol-edged terms."""
+    pattern = _WORD_BOUNDARY_RE_CACHE.get(word)
+    if pattern is None:
+        if word[-1].isalnum() or word[-1] == "_":
+            trailing = r"(?!\w)"
+        else:
+            trailing = rf"(?![A-Za-z_{re.escape(word[-1])}])"
+        pattern = re.compile(rf"(?<!\w){re.escape(word)}{trailing}")
+        _WORD_BOUNDARY_RE_CACHE[word] = pattern
+    return pattern
 
 
 def _title_matches_query(title: str, query: str, author: str = "") -> bool:
-    """Check if any query token appears as a whole word in the title.
+    """Check if any query token appears as a whole token in the title.
 
     Returns True when the query is empty (no filter), or when at least one
-    query token matches as a whole word in the title after stripping
+    query token matches as a whole token in the title after stripping
     "Tell HN:", "Show HN:", "Ask HN:", "Launch HN:" prefixes.
 
     We previously required *every* token to appear (all-words), which killed
@@ -217,9 +255,10 @@ def _title_matches_query(title: str, query: str, author: str = "") -> bool:
     demotes hits where only one weak token matched, so the loosened gate
     won't surface noise to the top of the ranking.
 
-    Word-boundary matching (rather than naive substring) prevents short
-    tokens like ``ai`` or ``ts`` from matching unrelated words like
-    ``email`` or ``artists``.
+    Word-character lookarounds (rather than ``\\b`` or naive substring) prevent
+    short tokens like ``ai`` or ``ts`` from matching unrelated words like
+    ``email`` or ``artists`` while still matching symbol-edged tech terms like
+    ``C++``, ``C#``, ``F#``, and ``.NET``.
     """
     if not query:
         return True
@@ -227,15 +266,11 @@ def _title_matches_query(title: str, query: str, author: str = "") -> bool:
     check_text = stripped.lower()
     # Normalise the query the same way search_hackernews does so post-filter
     # tokens line up with what Algolia actually saw.
-    query_words = [w for w in _flatten_query_for_algolia(query.lower()).split() if w]
+    query_words = [w for w in _normalize_query(query).lower().split() if w]
     if not query_words:
         return True
     for word in query_words:
-        pattern = _WORD_BOUNDARY_RE_CACHE.get(word)
-        if pattern is None:
-            pattern = re.compile(rf"\b{re.escape(word)}\b")
-            _WORD_BOUNDARY_RE_CACHE[word] = pattern
-        if pattern.search(check_text):
+        if _word_boundary_pattern(word).search(check_text):
             return True
     return False
 
@@ -275,7 +310,7 @@ def parse_hackernews_response(response: Dict[str, Any], query: str = "") -> List
 
         # Article URL vs HN discussion URL
         article_url = hit.get("url") or ""
-        hn_url = f"https://news.ycombinator.com/item?id={object_id}"
+        hn_url = _hn_item_url(object_id)
 
         # Relevance: blend Algolia rank with token-overlap content matching
         rank_score = max(0.3, 1.0 - (i * 0.02))  # 1.0 -> 0.3 over 35 items
@@ -304,6 +339,73 @@ def parse_hackernews_response(response: Dict[str, Any], query: str = "") -> List
     return items
 
 
+def _hn_item_url(item_id: Any) -> str:
+    """HN discussion/comment permalink for an item id."""
+    return f"https://news.ycombinator.com/item?id={item_id}"
+
+
+# Ordering is optional, so a slow Firebase must not hold up the report.
+FIREBASE_KIDS_TIMEOUT = 5
+FIREBASE_KIDS_RETRIES = 2
+FIREBASE_KIDS_BUDGET = 8.0
+
+
+def _fetch_hn_kids(object_id: str) -> Optional[List[Any]]:
+    """Return HN's display order for a story's top-level comments, or None on failure.
+
+    Algolia's `/items/<id>` children list is effectively id-order with `points`
+    always null, so sorting by points is a no-op (#1285). The Firebase item
+    endpoint returns `kids` in the same order the HN thread UI shows.
+    """
+    url = f"{FIREBASE_ITEM_URL}/{object_id}.json"
+    # Comment order is a refinement over comments Algolia already returned, so a
+    # Firebase failure must not reach the pipeline's sink and mark HN degraded.
+    try:
+        with http.capture_failures():
+            data = http.request(
+                "GET",
+                url,
+                timeout=FIREBASE_KIDS_TIMEOUT,
+                retries=FIREBASE_KIDS_RETRIES,
+                deadline_monotonic=time.monotonic() + FIREBASE_KIDS_BUDGET,
+            )
+    # http.request wraps HTTP and socket errors, but a truncated or non-UTF-8
+    # body escapes as IncompleteRead or UnicodeDecodeError.
+    except (http.HTTPError, HTTPException, UnicodeDecodeError) as e:
+        _log(f"Failed to fetch HN kids for {object_id}: {e}")
+        return None
+    if not isinstance(data, dict):
+        return None
+    kids = data.get("kids")
+    if not isinstance(kids, list):
+        return None
+    return kids
+
+
+def _order_comments_by_kids(
+    comments: List[Dict[str, Any]],
+    kids: List[Any],
+) -> List[Dict[str, Any]]:
+    """Reorder Algolia children to match HN `kids` order; unknowns keep relative order."""
+    by_id: Dict[Any, Dict[str, Any]] = {}
+    for comment in comments:
+        cid = comment.get("id")
+        if cid is not None and cid not in by_id:
+            by_id[cid] = comment
+    ordered: List[Dict[str, Any]] = []
+    seen = set()
+    for kid in kids:
+        comment = by_id.get(kid)
+        if comment is not None:
+            ordered.append(comment)
+            seen.add(kid)
+    for comment in comments:
+        cid = comment.get("id")
+        if cid not in seen:
+            ordered.append(comment)
+    return ordered
+
+
 def _fetch_item_comments(object_id: str, max_comments: int = 5) -> Dict[str, Any]:
     """Fetch top-level comments for a story from Algolia items endpoint.
 
@@ -324,22 +426,33 @@ def _fetch_item_comments(object_id: str, max_comments: int = 5) -> Dict[str, Any
 
     children = data.get("children", [])
 
-    # Sort by points (highest first), filter to actual comments
+    # Filter to actual comments. Prefer HN's Firebase `kids` order (#1285);
+    # Algolia children have null points, so a points sort is a no-op and leaves
+    # earliest-posted replies first. Fall back to points only when kids is unavailable.
     real_comments = [
         c for c in children
         if c.get("text") and c.get("author")
     ]
-    real_comments.sort(key=lambda c: c.get("points") or 0, reverse=True)
+    kids = _fetch_hn_kids(object_id)
+    if kids is not None:
+        real_comments = _order_comments_by_kids(real_comments, kids)
+    else:
+        real_comments.sort(key=lambda c: c.get("points") or 0, reverse=True)
 
     comments = []
     insights = []
+    # A quote links to where it was said: the comment's own permalink, else the
+    # story's discussion page -- never the article URL.
+    discussion_url = _hn_item_url(object_id)
     for c in real_comments[:max_comments]:
         text = _strip_html(c.get("text", ""))
         excerpt = text[:300] + "..." if len(text) > 300 else text
+        comment_id = c.get("id")
         comments.append({
             "author": c.get("author", ""),
             "text": excerpt,
             "points": c.get("points"),
+            "url": _hn_item_url(comment_id) if comment_id else discussion_url,
         })
         # First sentence as insight
         first_sentence = text.split(". ")[0].split("\n")[0][:200]
@@ -378,8 +491,12 @@ def enrich_top_stories(
     _log(f"Enriching top {len(to_enrich)} stories with comments")
 
     with ThreadPoolExecutor(max_workers=5) as executor:
+        # submit_with_context, not executor.submit: a plain submit drops the
+        # pipeline's capture_failures() sink, so failed or rate-limited item
+        # fetches would vanish and the HN source would look fully enriched.
         futures = {
-            executor.submit(
+            http.submit_with_context(
+                executor,
                 _fetch_item_comments,
                 items[idx]["id"],
             ): idx

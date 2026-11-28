@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import datetime
+import errno
 import json
 import locale
 import os
+import re
+import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,6 +54,18 @@ KEYCHAIN_SERVICE_PREFIX = "last30days-"
 # A string value is shorthand for {"service": "..."} with the current user.
 KEYCHAIN_ALIASES_ENV = "LAST30DAYS_KEYCHAIN_ALIASES"
 
+# Opt-out switch for the Keychain source. Set truthy to make _load_keychain a
+# no-op on Darwin too. Tests that assert on "no credentials configured"
+# behaviour need this: stripping os.environ and pointing LAST30DAYS_CONFIG_DIR
+# at nothing still leaves Keychain as a third source, so on a contributor's Mac
+# a stored key can silently satisfy a lookup the test meant to see fail.
+KEYCHAIN_DISABLE_ENV = "LAST30DAYS_SKIP_KEYCHAIN"
+
+X_COOKIE_ACCESS_FIX = (
+    "Check the browser-data permissions for the terminal or agent host and retry setup. "
+    "If access remains blocked, set AUTH_TOKEN and CT0 manually or use XAI_API_KEY."
+)
+
 # Single source of truth for which credentials the Keychain loader looks up.
 # The setup-keychain.sh helper mirrors this list and is held in sync via
 # tests/test_env_keychain.py::test_keychain_keys_match_setup_script.
@@ -60,7 +75,8 @@ KEYCHAIN_KEYS = (
     "AUTH_TOKEN", "CT0", "BSKY_HANDLE", "BSKY_APP_PASSWORD",
     "TRUTHSOCIAL_TOKEN", "BRAVE_API_KEY", "EXA_API_KEY", "SERPER_API_KEY",
     "OPENROUTER_API_KEY", "PERPLEXITY_API_KEY", "PARALLEL_API_KEY", "XQUIK_API_KEY",
-    "XIAOHONGSHU_API_BASE", "GITHUB_TOKEN",
+    "XIAOHONGSHU_API_BASE", "GITHUB_TOKEN", "BRIGHTDATA_API_KEY",
+    "X_BEARER_TOKEN", "DEEPLINE_API_KEY",
 )
 
 # pass(1) integration: Linux/Unix analog of the Keychain source. Each key in
@@ -110,12 +126,87 @@ class ConfigLoadPolicy:
     browser_cookies: BrowserCookieMode = "off"
     allow_project_config: bool = False
     inspect_ignored_project_config: bool = False
+    require_recorded_browser_consent: bool = False
+    load_secret_stores: bool = True
 
 
 def _truthy(value: Any) -> bool:
     if value is None:
         return False
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+# A Claude Desktop extension maps every unset field in its config modal to the
+# literal string ``${user_config.<field>}`` in the engine's environment. The
+# placeholder is non-empty, so a presence check reads it as a real credential:
+# doctor reports the source healthy, preflight returns ready, and the backend
+# sends the literal placeholder upstream and surfaces the vendor's 401 instead
+# of falling back. Two constraints keep legitimate values out of scope. The
+# match is anchored to the whole trimmed value, so a real credential containing
+# ``$`` or braces is untouched. And the field name is restricted to the
+# identifier charset the manifest uses, so shell-default syntax is not mistaken
+# for a placeholder - both the generic form a user may paste into ``.env``
+# (``${VAR:-default}``) and the namespaced form with a default
+# (``${user_config.x:-default}``). Only the extension namespace, as issue
+# #1081's own suggested fix names, is rejected.
+_UNSUBSTITUTED_TEMPLATE = re.compile(r"^\$\{user_config\.[A-Za-z0-9_]+\}$")
+
+# Config-record key holding the names of values rejected above, so diagnostics
+# report the templated state instead of silently counting the key absent.
+TEMPLATE_CONFIG_KEYS = "_TEMPLATE_CONFIG_KEYS"
+
+
+def is_unsubstituted_template(value: Any) -> bool:
+    """True when ``value`` is a whole, unexpanded ``${user_config.*}`` placeholder."""
+    if not isinstance(value, str):
+        return False
+    return bool(_UNSUBSTITUTED_TEMPLATE.match(value.strip()))
+
+
+def templated_config_keys(config: dict[str, Any]) -> list[str]:
+    """Public view of the keys ``get_config()`` rejected as unsubstituted templates.
+
+    Thin reader so diagnostics report the templated state without re-deriving
+    the record key, in the same spirit as ``include_sources`` and
+    ``is_setup_complete``. Sorted here too: these call sites also see hand-built
+    configs, and the order is user-visible in both diagnostics.
+    """
+    return sorted(config.get(TEMPLATE_CONFIG_KEYS) or [])
+
+
+def _rotate_scrapecreators_key(config: dict[str, Any]) -> None:
+    """Round-robin a comma-separated SCRAPECREATORS_API_KEY to one key per run.
+
+    Filters any unsubstituted ``${user_config.*}`` placeholders from the list
+    so a partial placeholder entry cannot be selected over a real key.
+    """
+    raw = config.get('SCRAPECREATORS_API_KEY') or ''
+    if ',' not in raw:
+        return
+    import random
+    sc_keys = [
+        k.strip()
+        for k in raw.split(',')
+        if k.strip() and not is_unsubstituted_template(k)
+    ]
+    config['SCRAPECREATORS_API_KEY'] = random.choice(sc_keys) if sc_keys else ''
+
+
+def _strip_layer_templates(
+    mapping: dict[str, str],
+    allowed_keys: frozenset[str],
+    templated_seen: set[str],
+    *,
+    canonical_map: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Return a copy of ``mapping`` without ``${user_config.*}`` placeholders."""
+    cleaned: dict[str, str] = {}
+    for key, value in mapping.items():
+        if key in allowed_keys and is_unsubstituted_template(value):
+            templated_seen.add((canonical_map or {}).get(key, key))
+            continue
+        cleaned[key] = value
+    return cleaned
 
 
 def is_timestamp_fresh(timestamp_value: Any, ttl_seconds: int) -> bool:
@@ -147,7 +238,7 @@ def _project_config_trusted(policy: ConfigLoadPolicy, file_env: dict[str, Any]) 
     if policy.allow_project_config:
         return True
     process_value = os.environ.get("LAST30DAYS_TRUST_PROJECT_CONFIG")
-    if process_value is not None:
+    if process_value is not None and not is_unsubstituted_template(process_value):
         return _truthy(process_value)
     return _truthy(file_env.get("LAST30DAYS_TRUST_PROJECT_CONFIG"))
 
@@ -172,11 +263,150 @@ def _check_file_permissions(path: Path) -> None:
         sys.stderr.flush()
 
 
-def load_env_file(path: Path) -> dict[str, str]:
-    """Load environment variables from a file."""
-    env = {}
-    if not path or not path.exists():
+def _strip_inline_comment(value: str) -> str:
+    """Drop a trailing ``# comment`` from the right-hand side of a KEY=value line.
+
+    Unquoted: ``#`` opens a comment only as the first non-blank character or
+    when preceded by whitespace, so ``value#nothash`` stays intact. Quoted:
+    everything up to the matching close quote is kept verbatim; only a
+    whitespace-separated ``#`` after the close quote is dropped. Anything that
+    does not match those shapes is returned unchanged for the existing quote
+    handling to deal with.
+    """
+    stripped = value.lstrip()
+    if stripped[:1] in ('"', "'"):
+        end = stripped.find(stripped[0], 1)
+        if end == -1:
+            return value
+        rest = stripped[end + 1:]
+        if rest[:1].isspace() and rest.lstrip().startswith('#'):
+            return stripped[:end + 1]
+        return value
+    match = re.search(r'(?:^|\s)#', stripped)
+    if match:
+        return stripped[:match.start()]
+    return value
+
+
+# ``export KEY=value`` is the shell spelling people paste into .env files, and
+# python-dotenv and docker compose accept it too. The prefix only counts when
+# whitespace and a key follow it, so a key literally named ``export`` is kept.
+_EXPORT_PREFIX = re.compile(r'export\s+')
+
+
+def env_line_key(lhs: str) -> str:
+    """Return the key named by the left-hand side of a ``KEY=value`` line.
+
+    Shared with the setup wizard's .env writers so that reading and writing
+    agree on which key a hand-written line sets.
+    """
+    key = lhs.strip()
+    match = _EXPORT_PREFIX.match(key)
+    return key[match.end():] if match else key
+
+
+_MAX_ENV_FILE_BYTES = 256 * 1024
+_ENV_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _is_symlink_or_junction(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    isjunction = getattr(os.path, "isjunction", None)
+    return bool(isjunction and isjunction(path))
+
+
+class ConfigReadError(OSError):
+    """A config file that exists could not be read right now (the cause is chained)."""
+
+
+# A missing file, a path that is not a file, or a refused symlink is an ordinary
+# absent or unsafe config. Any other read failure may pass on a later attempt.
+_ABSENT_OR_UNSAFE_ERRNOS = frozenset({
+    errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.EMLINK, errno.EISDIR,
+})
+
+
+def _is_transient_read_error(exc: OSError) -> bool:
+    if isinstance(exc, (FileNotFoundError, NotADirectoryError, IsADirectoryError)):
+        return False
+    return exc.errno not in _ABSENT_OR_UNSAFE_ERRNOS
+
+
+def load_env_file(
+    path: Path,
+    *,
+    allow_symlink: bool = True,
+    strict_keys: bool = False,
+    raise_read_errors: bool = False,
+) -> dict[str, str]:
+    """Load environment variables from a file.
+
+    An unreadable file yields ``{}`` unless ``raise_read_errors`` is set. Then a
+    read failure that could pass on a later attempt raises ``ConfigReadError``, while a
+    missing file or a refused symlink still yields ``{}``.
+    """
+    env: dict[str, str] = {}
+    if not path:
         return env
+    if not allow_symlink and (
+        _is_symlink_or_junction(path) or _is_symlink_or_junction(path.parent)
+    ):
+        return env
+
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    if not allow_symlink:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = -1
+    parent_fd = -1
+    try:
+        if (
+            not allow_symlink
+            and path.name
+            and os.open in os.supports_dir_fd
+            and hasattr(os, "O_DIRECTORY")
+            and hasattr(os, "O_NOFOLLOW")
+        ):
+            parent_fd = os.open(
+                path.parent,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+            fd = os.open(path.name, flags, dir_fd=parent_fd)
+        else:
+            fd = os.open(path, flags)
+    except OSError as exc:
+        if raise_read_errors and _is_transient_read_error(exc):
+            raise ConfigReadError(f"config file could not be opened ({type(exc).__name__})") from exc
+        return env
+    finally:
+        if parent_fd >= 0:
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
+
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > _MAX_ENV_FILE_BYTES:
+            return env
+        handle = os.fdopen(fd, "rb")
+        fd = -1
+        with handle:
+            raw = handle.read(_MAX_ENV_FILE_BYTES + 1)
+    except OSError as exc:
+        if raise_read_errors and _is_transient_read_error(exc):
+            raise ConfigReadError(f"config file could not be read ({type(exc).__name__})") from exc
+        return env
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    if len(raw) > _MAX_ENV_FILE_BYTES:
+        return env
+
     _check_file_permissions(path)
 
     # Prefer UTF-8 (utf-8-sig transparently strips a BOM written by Windows
@@ -185,9 +415,9 @@ def load_env_file(path: Path) -> dict[str, str]:
     # keeps loading. If it decodes as neither, let UnicodeDecodeError surface
     # rather than corrupting keys/secrets with replacement characters.
     try:
-        text = path.read_text(encoding='utf-8-sig')
+        text = raw.decode('utf-8-sig')
     except UnicodeDecodeError:
-        text = path.read_text(encoding=locale.getpreferredencoding(False))
+        text = raw.decode(locale.getpreferredencoding(False))
 
     for line in text.splitlines():
         line = line.strip()
@@ -195,12 +425,16 @@ def load_env_file(path: Path) -> dict[str, str]:
             continue
         if '=' in line:
             key, _, value = line.partition('=')
-            key = key.strip()
-            value = value.strip()
+            key = env_line_key(key)
+            if strict_keys and not _ENV_IDENT_RE.fullmatch(key):
+                continue
+            value = _strip_inline_comment(value).strip()
             # Remove quotes if present
             if value and value[0] in ('"', "'") and value[-1] == value[0]:
                 value = value[1:-1]
-            if key and value:
+            # These settings use empty as a persisted disable; secrets still
+            # drop blanks instead of overriding a configured credential.
+            if key and (value or key in {'LAST30DAYS_YT_PLAYER_CLIENT', 'LAST30DAYS_MEMORY_DIR'}):
                 env.update({key: value})
     return env
 
@@ -262,7 +496,16 @@ def _load_keychain(keys: list[str], aliases: dict[str, list[dict[str, str]]] | N
     ``LAST30DAYS_KEYCHAIN_ALIASES``. Lookup failures are silent — Keychain is
     the lowest-priority source and is meant to be additive over `.env` files
     and process environment.
+
+    Set ``LAST30DAYS_SKIP_KEYCHAIN`` truthy to disable the source entirely. It
+    is read from the process environment only, never from a config file: it
+    gates a credential source that is consulted *while* the config is being
+    assembled, so a file-sourced value would be read too late to have any
+    effect.
     """
+    if _truthy(os.environ.get(KEYCHAIN_DISABLE_ENV)):
+        return {}
+
     import platform
     if platform.system() != "Darwin":
         return {}
@@ -327,11 +570,12 @@ def _load_pass(keys: list[str], prefix: str) -> dict[str, str]:
     looked up at pass path ``f"{prefix}{key}"`` — mirroring Keychain's
     ``last30days-<key>`` service-name convention — so any user stores keys under
     that namespace without editing code (prefix overridable via
-    ``LAST30DAYS_PASS_PREFIX``). The secret is decrypted in a subprocess and
-    read from stdout's first line (pass keeps the secret there; any metadata
-    follows) — never written to disk, never logged. Honors ``PASSWORD_STORE_DIR``.
-    Missing entries and failures are silent: pass is a lowest-priority, additive
-    source like Keychain, so an explicit .env or process-env value still wins.
+    ``LAST30DAYS_PASS_PREFIX``, used verbatim to match ``setup-pass.sh``). The
+    secret is decrypted in a subprocess and read from stdout's first line (pass
+    keeps the secret there; any metadata follows) — never written to disk, never
+    logged. Honors ``PASSWORD_STORE_DIR``. Missing entries and failures are
+    silent: pass is a lowest-priority, additive source like Keychain, so an
+    explicit .env or process-env value still wins.
     """
     import shutil
     pass_bin = shutil.which("pass")
@@ -343,7 +587,7 @@ def _load_pass(keys: list[str], prefix: str) -> dict[str, str]:
     for key in keys:
         try:
             result = subprocess.run(
-                [pass_bin, "show", f"{prefix}{key}"],
+                [pass_bin, "show", "--", f"{prefix}{key}"],
                 capture_output=True, text=True, timeout=5,
                 encoding="utf-8", errors="replace",
             )
@@ -361,7 +605,13 @@ def _load_pass(keys: list[str], prefix: str) -> dict[str, str]:
 
 def get_openai_auth(file_env: dict[str, str]) -> OpenAIAuth:
     """Resolve OpenAI API auth from explicit user-provided API keys."""
-    api_key = read_secret_env('OPENAI_API_KEY') or file_env.get('OPENAI_API_KEY')
+    env_key = read_secret_env('OPENAI_API_KEY')
+    if is_unsubstituted_template(env_key):
+        env_key = None
+    file_key = file_env.get('OPENAI_API_KEY')
+    if is_unsubstituted_template(file_key):
+        file_key = None
+    api_key = env_key or file_key
     if api_key:
         return OpenAIAuth(
             token=api_key,
@@ -381,18 +631,102 @@ def _find_project_env() -> Path | None:
 
     Searches for .claude/last30days.env in each parent directory,
     stopping at the git root, user's home directory, or filesystem root.
+    Rejects symlinks, junctions, and non-regular files so an untrusted
+    repository cannot redirect config reads outside the project tree.
     """
     cwd = Path.cwd()
     for parent in [cwd, *cwd.parents]:
-        candidate = parent / '.claude' / 'last30days.env'
-        if candidate.exists():
-            return candidate
+        claude_dir = parent / '.claude'
+        candidate = claude_dir / 'last30days.env'
+        if not _is_symlink_or_junction(claude_dir) and not _is_symlink_or_junction(candidate):
+            try:
+                st = candidate.lstat()
+            except OSError:
+                st = None
+            if st is not None and stat.S_ISREG(st.st_mode):
+                return candidate
         if (parent / ".git").exists():
             break
         # Stop at filesystem root or home
         if parent == Path.home() or parent == parent.parent:
             break
     return None
+
+
+def _load_config_files(
+    policy: ConfigLoadPolicy,
+    *,
+    raise_read_errors: bool = False,
+) -> tuple[dict[str, str], dict[str, str], Path | None]:
+    file_env = (
+        load_env_file(CONFIG_FILE, raise_read_errors=raise_read_errors) if CONFIG_FILE else {}
+    )
+    project_path = _find_project_env() if _project_config_trusted(policy, file_env) else None
+    project_env = (
+        load_env_file(project_path, allow_symlink=False, raise_read_errors=raise_read_errors)
+        if project_path else {}
+    )
+    return file_env, project_env, project_path
+
+
+def resolve_searxng_url() -> str | None:
+    """Read only the approved SearXNG setting, without exporting process settings."""
+    key = "LAST30DAYS_SEARXNG_URL"
+    value = os.environ.get(key)
+    if value and not is_unsubstituted_template(value):
+        return value
+    # A read failure that may pass raises ConfigReadError, so a caller can retry instead of
+    # remembering "no URL". A missing or unsafe file is still just absent.
+    file_env, project_env, _ = _load_config_files(ConfigLoadPolicy(), raise_read_errors=True)
+    for layer in (project_env, file_env):
+        value = layer.get(key)
+        if value is not None and not is_unsubstituted_template(value):
+            return value
+    return None
+
+
+def has_recorded_browser_consent() -> bool:
+    """Check whether setup can reuse explicit consent without opening credential stores."""
+    file_env, project_env, _ = _load_config_files(ConfigLoadPolicy())
+    consent_keys = frozenset({"BROWSER_CONSENT", "FROM_BROWSER"})
+    discarded: set[str] = set()
+    file_env = _strip_layer_templates(file_env, consent_keys, discarded)
+    project_env = _strip_layer_templates(project_env, consent_keys, discarded)
+    file_settings = {**file_env, **project_env}
+    config = {}
+    for key in ("BROWSER_CONSENT", "FROM_BROWSER"):
+        value = os.environ.get(key)
+        config[key] = (
+            file_settings.get(key)
+            if not value or is_unsubstituted_template(value)
+            else value
+        )
+    return browser_consent_granted(config)
+
+
+def _configured_memory_dir(*values: str | None) -> str | None:
+    for value in values:
+        if value is not None and not is_unsubstituted_template(value):
+            return value
+    return None
+
+
+def resolve_memory_dir(save_dir: str | None = None) -> str:
+    """Resolve the skill's save directory without credential-store access."""
+    value = save_dir
+    if value is None:
+        value = _configured_memory_dir(os.environ.get("LAST30DAYS_MEMORY_DIR"))
+    if value is None:
+        file_env, project_env, _ = _load_config_files(ConfigLoadPolicy())
+        value = _configured_memory_dir(
+            project_env.get("LAST30DAYS_MEMORY_DIR"),
+            file_env.get("LAST30DAYS_MEMORY_DIR"),
+        )
+    if value is None:
+        value = str(Path.home() / "Documents" / "Last30Days")
+    if value and not value.strip():
+        raise ValueError("--save-dir / LAST30DAYS_MEMORY_DIR cannot be whitespace-only.")
+    return str(Path(value).expanduser().absolute()) if value else ""
 
 
 def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
@@ -405,56 +739,6 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
       4. macOS Keychain items prefixed ``last30days-`` (Darwin only)
     """
     policy = policy or ConfigLoadPolicy()
-    # Load from global config file
-    file_env = load_env_file(CONFIG_FILE) if CONFIG_FILE else {}
-
-    # Load per-project config only when trust comes from process env, global
-    # user config, or an explicit policy. A project file cannot grant trust to
-    # itself because it is not parsed until after this decision.
-    project_config_trusted = _project_config_trusted(policy, file_env)
-    project_env_path = _find_project_env() if project_config_trusted else None
-    project_env = load_env_file(project_env_path) if project_env_path else {}
-    ignored_project_env_path = None
-    ignored_project_keys: list[str] = []
-    if not project_config_trusted and policy.inspect_ignored_project_config:
-        ignored_project_env_path = _find_project_env()
-        if ignored_project_env_path:
-            ignored_project_keys = sorted(load_env_file(ignored_project_env_path).keys())
-
-    # Merge file sources: project > global
-    merged_env = {**file_env, **project_env}
-
-    # Keychain is the lowest-priority source (Darwin only; no-op elsewhere).
-    # Loaded before openai_auth so OPENAI_API_KEY can come from Keychain too.
-    keychain_aliases_raw = os.environ.get(KEYCHAIN_ALIASES_ENV) or merged_env.get(KEYCHAIN_ALIASES_ENV)
-    keychain_aliases = _parse_keychain_aliases(keychain_aliases_raw)
-    keychain_env = _load_keychain(list(KEYCHAIN_KEYS), keychain_aliases)
-    merged_env = {**keychain_env, **merged_env}
-    # pass(1) store: Linux/Unix analog of Keychain at convention path
-    # {prefix}<KEY>. Decrypts transiently so secrets stay encrypted at rest (no
-    # plaintext .env). Lowest priority: Keychain, the config files, and process
-    # env all win over it. Two efficiency guards so a user who merely has `pass`
-    # on PATH doesn't pay for it: resolve the prefix from the loaded config/env
-    # (not import time, so a .env-set LAST30DAYS_PASS_PREFIX is honored), and
-    # probe ONLY keys still unset after the higher-priority sources — an empty
-    # list short-circuits with no gpg/pinentry calls at all.
-    pass_prefix = (
-        os.environ.get("LAST30DAYS_PASS_PREFIX")
-        or merged_env.get("LAST30DAYS_PASS_PREFIX")
-        or DEFAULT_PASS_PATH_PREFIX
-    )
-    pass_missing = [k for k in KEYCHAIN_KEYS if k not in os.environ and not merged_env.get(k)]
-    pass_env = _load_pass(pass_missing, pass_prefix)
-    merged_env = {**pass_env, **merged_env}
-
-    openai_auth = get_openai_auth(merged_env)
-
-    # Build config: Codex/OpenAI auth + process.env > project .env > global .env
-    config = {
-        'OPENAI_API_KEY': openai_auth.token,
-        'OPENAI_AUTH_SOURCE': openai_auth.source,
-        'OPENAI_AUTH_STATUS': openai_auth.status,
-    }
 
     keys = [
         # Debug flag; also exported to os.environ below so log.py's lazy
@@ -470,12 +754,27 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         ('LAST30DAYS_RERANK_MODEL', None),
         ('LAST30DAYS_X_MODEL', None),
         ('LAST30DAYS_X_BACKEND', None),
+        # Wall-clock budget (seconds) for the X backend chain. Default 90; a
+        # grok call on a subscription account measured 150-170s, so pinning
+        # grok needs a larger budget to return the first call's posts. Read
+        # from the resolved config only (pipeline._x_chain_budget_seconds);
+        # blank/invalid/non-finite/non-positive falls back to 90, values above
+        # 240 clamp to 240 (the default-depth grok per-call ceiling).
+        ('LAST30DAYS_X_BUDGET_SECONDS', None),
         ('LAST30DAYS_REDDIT_BACKEND', None),
+        ('LAST30DAYS_YOUTUBE_BACKEND', None),
+        # Jobs lane: skip a job listing its site's robots.txt disallows.
+        # job_boards.robots reads os.environ, so .env values are exported below.
+        ('LAST30DAYS_JOBS_RESPECT_ROBOTS', None),
+        # Keyless reddit.com token-bucket rate (req/sec). http.py reads it
+        # from os.environ on each acquire, so .env values are exported below.
+        ('LAST30DAYS_REDDIT_KEYLESS_RATE', None),
         # Doctor cache freshness window in seconds (doctor --cached).
         ('LAST30DAYS_DOCTOR_TTL', None),
         # Per-source deadline (seconds) for doctor --probe live checks.
         ('LAST30DAYS_DOCTOR_PROBE_TIMEOUT', None),
         ('LAST30DAYS_REDDIT_SC_MIN_ITEMS', None),
+        ('LAST30DAYS_YT_SC_MIN_ITEMS', None),
         ('LAST30DAYS_STORE', None),
         # Discovery topic queue (podcast/X-article pipeline memory). Default
         # ON; the literal value "off" disables queue writes and annotations.
@@ -498,6 +797,8 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         ('LAST30DAYS_CORPUS_IN_EXPORT', None),
         ('LAST30DAYS_LIBRARY_OWNER', None),
         ('LAST30DAYS_LIBRARY_CONTEXT', 'on'),
+        ('LAST30DAYS_AUTO_CAPTURE', 'on'),
+        ('LAST30DAYS_HOOK_DEBUG', None),
         ('LAST30DAYS_PUBLISH_PASSWORD', None),
         ('OPENAI_MODEL_PIN', None),
         ('XAI_MODEL_PIN', None),
@@ -505,6 +806,7 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         ('XAI_BASE_URL', None),
         ('OPENROUTER_BASE_URL', None),
         ('SCRAPECREATORS_API_KEY', None),
+        ('SCRAPECREATORS_BASE_URL', None),
         ('APIFY_API_TOKEN', None),
         ('AUTH_TOKEN', None),
         ('CT0', None),
@@ -517,10 +819,18 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         ('SERPER_API_KEY', None),
         ('OPENROUTER_API_KEY', None),
         ('PERPLEXITY_API_KEY', None),
-        ('LAST30DAYS_PERPLEXITY_MODE', 'sonar'),
+        ('LAST30DAYS_PERPLEXITY_MODE', 'agent'),
+        # Legacy Sonar setting. Retain it during migration so existing env
+        # files load, but the Agent adapter does not map it to a dynamic preset.
         ('LAST30DAYS_PERPLEXITY_MODEL', None),
+        ('LAST30DAYS_PERPLEXITY_AGENT_MODEL', None),
+        ('LAST30DAYS_PERPLEXITY_AGENT_PRESET', None),
+        ('LAST30DAYS_PERPLEXITY_AGENT_MAX_STEPS', None),
+        ('LAST30DAYS_PERPLEXITY_AGENT_MAX_OUTPUT_TOKENS', None),
+        ('LAST30DAYS_PERPLEXITY_AGENT_TIMEOUT_SECONDS', '120'),
         ('LAST30DAYS_PERPLEXITY_MAX_RESULTS', None),
         ('LAST30DAYS_PERPLEXITY_SEARCH_CONTEXT_SIZE', None),
+        ('LAST30DAYS_PERPLEXITY_SEARCH_TYPE', None),
         ('LAST30DAYS_PERPLEXITY_SEARCH_MODE', None),
         ('LAST30DAYS_PERPLEXITY_DOMAIN_FILTER', None),
         ('LAST30DAYS_PERPLEXITY_LANGUAGE_FILTER', None),
@@ -530,16 +840,60 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         ('LAST30DAYS_PERPLEXITY_DEEP_TIMEOUT_SECONDS', '600'),
         ('PARALLEL_API_KEY', None),
         ('XQUIK_API_KEY', None),
+        # Deepline: one key for the person-run lanes (LinkedIn profile and
+        # posts, name-to-profile lookup). Called directly, never proxied.
+        ('DEEPLINE_API_KEY', None),
+        # Bright Data CLI. Optional: the CLI normally owns its own auth via
+        # `brightdata login`, so this only matters for users who prefer an
+        # explicit key in a `.env` file or the keychain. Registered here so
+        # those layers reach the gate and the subprocess environment alike.
+        ('BRIGHTDATA_API_KEY', None),
+        # Amazon marketplace the amazon source searches. Non-US users point
+        # this at their own storefront (e.g. https://www.amazon.co.uk).
+        ('LAST30DAYS_AMAZON_DOMAIN', 'https://www.amazon.com'),
+        # Ad Library country for the meta_ads source, as a two-letter code. The
+        # endpoint takes exactly one country per call. There is deliberately no
+        # durable env form of the advertiser-page override: a page id is
+        # per-topic state, and env keys ride through the competitor runner's
+        # config copy, which would attach one brand's ads to every peer.
+        ('LAST30DAYS_META_ADS_COUNTRY', 'US'),
         # Host-native search signal: set by the SKILL.md agent-host path when the
         # invoking runtime has its own (better) web-search tool, so the engine's
         # keyless search floor stays off there. Defaults unset -> floor allowed.
         ('LAST30DAYS_NATIVE_SEARCH', None),
         # Optional SearXNG instance for the keyless-search fallback rung.
         ('LAST30DAYS_SEARXNG_URL', None),
+        # Keyless TikTok/Instagram lane switches (lib/shortform_oss.py):
+        # discovery freshness (on/off/backend list) and TikTok creator expansion.
+        ('LAST30DAYS_SHORTFORM_FRESHNESS', None),
+        ('LAST30DAYS_SHORTFORM_CREATOR_EXPANSION', None),
+        # TikTok top comments from TikTok's public web endpoint (free, no key):
+        # on (default) or off. Off puts comment calls back on ScrapeCreators.
+        ('LAST30DAYS_TIKTOK_PUBLIC_COMMENTS', None),
         # Truthy -> disable Trustpilot's headless-Chrome WAF-cookie harvest in
         # automated contexts (cron/CI/eval). Read by trustpilot._harvest_allowed.
         ('LAST30DAYS_TRUSTPILOT_NO_BROWSER', None),
         ('FROM_BROWSER', None),
+        ('BROWSER_CONSENT', None),
+        # Opt-in logged-in Reddit session (lib/reddit_session.py). Its own
+        # consent, separate from BROWSER_CONSENT (which can only veto it),
+        # and its own browser, recorded by `setup --reddit-session`.
+        (REDDIT_CONSENT_VAR, None),
+        (REDDIT_FROM_BROWSER_VAR, None),
+        (REDDIT_OFFERED_VAR, None),
+        (REDDIT_SESSION_SCHEDULED_VAR, None),
+        # Process env only (see the loop below): a .env line must not make
+        # every run look scheduled.
+        (SCHEDULED_RUN_VAR, None),
+        ('LAST30DAYS_X_COOKIE_ACCESS_DENIED', None),
+        # agentcookie sidecar: soft-dep X cookie source (lib/agentcookie.py),
+        # active only on extra hosts (Linux / Mac mini / Darwin sink) or when
+        # set to "on". "off" disables the sidecar reader.
+        ('AGENTCOOKIE', None),
+        # Explicit Chrome DevTools endpoint for the extra-host CDP cookie
+        # lookup (lib/chrome_cdp.py), e.g. http://127.0.0.1:18800. Preferred
+        # over the 18800 / 9222+$DISPLAY defaults when set.
+        ('BROWSER_CDP_URL', None),
         ('LAST30DAYS_TRUST_PROJECT_CONFIG', None),
         ('SETUP_COMPLETE', None),
         ('INCLUDE_SOURCES', ''),
@@ -554,6 +908,10 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         # follow-up command. New writes use LAST30DAYS_REGISTER=eli5.
         ('ELI5_MODE', None),
         ('LAST30DAYS_YOUTUBE_SSH_HOST', None),
+        # Proxy for yt-dlp; YT_PROXY is the short alias. Only routes yt-dlp
+        # traffic — does not affect other HTTP calls the skill makes.
+        ('YOUTUBE_PROXY', None),
+        ('YT_PROXY', None),
         ('LAST30DAYS_REPORT_CACHE_TTL_SECONDS', None),
         ('LAST30DAYS_VERIFY_FRESHNESS', None),
         ('LAST30DAYS_TRANSCRIPT_TIMEOUT', None),
@@ -564,13 +922,185 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         # resolved above via openai_auth).
         ('GROQ_API_KEY', None),
         ('LAST30DAYS_YT_SUB_LANGS', 'en,es,pt'),
+        # youtube_yt reads this lazily from os.environ; default android is
+        # applied there when the key is absent. Empty disables.
+        ('LAST30DAYS_YT_PLAYER_CLIENT', None),
         ('LAST30DAYS_YT_TRANSCRIPT_FAST_TIMEOUT', None),
+        ('LAST30DAYS_YT_TRANSCRIPT_FAST_ATTEMPTS', None),
         ('LAST30DAYS_YT_SEARCH_TIMEOUT', None),
         ('GITHUB_TOKEN', None),
+        # Host self-identification. `grok-bot` switches the X policy
+        # to official-only (see x_policy); the engine never sniffs the host
+        # any other way. Persisted by first-run setup and exported per
+        # invocation by the SKILL.md rule.
+        (X_HOST_VAR, None),
+        # App-only bearer token for the direct X API v2 backend (`xapi`).
+        ('X_BEARER_TOKEN', None),
+        # Per-session X connector lane signal. Read from the process
+        # environment ONLY: a .env line is deliberately ignored (a removed
+        # connector must never leave a stale declaration), so it is handled
+        # in the loop below rather than via merged_env.
+        (X_HOST_LANE_VAR, None),
     ]
 
+    # Strip unsubstituted ``${user_config.*}`` extension placeholders per source
+    # layer *before* trust checks, secret-store probing, layer merging, legacy
+    # alias lookup, lazy env exports, and browser-cookie preflight calculation.
+    # Bounded to registered keys so unregistered env vars (such as
+    # LAST30DAYS_API_KEY or an unused SCRAPE_CREATORS_API_KEY) remain untouched.
+    legacy_alias_map = {
+        'SCRAPE_CREATORS_API_KEY': 'SCRAPECREATORS_API_KEY',
+        'SCRAPE_CREATORS_BASE_URL': 'SCRAPECREATORS_BASE_URL',
+    }
+    registered_keys = frozenset({'OPENAI_API_KEY', *(key for key, _ in keys)})
+    file_strip_keys = registered_keys | frozenset(legacy_alias_map)
+    process_only_keys = frozenset({X_HOST_LANE_VAR, SCHEDULED_RUN_VAR})
+    preserve_none_keys = frozenset({
+        'BROWSER_CONSENT',
+        'LAST30DAYS_MEMORY_DIR',
+        X_HOST_LANE_VAR,
+        SCHEDULED_RUN_VAR,
+    })
+    templated_seen: set[str] = set()
+    for key in registered_keys:
+        if is_unsubstituted_template(os.environ.get(key)):
+            os.environ.pop(key, None)
+            templated_seen.add(key)
+
+    # Load per-project config only when trust comes from process env, global
+    # user config, or an explicit policy. A project file cannot grant trust to
+    # itself because it is not parsed until after this decision.
+    file_env, project_env, project_env_path = _load_config_files(policy)
+    ignored_project_env_path = None
+    ignored_project_keys: list[str] = []
+    if policy.inspect_ignored_project_config and not _project_config_trusted(policy, file_env):
+        ignored_project_env_path = _find_project_env()
+        if ignored_project_env_path:
+            ignored_project_keys = sorted(
+                load_env_file(
+                    ignored_project_env_path,
+                    allow_symlink=False,
+                    strict_keys=True,
+                ).keys()
+            )
+
+    file_env = _strip_layer_templates(
+        file_env, file_strip_keys, templated_seen, canonical_map=legacy_alias_map
+    )
+    project_env = _strip_layer_templates(
+        project_env, file_strip_keys, templated_seen, canonical_map=legacy_alias_map
+    )
+
+    # Merge file sources: project > global
+    merged_env = {**file_env, **project_env}
+
+    # Keychain and pass(1) are the lowest-priority credential stores. Skip both
+    # when the caller's ConfigLoadPolicy opts out (e.g. offline, mock, invalid,
+    # or hosted-API invocations) so users are never prompted for unused secrets.
+    keychain_env: dict[str, str] = {}
+    pass_env: dict[str, str] = {}
+    if policy.load_secret_stores:
+        keychain_aliases_raw = os.environ.get(KEYCHAIN_ALIASES_ENV) or merged_env.get(KEYCHAIN_ALIASES_ENV)
+        keychain_aliases = _parse_keychain_aliases(keychain_aliases_raw)
+        keychain_env = _strip_layer_templates(
+            _load_keychain(list(KEYCHAIN_KEYS), keychain_aliases),
+            registered_keys,
+            templated_seen,
+        )
+        merged_env = {**keychain_env, **merged_env}
+        # pass(1) store: Linux/Unix analog of Keychain at convention path
+        # {prefix}<KEY>. Decrypts transiently so secrets stay encrypted at rest (no
+        # plaintext .env). Lowest priority: Keychain, the config files, and process
+        # env all win over it. Two efficiency guards so a user who merely has `pass`
+        # on PATH doesn't pay for it: resolve the prefix from the loaded config/env
+        # (not import time, so a .env-set LAST30DAYS_PASS_PREFIX is honored), and
+        # probe ONLY keys still unset after the higher-priority sources — an empty
+        # list short-circuits with no gpg/pinentry calls at all.
+        env_pass_prefix = os.environ.get("LAST30DAYS_PASS_PREFIX")
+        if is_unsubstituted_template(env_pass_prefix):
+            env_pass_prefix = None
+        file_pass_prefix = next(
+            (
+                value
+                for value in (
+                    project_env.get("LAST30DAYS_PASS_PREFIX"),
+                    file_env.get("LAST30DAYS_PASS_PREFIX"),
+                )
+                if value and not is_unsubstituted_template(value)
+            ),
+            None,
+        )
+        pass_prefix = env_pass_prefix or file_pass_prefix or DEFAULT_PASS_PATH_PREFIX
+        pass_missing = [
+            k
+            for k in KEYCHAIN_KEYS
+            if (not os.environ.get(k) or is_unsubstituted_template(os.environ.get(k)))
+            and not merged_env.get(k)
+        ]
+        pass_env = _strip_layer_templates(
+            _load_pass(pass_missing, pass_prefix),
+            registered_keys,
+            templated_seen,
+        )
+        merged_env = {**pass_env, **merged_env}
+
+    openai_auth = get_openai_auth(merged_env)
+
+    # Build config: Codex/OpenAI auth + process.env > project .env > global .env
+    config = {
+        'OPENAI_API_KEY': openai_auth.token,
+        'OPENAI_AUTH_SOURCE': openai_auth.source,
+        'OPENAI_AUTH_STATUS': openai_auth.status,
+    }
+
     for key, default in keys:
-        config[key] = os.environ.get(key) or merged_env.get(key, default)
+        if key in process_only_keys:
+            # Process env only; the .env value never reaches config.
+            config[key] = os.environ.get(key) or default
+            continue
+        if key in {'LAST30DAYS_YT_PLAYER_CLIENT', 'LAST30DAYS_MEMORY_DIR'}:
+            # Empty string is a valid disable; `or` would treat it as unset.
+            if key in os.environ:
+                config[key] = os.environ.get(key)
+            elif key in merged_env:
+                # Mapping lookup via .get; bracket form trips a CRITICAL
+                # scanner false positive on this identifier.
+                config[key] = merged_env.get(key)
+            else:
+                config[key] = default
+        else:
+            config[key] = os.environ.get(key) or merged_env.get(key, default)
+
+    # Backward-compat: ScrapeCreators' own examples and tutorials use the
+    # SCRAPE_CREATORS_API_KEY spelling (with underscore between SCRAPE and
+    # CREATORS). Accept that form too so users who follow the vendor's docs
+    # don't silently end up with has_scrapecreators=False. Canonical name
+    # wins when both are set.
+    if not config.get('SCRAPECREATORS_API_KEY'):
+        env_legacy = read_secret_env('SCRAPE_CREATORS_API_KEY')
+        if is_unsubstituted_template(env_legacy):
+            templated_seen.add('SCRAPECREATORS_API_KEY')
+            env_legacy = None
+        legacy = env_legacy or merged_env.get('SCRAPE_CREATORS_API_KEY')
+        if legacy:
+            config['SCRAPECREATORS_API_KEY'] = legacy
+
+    if not config.get('SCRAPECREATORS_BASE_URL'):
+        env_legacy_base = os.environ.get('SCRAPE_CREATORS_BASE_URL')
+        if is_unsubstituted_template(env_legacy_base):
+            templated_seen.add('SCRAPECREATORS_BASE_URL')
+            env_legacy_base = None
+        legacy_base = env_legacy_base or merged_env.get('SCRAPE_CREATORS_BASE_URL')
+        if legacy_base:
+            config['SCRAPECREATORS_BASE_URL'] = legacy_base
+
+    # Multi-key rotation: comma-separated SCRAPECREATORS_API_KEY round-robins
+    # via random.choice per run. Originally added in #268, accidentally dropped
+    # in v3.0.6, restored here.
+    _rotate_scrapecreators_key(config)
+    if is_unsubstituted_template(config.get('SCRAPECREATORS_API_KEY')):
+        templated_seen.add('SCRAPECREATORS_API_KEY')
+        config['SCRAPECREATORS_API_KEY'] = None
 
     # Export debug flag to os.environ so log.py's lazy os.environ.get()
     # picks up .env values. setdefault ensures a shell-exported value is
@@ -579,33 +1109,26 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         os.environ.setdefault('LAST30DAYS_DEBUG', config['LAST30DAYS_DEBUG'])
 
     # youtube_yt reads these tuning knobs lazily from os.environ, so values
-    # loaded from .env must be exported into the current engine process.
+    # loaded from .env (including fallbacks restored after stripping a
+    # placeholder) must be exported into the current engine process.
     for key in (
         'LAST30DAYS_YT_SUB_LANGS',
         'LAST30DAYS_YT_TRANSCRIPT_FAST_TIMEOUT',
+        'LAST30DAYS_YT_TRANSCRIPT_FAST_ATTEMPTS',
         'LAST30DAYS_YT_SEARCH_TIMEOUT',
+        'LAST30DAYS_REDDIT_KEYLESS_RATE',
+        'LAST30DAYS_YT_PLAYER_CLIENT',
+        'LAST30DAYS_JOBS_RESPECT_ROBOTS',
+        'SCRAPECREATORS_BASE_URL',
     ):
-        if config.get(key):
-            os.environ.setdefault(key, config[key])
-
-    # Backward-compat: ScrapeCreators' own examples and tutorials use the
-    # SCRAPE_CREATORS_API_KEY spelling (with underscore between SCRAPE and
-    # CREATORS). Accept that form too so users who follow the vendor's docs
-    # don't silently end up with has_scrapecreators=False. Canonical name
-    # wins when both are set.
-    if not config.get('SCRAPECREATORS_API_KEY'):
-        legacy = read_secret_env('SCRAPE_CREATORS_API_KEY') or merged_env.get('SCRAPE_CREATORS_API_KEY')
-        if legacy:
-            config['SCRAPECREATORS_API_KEY'] = legacy
-
-    # Multi-key rotation: comma-separated SCRAPECREATORS_API_KEY round-robins
-    # via random.choice per run. Originally added in #268, accidentally dropped
-    # in v3.0.6, restored here.
-    sc_key_raw = config.get('SCRAPECREATORS_API_KEY') or ''
-    if ',' in sc_key_raw:
-        import random
-        sc_keys = [k.strip() for k in sc_key_raw.split(',') if k.strip()]
-        config['SCRAPECREATORS_API_KEY'] = random.choice(sc_keys) if sc_keys else ''
+        value = config.get(key)
+        # Empty LAST30DAYS_YT_PLAYER_CLIENT is a valid disable; other knobs
+        # treat empty as unset and keep their code defaults.
+        if key == 'LAST30DAYS_YT_PLAYER_CLIENT':
+            if value is not None:
+                os.environ.setdefault(key, value)
+        elif value:
+            os.environ.setdefault(key, value)
 
     # Track which config source was used (highest-priority file source wins
     # the label; keychain is only reported when nothing else is configured).
@@ -623,16 +1146,201 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         config['_IGNORED_PROJECT_CONFIG'] = str(ignored_project_env_path)
         config['_IGNORED_PROJECT_CONFIG_KEYS'] = ignored_project_keys
     config['_BROWSER_COOKIE_MODE'] = policy.browser_cookies
+    # A LAST30DAYS_X_HOST_LANE line in a config file is ignored;
+    # remember that it was there so doctor can say so.
+    config['_X_HOST_LANE_FILE_IGNORED'] = bool(merged_env.get(X_HOST_LANE_VAR))
+    # Evaluated after placeholder stripping and fallback restoration so preflight
+    # and runtime agree on browser-cookie reads.
     config['_BROWSER_COOKIE_BROWSERS'] = cookie_extraction_browsers(config)
 
+    # Report only the keys still leaving the setting unset. Preserve None for
+    # keys where None != "" (BROWSER_CONSENT, LAST30DAYS_MEMORY_DIR, and
+    # process-env-only keys), while keeping "" for ordinary unset templated keys.
+    templated_keys = sorted(templated_seen)
+    config[TEMPLATE_CONFIG_KEYS] = [
+        key
+        for key in templated_keys
+        if (
+            config.get(key) is None
+            if key in {'LAST30DAYS_MEMORY_DIR', 'LAST30DAYS_YT_PLAYER_CLIENT'}
+            else not config.get(key)
+        )
+    ]
+    for key in templated_keys:
+        if config.get(key) is None and key not in preserve_none_keys:
+            config[key] = ''
+    if 'OPENAI_API_KEY' in templated_keys and not config.get('OPENAI_API_KEY'):
+        # Keep the derived auth record consistent with the token it describes.
+        config['OPENAI_AUTH_SOURCE'] = AUTH_SOURCE_NONE
+        config['OPENAI_AUTH_STATUS'] = AUTH_STATUS_MISSING
+
     if policy.browser_cookies == "read":
-        browser_creds = extract_browser_credentials(config)
-        for key, value in browser_creds.items():
-            if not config.get(key):
-                config[key] = value
-                config[f"_{key}_SOURCE"] = "browser"
+        if policy.require_recorded_browser_consent and not browser_consent_granted(config):
+            config['_BROWSER_COOKIE_MODE'] = "off"
+        else:
+            _discover_and_apply_x_credentials(config)
+
+    # Proxy mode (LAST30DAYS_API_MODE=proxy): each paid lane the user has no
+    # key for is served through the metered proxy. Filled last, so a user's
+    # own key from any source always wins for its provider.
+    from . import proxy as _proxy
+    _proxy.fill_config(config)
+
+    # Fixture recording (--record-fixtures) must redact a credential that
+    # came from a file, Keychain, or pass, not only one exported in the
+    # shell. No-op outside a recording session.
+    from . import http as _http
+    _http.add_fixture_redactions(_http.config_secret_values(config))
 
     return config
+
+
+# ---------------------------------------------------------------------------
+# Extra-host X cookie discovery (Linux, Mac mini, Darwin agentcookie sink)
+# ---------------------------------------------------------------------------
+
+
+def _mac_model() -> str:
+    """Darwin hardware model via ``sysctl -n hw.model``, or "" otherwise.
+
+    Returns "" on non-Darwin and on any sysctl failure (missing binary,
+    non-zero exit, timeout) — the caller treats "" as "not a Mac mini", i.e. a
+    MacBook, which is the conservative default (no extra cookie lookups).
+    """
+    import platform
+    if platform.system() != "Darwin":
+        return ""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", "hw.model"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if out.returncode != 0:
+        return ""
+    return (out.stdout or "").strip()
+
+
+def _is_mac_mini() -> bool:
+    """True on a Darwin Mac mini (``hw.model`` prefix ``Macmini``).
+
+    sysctl failure yields "" -> False, so an unreadable model is treated as a
+    MacBook (no extras), per the plan.
+    """
+    return _mac_model().startswith("Macmini")
+
+
+def x_extras_enabled(config: dict[str, Any]) -> bool:
+    """Whether the two EXTRA bird cookie lookups (agentcookie sidecar, live
+    Chrome CDP) apply on this host.
+
+    Extras apply when ANY of:
+      * ``AGENTCOOKIE=on`` — explicit per-host opt-in (works on a MacBook too);
+      * platform is Linux;
+      * a Darwin Mac mini (``hw.model`` prefix ``Macmini``);
+      * a Darwin agentcookie **sink** role (parse failure = not sink).
+
+    A plain MacBook (Darwin, source/unknown role, no opt-in) stays on the
+    mainline path — no agentcookie subprocess, no CDP socket. The host is NEVER
+    inferred from the home directory, PATH, or ``HERMES_AGENT``/``OPENCLAW_CLI``
+    env: only the signals above.
+    """
+    import platform
+    raw = (config.get("AGENTCOOKIE") or read_secret_env("AGENTCOOKIE") or "").strip().lower()
+    if raw == "on":
+        return True
+    system = platform.system()
+    if system == "Linux":
+        return True
+    if system == "Darwin":
+        if _is_mac_mini():
+            return True
+        from . import agentcookie
+        return agentcookie.role_is_sink(config)
+    return False
+
+
+def _apply_x_pair(config: dict[str, Any], auth_token: str, ct0: str, source: str) -> None:
+    """Apply a COMPLETE X cookie pair from one source, labeling its origin.
+
+    Atomic on purpose (both keys from the same source) so a half-pair from one
+    source is never merged with a half-pair from another. Never written to the
+    ``.env``; values are never logged.
+    """
+    config["AUTH_TOKEN"] = auth_token
+    config["CT0"] = ct0
+    config["_AUTH_TOKEN_SOURCE"] = source
+    config["_CT0_SOURCE"] = source
+
+
+def _apply_browser_extract(config: dict[str, Any]) -> None:
+    """Run the mainline in-process browser cookie extractor (unchanged from
+    main): fills X (when a browser is opted in via FROM_BROWSER) and non-X
+    cookie domains like truthsocial. Missing keys only; source label ``browser``."""
+    browser_creds = extract_browser_credentials(config)
+    for key, value in browser_creds.items():
+        if not config.get(key):
+            config[key] = value
+            config[f"_{key}_SOURCE"] = "browser"
+
+
+def _discover_and_apply_x_credentials(config: dict[str, Any]) -> None:
+    """Fill AUTH_TOKEN/CT0 for the bird backend, first COMPLETE pair wins.
+
+    Mainline (every host): the in-process browser extractor, gated by
+    FROM_BROWSER exactly as on ``main``. EXTRA lookups (agentcookie sidecar,
+    then live Chrome CDP) run ONLY on extra hosts (``x_extras_enabled``), so a
+    MacBook with FROM_BROWSER unset/off does no agentcookie spawn and no CDP
+    socket. Probe order:
+
+      1. an explicit env AUTH_TOKEN+CT0 already present — never overwritten;
+      2. agentcookie sidecar (extras only);
+      3. live Chrome CDP (extras only);
+      4. the mainline browser extract (all hosts; X only when FROM_BROWSER
+         lists a browser).
+
+    On a Mac mini that has already opted into browser reads (FROM_BROWSER set),
+    the native extract runs BEFORE CDP (R19) — a local Keychain read beats a
+    debug-port scrape. Never persists cookies; values are never logged.
+
+    On an official-only host (``x_policy``: ``LAST30DAYS_HOST=grok-bot``)
+    this returns before ANY leg, for every cookie domain, unless the pin is
+    ``bird`` (the one path that re-enables discovery for that run).
+    """
+    if not x_policy(config).cookie_discovery or cookie_access_denied(config):
+        return
+
+    from . import agentcookie, chrome_cdp
+
+    def have_pair() -> bool:
+        return bool(config.get("AUTH_TOKEN") and config.get("CT0"))
+
+    extras = x_extras_enabled(config)
+
+    # (2) agentcookie sidecar — extras only, complete pair only.
+    if extras and not have_pair():
+        pair = agentcookie.read_x_cookies(config)
+        if pair:
+            _apply_x_pair(config, pair["auth_token"], pair["ct0"], "agentcookie")
+
+    # Mac mini + browser opted in: native extract before CDP (R19).
+    mini_extract_first = (
+        extras and _is_mac_mini() and bool(cookie_extraction_browsers(config))
+    )
+    if mini_extract_first and not have_pair():
+        _apply_browser_extract(config)
+
+    # (3) live Chrome CDP — extras only, after browser-cookie consent.
+    if extras and not have_pair() and chrome_cdp.cookie_access_allowed(config):
+        pair = chrome_cdp.read_x_cookies(config)
+        if pair:
+            _apply_x_pair(config, pair["auth_token"], pair["ct0"], "chrome cdp")
+
+    # (4) mainline browser extract (unless already run above for the mini case).
+    if not mini_extract_first:
+        _apply_browser_extract(config)
 
 
 # ---------------------------------------------------------------------------
@@ -650,14 +1358,189 @@ COOKIE_DOMAINS: dict[str, dict[str, Any]] = {
         "cookies": ["_session_id"],
         "mapping": {"_session_id": "TRUTHSOCIAL_TOKEN"},
     },
+    # The logged-in Reddit session. Its own consent gates it, and it is read
+    # from its own recorded browser, so the generic browser extract and the
+    # X-consent setup scan always skip it (``consent_key``); only
+    # read_reddit_session_cookie reads it, after reddit_session_gate passes.
+    "reddit": {
+        "domain": ".reddit.com",
+        "cookies": ["reddit_session"],
+        "mapping": {"reddit_session": "REDDIT_SESSION_COOKIE"},
+        "consent_key": "REDDIT_BROWSER_CONSENT",
+    },
 }
+
+# --- Opt-in logged-in Reddit session ----------------------------------------
+#
+# Reading the reddit.com login cookie needs its own affirmative consent,
+# separate from the X browser consent: a user may want one without the other.
+# Every global refusal still vetoes it. The cookie lives only in process
+# memory; nothing persists it.
+REDDIT_CONSENT_VAR = "REDDIT_BROWSER_CONSENT"
+REDDIT_FROM_BROWSER_VAR = "REDDIT_FROM_BROWSER"
+# Written once the returning-user offer was made, whatever the answer.
+REDDIT_OFFERED_VAR = "REDDIT_SESSION_OFFERED"
+# In-memory key for the session cookie (never a .env key). The _COOKIE
+# suffix is what fixture recording redacts.
+REDDIT_SESSION_COOKIE_VAR = "REDDIT_SESSION_COOKIE"
+# Scheduled runs (cron, watchlist, briefing) export this; process env only.
+SCHEDULED_RUN_VAR = "LAST30DAYS_SCHEDULED_RUN"
+# Lets a scheduled run use the session anyway (its Keychain prompt cannot be
+# answered unattended, so this is off by default).
+REDDIT_SESSION_SCHEDULED_VAR = "LAST30DAYS_REDDIT_SESSION_SCHEDULED"
+REDDIT_COOKIE_DOMAIN = ".reddit.com"
+REDDIT_COOKIE_NAMES = ("reddit_session",)
+# Setup's scan order for the Reddit login: Chrome first, then the rest.
+REDDIT_SETUP_BROWSERS = (
+    "chrome", "brave", "edge", "vivaldi", "opera", "arc", "dia", "chromium", "firefox", "safari",
+)
+
+
+# Placeholder for a provider key served by the API-key proxy (lib/proxy.py
+# owns the routing; it is defined here because proxy imports this module).
+PROXY_SENTINEL = "last30days-proxy-lane"
+
+
+def proxy_mode_requested() -> bool:
+    """True when LAST30DAYS_API_MODE selects the metered proxy (lib/proxy.py)."""
+    return (os.environ.get("LAST30DAYS_API_MODE") or "").strip().lower() == "proxy"
+
+
+def hosted_backend_configured() -> bool:
+    """True when research would run through the remote API backend.
+
+    Proxy mode keeps research on the local engine, so it is never hosted.
+    """
+    return bool(
+        read_secret_env("LAST30DAYS_API_KEY")
+        and os.environ.get("LAST30DAYS_API_BASE")
+        and not proxy_mode_requested()
+    )
+
+
+def global_cookie_refusal(config: dict[str, Any], reddit_consent: bool = False) -> str:
+    """Why every browser-cookie read is refused this run, or "".
+
+    ``BROWSER_CONSENT=false``, ``FROM_BROWSER=off``, and a run that does not
+    read browser cookies at all (``--no-browser-cookies``, the MCP default,
+    and the plan-only ``--diagnose``/``--preflight``/``doctor`` modes).
+
+    ``reddit_consent`` marks an explicit yes to the Reddit session question.
+    That yes is its own consent, so a ``BROWSER_CONSENT=false`` saved when the
+    user skipped X does not block it. ``FROM_BROWSER=off`` still does.
+    """
+    if str(config.get("FROM_BROWSER") or "").strip().lower() == "off":
+        return "FROM_BROWSER=off"
+    if not reddit_consent and cookie_access_denied(config):
+        return "BROWSER_CONSENT refuses browser reads"
+    mode = config.get("_BROWSER_COOKIE_MODE") or "off"
+    if mode == "plan_only":
+        return "this mode reads no browser cookies"
+    if mode != "read":
+        return "browser cookies are off for this run"
+    return ""
+
+
+def reddit_session_gate(config: dict[str, Any]) -> tuple[bool, str]:
+    """Whether this run may read the Reddit login cookie: ``(allowed, why_not)``.
+
+    Pure: reads config and the process environment only, never a cookie. The
+    order is the global veto, then the contexts that never use the session,
+    then the Reddit consent itself, then a recorded browser.
+    """
+    refusal = global_cookie_refusal(config, reddit_consent=_truthy(config.get(REDDIT_CONSENT_VAR)))
+    if refusal:
+        return False, refusal
+    if str(config.get(X_HOST_VAR) or os.environ.get(X_HOST_VAR) or "").strip().lower() == GROK_BOT_HOST:
+        return False, "never on a Grok Bot host"
+    if hosted_backend_configured():
+        return False, "the hosted API backend runs research remotely"
+    if _truthy(os.environ.get(SCHEDULED_RUN_VAR)) and not _truthy(
+        config.get(REDDIT_SESSION_SCHEDULED_VAR) or os.environ.get(REDDIT_SESSION_SCHEDULED_VAR)
+    ):
+        return False, "scheduled run (set LAST30DAYS_REDDIT_SESSION_SCHEDULED=1 to allow)"
+    if not _truthy(config.get(REDDIT_CONSENT_VAR)):
+        return False, "no Reddit session consent"
+    browser = str(config.get(REDDIT_FROM_BROWSER_VAR) or "").strip().lower()
+    if browser not in COOKIE_BROWSER_NAMES:
+        return False, "no browser recorded for the Reddit login (run setup --reddit-session)"
+    return True, ""
+
+
+def reddit_scrapecreators_primary(config: dict[str, Any]) -> bool:
+    return bool(
+        config.get("SCRAPECREATORS_API_KEY")
+        and (config.get(REDDIT_BACKEND_PIN_VAR) or "").strip().lower() == "scrapecreators"
+    )
+
+
+def reddit_consent_state(config: dict[str, Any]) -> str:
+    """``granted``, ``refused``, or ``unset`` (doctor and setup; no read)."""
+    raw = config.get(REDDIT_CONSENT_VAR)
+    if raw is None or str(raw).strip() == "":
+        return "unset"
+    return "granted" if _truthy(raw) else "refused"
+
+
+def read_reddit_session_cookie(
+    config: dict[str, Any], browser: str | None = None,
+) -> tuple[str | None, str]:
+    """The ``reddit_session`` cookie from one browser: ``(value, status)``.
+
+    Reads only the recorded ``REDDIT_FROM_BROWSER`` (or ``browser``), never
+    ``FROM_BROWSER``. ``status`` is ``ok``, ``not-logged-in``,
+    ``permission-denied``, ``unsupported-encryption`` (a Windows app-bound
+    store) or ``error``. Never logs the value. Callers check
+    :func:`reddit_session_gate` first.
+    """
+    name = str(browser or config.get(REDDIT_FROM_BROWSER_VAR) or "").strip().lower()
+    if name not in COOKIE_BROWSER_NAMES:
+        return None, "error"
+    if os.name == "nt" and name != "firefox":
+        return None, "unsupported-encryption"
+    try:
+        from . import cookie_extract
+        cookies = cookie_extract.extract_cookies(name, REDDIT_COOKIE_DOMAIN, list(REDDIT_COOKIE_NAMES))
+    except PermissionError:
+        return None, "permission-denied"
+    except Exception:
+        return None, "error"
+    value = (cookies or {}).get("reddit_session")
+    if not value:
+        return None, "not-logged-in"
+    from . import http as _http
+    _http.add_fixture_redactions([value])
+    return value, "ok"
+
+COOKIE_BROWSER_NAMES = (
+    "firefox", "safari", "chrome", "brave", "edge", "vivaldi", "opera", "arc", "dia", "chromium"
+)
+
+
+def cookie_access_denied(config: dict[str, Any]) -> bool:
+    """An explicit refusal blocks native, CDP, and sidecar cookie discovery.
+
+    Missing consent keeps each source's existing opt-in/default policy.
+    A present but unrecognized consent value fails closed, as native reads do.
+    This does not disable credentials supplied directly by the user.
+    """
+    if str(config.get("FROM_BROWSER") or "").strip().lower() == "off":
+        return True
+    consent = config.get("BROWSER_CONSENT")
+    return consent is not None and str(consent).strip().lower() not in {
+        "1", "true", "yes", "on",
+    }
+
+
+def browser_consent_granted(config: dict[str, Any]) -> bool:
+    return _truthy(config.get("BROWSER_CONSENT")) and not cookie_access_denied(config)
 
 
 def cookie_extraction_browsers(config: dict[str, Any]) -> list[str]:
     """Browsers to try for cookie extraction, honoring FROM_BROWSER.
 
     Default (FROM_BROWSER unset): no browser-cookie reads. The Chromium family
-    (Chrome, Brave, Edge, Vivaldi, Opera, Arc, Chromium) is available only when
+    (Chrome, Brave, Edge, Vivaldi, Opera, Arc, Dia, Chromium) is available only when
     explicitly selected because reading their cookies on macOS requires the
     browser's Safe Storage Keychain key, which triggers a system password prompt
     that cannot be reliably suppressed. On Windows only Firefox cookie
@@ -673,11 +1556,14 @@ def cookie_extraction_browsers(config: dict[str, Any]) -> list[str]:
 
     Returning the browser list from one place keeps the setup wizard and the
     steady-state path on the same policy, so neither surprises the user with an
-    unrequested Keychain prompt.
+    unrequested Keychain prompt. On an official-only host (``x_policy``) the
+    list is empty regardless of ``FROM_BROWSER`` unless ``bird`` is pinned.
     """
-    silent_browsers = ["firefox", "safari"]
-    chromium_browsers = ["chrome", "brave", "edge", "vivaldi", "opera", "arc", "chromium"]
-    known_browsers = silent_browsers + chromium_browsers
+    if not x_policy(config).cookie_discovery or cookie_access_denied(config):
+        return []
+    silent_browsers = list(COOKIE_BROWSER_NAMES[:2])
+    chromium_browsers = list(COOKIE_BROWSER_NAMES[2:])
+    known_browsers = list(COOKIE_BROWSER_NAMES)
     from_browser = (config.get("FROM_BROWSER") or "").strip().lower()
     if not from_browser:
         return []
@@ -727,32 +1613,225 @@ def extract_browser_credentials(config: dict[str, Any]) -> dict[str, str]:
         return {}
     extracted: dict[str, str] = {}
     for _service, spec in COOKIE_DOMAINS.items():
-        if all(config.get(env_key) for env_key in spec["mapping"].values()):
+        if spec.get("consent_key"):
+            # Its own gate and its own browser (read_reddit_session_cookie).
             continue
-        for browser in browsers:
+        missing_cookies = [
+            name for name in spec["cookies"] if not config.get(spec["mapping"][name])
+        ]
+        if not missing_cookies:
+            continue
+        # Cookies from different browsers can belong to different sessions,
+        # so values are never combined across browsers: a complete set from
+        # one browser wins, else the first browser's partial set is kept.
+        chosen: dict[str, str] | None = None
+        chosen_index: int | None = None
+        fallback: dict[str, str] | None = None
+        denied_browsers: list[str] = []
+        for index, browser in enumerate(browsers):
             try:
                 cookies = cookie_extract.extract_cookies(browser, spec["domain"], spec["cookies"])
+            except PermissionError:
+                denied_browsers.append(browser)
+                if len(missing_cookies) == len(spec["cookies"]):
+                    continue
+                # Keep full-pair profile preference unless a denied profile blocks it.
+                try:
+                    cookies = cookie_extract.extract_cookies(
+                        browser, spec["domain"], missing_cookies
+                    )
+                except Exception:
+                    continue
             except Exception:
                 continue
-            if cookies:
-                for cookie_name, env_key in spec["mapping"].items():
-                    if cookie_name in cookies and not config.get(env_key):
-                        extracted[env_key] = cookies[cookie_name]
-                break  # Found cookies for this service, stop trying browsers
+            if not cookies:
+                continue
+            if cookie_extract.has_complete_pair(cookies, spec["cookies"]):
+                chosen = cookies
+                chosen_index = index
+                break
+            if fallback is None:
+                fallback = cookies
+        if chosen is None:
+            chosen = fallback or {}
+        if _service == "x" and denied_browsers and not cookie_extract.has_complete_pair(
+            chosen, spec["cookies"]
+        ):
+            sys.stderr.write(
+                "[last30days] X browser cookie access permission denied in "
+                f"{', '.join(denied_browsers)}. {X_COOKIE_ACCESS_FIX}\n"
+            )
+        if (
+            _service == "x"
+            and chosen_index is not None
+            and len(missing_cookies) == len(spec["cookies"])
+        ):
+            # Remember where the X session came from and which browsers are
+            # left, so bird can move to the next browser's session if X
+            # rejects this one (an expired session in an earlier browser
+            # would otherwise shadow a live one in a later browser).
+            config[X_SESSION_STATE_KEY] = {
+                "browser": browsers[chosen_index],
+                "remaining": list(browsers[chosen_index + 1:]),
+                "rejected": set(),
+                "auth_token": chosen.get("auth_token"),
+                "ct0": chosen.get("ct0"),
+            }
+        for cookie_name, env_key in spec["mapping"].items():
+            if chosen.get(cookie_name) and not config.get(env_key):
+                extracted[env_key] = chosen[cookie_name]
     return extracted
 
 
+# In-memory X browser-session failover state (never persisted). One mutable
+# dict per run: ``pipeline.run`` and its phases work on shallow config copies,
+# so keeping the live session here (not in AUTH_TOKEN/CT0) lets every copy see
+# a switch made by any other.
+X_SESSION_STATE_KEY = "_X_SESSION_STATE"
+
+
+def x_session_state(config: dict[str, Any]) -> dict[str, Any] | None:
+    """The run's browser-session failover state, or None when not browser-sourced."""
+    state = config.get(X_SESSION_STATE_KEY)
+    if not isinstance(state, dict) or config.get("_AUTH_TOKEN_SOURCE") != "browser":
+        return None
+    return state
+
+
+def next_x_browser_pair(
+    config: dict[str, Any],
+    deadline: float | None = None,
+    cancel: Any = None,
+) -> tuple[str, str, str] | None:
+    """Extract the next browser's complete X session after a rejection.
+
+    Marks the current session rejected, then walks the browsers left after
+    the one that supplied it, in ``extract_browser_credentials`` order, and
+    returns ``(auth_token, ct0, browser)`` for the first complete pair whose
+    session has not been rejected this run. Stops early when ``deadline``
+    (``time.monotonic()``) is under two seconds away or ``cancel`` is set,
+    leaving unread browsers for a later search. Lazy on purpose: a later
+    Chromium browser may cost a Keychain prompt, so it is read only after an
+    earlier browser's session failed.
+    """
+    state = x_session_state(config)
+    if state is None:
+        return None
+    if state.get("auth_token"):
+        state["rejected"].add(state["auth_token"])
+    remaining = state["remaining"]
+    if not remaining:
+        return None
+    try:
+        from . import cookie_extract
+    except ImportError:
+        return None
+    import time as _time
+    spec = COOKIE_DOMAINS["x"]
+    while remaining:
+        if cancel is not None and cancel.is_set():
+            return None
+        if deadline is not None and deadline - _time.monotonic() < 2:
+            return None
+        browser = remaining.pop(0)
+        budget = None if deadline is None else deadline - _time.monotonic() - 1
+        cookies = _bounded_cookie_read(cookie_extract, browser, spec, budget)
+        if cookies is _READ_TIMED_OUT:
+            # A Keychain lookup is still waiting; leave the rest for later
+            # rather than overrunning this search's budget.
+            return None
+        if not cookie_extract.has_complete_pair(cookies, spec["cookies"]):
+            continue
+        if cookies["auth_token"] in state["rejected"]:
+            # A session already rejected this run (e.g. a shared profile).
+            continue
+        state.update(browser=browser, auth_token=cookies["auth_token"], ct0=cookies["ct0"])
+        _apply_x_pair(config, cookies["auth_token"], cookies["ct0"], "browser")
+        return cookies["auth_token"], cookies["ct0"], browser
+    return None
+
+
+_READ_TIMED_OUT = object()
+
+
+def _bounded_cookie_read(cookie_extract: Any, browser: str, spec: dict[str, Any], budget: float | None) -> Any:
+    """Read one browser's X cookies, waiting at most ``budget`` seconds.
+
+    A Chromium read can block on a Keychain lookup (up to its own 10s
+    timeout). With a budget the read runs on a daemon thread, and an unfinished
+    read returns ``_READ_TIMED_OUT`` so the caller is never held past its
+    deadline; the abandoned read finishes or times out on its own.
+    """
+    def read() -> Any:
+        try:
+            return cookie_extract.extract_cookies(browser, spec["domain"], spec["cookies"])
+        except Exception:
+            return None
+
+    if budget is None:
+        return read()
+    if budget <= 0:
+        return _READ_TIMED_OUT
+    import threading
+    result: list[Any] = []
+    worker = threading.Thread(target=lambda: result.append(read()), daemon=True)
+    worker.start()
+    worker.join(budget)
+    if worker.is_alive():
+        return _READ_TIMED_OUT
+    return result[0] if result else None
+
+
+def _inject_bird_credentials(config: dict[str, Any]) -> None:
+    """Hand the X session (and its browser failover) to the bird client.
+
+    For a browser-sourced session the shared run state wins over this
+    config's AUTH_TOKEN/CT0, so a config copy made before a failover never
+    re-injects the session X already rejected.
+    """
+    from . import bird_x
+    state = x_session_state(config)
+    if state is not None and state.get("auth_token") and state.get("ct0"):
+        bird_x.set_credentials(state["auth_token"], state["ct0"])
+        bird_x.set_session_failover(
+            state.get("browser"),
+            lambda deadline=None, cancel=None: next_x_browser_pair(config, deadline, cancel),
+        )
+        return
+    bird_x.set_credentials(config.get('AUTH_TOKEN'), config.get('CT0'))
+
+
+# Auth-origin label per X backend for ``get_x_source_with_method`` (bird's
+# label is the cookie source recorded in ``_AUTH_TOKEN_SOURCE``).
+_X_METHOD_LABELS = {
+    "xai": "xai",
+    "xurl": "bearer",  # xurl CLI (official X API v2, app-only bearer, free developer app)
+    "xapi": "bearer",
+    "xquik": "api_key",
+}
+
+
 def get_x_source_with_method(config: dict[str, Any]) -> tuple[str | None, str]:
-    """Return (source, method) for X search, where method describes the auth origin."""
-    if config.get("XAI_API_KEY"):
-        return "xai", "xai"
-    if config.get("AUTH_TOKEN") and config.get("CT0"):
-        method = config.get("_AUTH_TOKEN_SOURCE", "env")
-        return "bird", method
-    # Fall back to xurl CLI (official X API v2, OAuth2, free developer app)
-    from . import xurl_x
-    if xurl_x.is_available():
-        return "xurl", "oauth2"
+    """Return (source, method) for X search, where method describes the auth origin.
+
+    Walks the policy's unpinned auto chain (``x_auto_chain``): on a default
+    host bird first (cookies beat XAI_API_KEY when both are present), then
+    xai, xurl, xquik; on an official-only host xapi, xai, xurl. Opt-in
+    backends (grok, and xapi off Grok Bot) are never auto-selected here.
+    """
+    has_bird_creds = bool(config.get("AUTH_TOKEN") and config.get("CT0"))
+    for backend in x_auto_chain(config):
+        if backend == "bird":
+            # Cookie presence only: the scraper install is not consulted
+            # here (unlike ``x_backend_chain``), so a fresh cookie-bearing
+            # config reports bird before the binary is checked.
+            if not has_bird_creds:
+                continue
+        elif not _x_backend_available(backend, config, has_bird_creds):
+            continue
+        if backend == "bird":
+            return "bird", config.get("_AUTH_TOKEN_SOURCE", "env")
+        return backend, _X_METHOD_LABELS.get(backend, "none")
     return None, "none"
 
 
@@ -781,20 +1860,246 @@ def get_reddit_source(config: dict[str, Any]) -> str | None:
 # source; the rest are ordered failover backups, tried only if the one before
 # returns nothing or errors. There is one X source ("x"); these are its
 # interchangeable backends, never run in parallel.
-#   xai   — xAI/Grok live search (XAI_API_KEY)
 #   bird  — X GraphQL scrape via the user's browser cookies (AUTH_TOKEN/CT0)
+#   xai   — xAI/Grok live search (XAI_API_KEY)
 #   xurl  — official X API v2 (xurl CLI, OAuth2)
-#   xquik — key-based REST X search (XQUIK_API_KEY); keyless of browser cookies
-_X_BACKEND_ORDER = ("xai", "bird", "xurl", "xquik")
+#   xquik — key-based REST X search (XQUIK_API_KEY)
+_X_BACKEND_ORDER = ("bird", "xai", "xurl", "xquik")
+
+# Opt-in backends: never in the default unpinned auto chain; require an
+# explicit pin. grok is here because a leftover ~/.grok/auth.json must never
+# steal the X lane. xapi (direct X API v2 with X_BEARER_TOKEN) is here so an
+# ambient bearer exported for some other tool never spends X API credits
+# every time the cookie scraper comes back empty; on an official-only
+# host it is the first rung of the auto chain instead (see _X_OFFICIAL).
+_X_BACKEND_OPT_IN = ("grok", "xapi")
+
+# All known backends (auto chain + opt-in): valid values for the pin var.
+_X_BACKEND_KNOWN = _X_BACKEND_ORDER + _X_BACKEND_OPT_IN
+
+# Licensed / official backends: the unpinned auto chain on an official-only
+# host. xapi = X API v2 with an app-only bearer, xai = xAI's licensed
+# X search, xurl = the X API through X's own CLI.
+_X_OFFICIAL = ("xapi", "xai", "xurl")
+
+# Host self-identification key and the one value that switches the X
+# policy. The engine trusts this key alone: it never infers the host from
+# the home directory, PATH, platform, or agent env vars.
+X_HOST_VAR = 'LAST30DAYS_HOST'
+GROK_BOT_HOST = 'grok-bot'
+# Per-session X connector lane signal: process env only.
+X_HOST_LANE_VAR = 'LAST30DAYS_X_HOST_LANE'
+
+# Agent-hosted run detection, used only to enforce SKILL.md LAW 7 (the host
+# model writes the query plan and passes --plan). This is separate from the
+# X policy above, which trusts LAST30DAYS_HOST alone. Here the engine reads
+# the markers agent runtimes export into the shells they spawn, because the
+# failure it guards against is a host that forgot to plan. Process
+# environment only: a .env line never makes a cron run look agent-hosted.
+AGENT_HOST_ENV_VARS = (
+    'CLAUDECODE',              # Claude Code
+    'CLAUDE_CODE_ENTRYPOINT',  # Claude Code / Claude Agent SDK
+    'CODEX_THREAD_ID',         # Codex
+    'CODEX_SESSION_ID',
+    'CODEX_SANDBOX',
+)
+# Explicit self-identification for any other agent runtime.
+HOST_AGENT_VAR = 'LAST30DAYS_HOST_AGENT'
+# Headless/cron escape hatch under an agent: let the engine plan internally.
+ALLOW_ENGINE_PLAN_VAR = 'LAST30DAYS_ALLOW_ENGINE_PLAN'
+
+
+def agent_host_signal(environ: Any = None) -> str:
+    """Name of the env var that marks this process as agent-hosted, or "".
+
+    ``LAST30DAYS_HOST_AGENT`` counts when truthy; the runtime markers in
+    ``AGENT_HOST_ENV_VARS`` and a host self-identification in
+    ``LAST30DAYS_HOST`` (e.g. ``grok-bot``) count when non-empty. Returns the
+    variable name (never its value) so messages can cite what was detected.
+    """
+    source = os.environ if environ is None else environ
+    if _truthy(source.get(HOST_AGENT_VAR)):
+        return HOST_AGENT_VAR
+    for name in (*AGENT_HOST_ENV_VARS, X_HOST_VAR):
+        if str(source.get(name) or '').strip():
+            return name
+    return ''
+
+
+def agent_hosted_run(environ: Any = None) -> bool:
+    """True when an agent runtime appears to be hosting this engine process."""
+    return bool(agent_host_signal(environ))
+
+
+def engine_plan_allowed(environ: Any = None) -> bool:
+    """True when ``LAST30DAYS_ALLOW_ENGINE_PLAN`` opts back into engine planning."""
+    source = os.environ if environ is None else environ
+    return _truthy(source.get(ALLOW_ENGINE_PLAN_VAR))
+
+
+# A caller whose reader never sees the skill's instruction files (the MCP
+# `research` tool) asks for output with no Jobs Digest section.
+NO_JOBS_DIGEST_VAR = 'LAST30DAYS_NO_JOBS_DIGEST'
+
+
+def jobs_digest_disabled(environ: Any = None) -> bool:
+    """True when ``LAST30DAYS_NO_JOBS_DIGEST`` asks for a run with no jobs digest."""
+    source = os.environ if environ is None else environ
+    return _truthy(source.get(NO_JOBS_DIGEST_VAR))
+
+
+# The same kind of caller asks for a run that does not search a company's
+# patent filings at all: the fetch is skipped, not just its section.
+NO_PATENT_DIGEST_VAR = 'LAST30DAYS_NO_PATENT_DIGEST'
+
+
+def patent_digest_disabled(environ: Any = None) -> bool:
+    """True when ``LAST30DAYS_NO_PATENT_DIGEST`` asks for a run with no patent digest."""
+    source = os.environ if environ is None else environ
+    return _truthy(source.get(NO_PATENT_DIGEST_VAR))
+
+
+# The same kind of caller asks for compact stdout that ends at the canonical
+# boundary, with no report-format checklist after it.
+NO_REPORT_CHECKLIST_VAR = 'LAST30DAYS_NO_REPORT_CHECKLIST'
+
+
+def report_checklist_disabled(environ: Any = None) -> bool:
+    """True when ``LAST30DAYS_NO_REPORT_CHECKLIST`` asks for no checklist."""
+    source = os.environ if environ is None else environ
+    return _truthy(source.get(NO_REPORT_CHECKLIST_VAR))
+
+
+# Set by the MCP wrapper when X_BEARER_TOKEN was explicitly configured in MCP
+# host config so xapi activates automatically when unpinned and no higher-
+# priority X backend (from env, .env, Keychain, or pass) is available.
+# Process environment only so a .env line cannot opt ambient tokens in.
+X_API_OPT_IN_VAR = 'LAST30DAYS_X_API_OPT_IN'
+
+
+def x_api_opt_in(environ: Any = None) -> bool:
+    """True when ``LAST30DAYS_X_API_OPT_IN`` allows fallback xapi selection."""
+    source = os.environ if environ is None else environ
+    return _truthy(source.get(X_API_OPT_IN_VAR))
 
 # Public routing definitions for the doctor/backend-descriptor layer
 # (lib/backends.py). These are aliases for knowledge this module already
 # owns — the declared X chain order and the pin/floor env var names — so
 # descriptors import one source of truth instead of restating it.
 X_BACKEND_ORDER = _X_BACKEND_ORDER
+X_BACKEND_OPT_IN = _X_BACKEND_OPT_IN
+X_BACKEND_KNOWN = _X_BACKEND_KNOWN
+X_OFFICIAL = _X_OFFICIAL
 X_BACKEND_PIN_VAR = 'LAST30DAYS_X_BACKEND'
 REDDIT_BACKEND_PIN_VAR = 'LAST30DAYS_REDDIT_BACKEND'
+# `yt-dlp` keeps YouTube off ScrapeCreators while the key still serves other
+# sources (#1316). It is the only pin value; anything else means auto.
+YOUTUBE_BACKEND_PIN_VAR = 'LAST30DAYS_YOUTUBE_BACKEND'
+YOUTUBE_BACKEND_PIN_VALUES = ('yt-dlp',)
 REDDIT_SC_MIN_ITEMS_VAR = 'LAST30DAYS_REDDIT_SC_MIN_ITEMS'
+# Keyed runs backfill Reddit from ScrapeCreators when the free path returns
+# fewer than this many items. Thin topics yield 2-3 free results; healthy
+# topics many more, so 5 spends credits only where it adds coverage.
+REDDIT_SC_MIN_ITEMS_DEFAULT = 5
+YOUTUBE_SC_MIN_ITEMS_VAR = 'LAST30DAYS_YT_SC_MIN_ITEMS'
+YOUTUBE_SC_MIN_ITEMS_DEFAULT = 3
+
+
+def reddit_sc_min_items(config: dict[str, Any]) -> int:
+    """The Reddit ScrapeCreators backfill floor, parsed one way for every caller.
+
+    Unset or blank means ``REDDIT_SC_MIN_ITEMS_DEFAULT``; an explicit ``0``
+    means backfill only when the free path is empty; a malformed value means
+    ``0`` so a typo never spends extra credits. Negative values clamp to 0.
+    """
+    raw = config.get(REDDIT_SC_MIN_ITEMS_VAR)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return REDDIT_SC_MIN_ITEMS_DEFAULT
+    try:
+        return max(int(raw), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def youtube_sc_min_items(config: dict[str, Any]) -> int:
+    """Minimum yt-dlp result count before keyed YouTube search backfill is skipped."""
+    raw = config.get(YOUTUBE_SC_MIN_ITEMS_VAR)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return YOUTUBE_SC_MIN_ITEMS_DEFAULT
+    try:
+        return max(int(raw), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+@dataclass(frozen=True)
+class XPolicy:
+    """The host-conditional X routing rule, resolved once per config.
+
+    ``host`` is the normalized ``LAST30DAYS_HOST`` value; ``official_only``
+    is true on a Grok Bot host; ``auto_chain`` is the unpinned chain
+    (``_X_OFFICIAL`` when official-only, else ``_X_BACKEND_ORDER``);
+    ``cookie_discovery`` is false when official-only unless the pin is
+    ``bird``; ``hint_namespace`` (``official`` or ``default``) is derived
+    from ``official_only`` as a plain string so this module never imports
+    ``prescriptions``.
+    """
+
+    host: str
+    official_only: bool
+    auto_chain: tuple[str, ...]
+    cookie_discovery: bool
+
+    @property
+    def hint_namespace(self) -> str:
+        return 'official' if self.official_only else 'default'
+
+
+def x_backend_pin(config: dict[str, Any]) -> str:
+    """The normalized ``LAST30DAYS_X_BACKEND`` pin value ("" when unset)."""
+    return (config.get(X_BACKEND_PIN_VAR) or '').strip().lower()
+
+
+def x_policy(config: dict[str, Any]) -> XPolicy:
+    """Resolve the X policy from ``LAST30DAYS_HOST``, ``LAST30DAYS_X_API_OPT_IN``, and the pin.
+
+    This is the ONLY place the Grok Bot host string is compared. It reads
+    just the host key, the pin, the process-env ``LAST30DAYS_X_API_OPT_IN``
+    fallback signal, and the config dict: no platform, PATH, home
+    directory, or agent env-var inspection (the same rule ``x_extras_enabled``
+    follows), and nothing imported from ``lib``. The pin keeps its exclusive
+    semantics on every host and may name any known backend; a ``bird`` pin
+    is the one path that re-enables cookie discovery on an official-only host.
+    """
+    host = str(config.get(X_HOST_VAR) or '').strip().lower()
+    official_only = host == GROK_BOT_HOST
+    pin = x_backend_pin(config)
+    auto_chain = _X_OFFICIAL if official_only else _X_BACKEND_ORDER
+    if not official_only and x_api_opt_in() and 'xapi' not in auto_chain:
+        auto_chain = auto_chain + ('xapi',)
+    return XPolicy(
+        host=host,
+        official_only=official_only,
+        auto_chain=auto_chain,
+        cookie_discovery=(not official_only) or pin == 'bird',
+    )
+
+
+def x_auto_chain(config: dict[str, Any]) -> list[str]:
+    """The unpinned X auto chain for this host, in failover order."""
+    return list(x_policy(config).auto_chain)
+
+
+def x_host_lane_declared(config: dict[str, Any]) -> bool:
+    """True when the hosting model declared the X connector lane.
+
+    ``get_config`` fills ``LAST30DAYS_X_HOST_LANE`` from the process
+    environment only, so a ``.env`` line never declares the lane.
+    Deliberately NOT ``x_pending_browser_auth``: that predicate is false in
+    cookie-read mode by contract, which would leave the envelope path dead at
+    research time. Host-independent: the envelope is accepted anywhere.
+    """
+    return _truthy(config.get(X_HOST_LANE_VAR))
 
 
 def _x_backend_available(
@@ -805,6 +2110,12 @@ def _x_backend_available(
 ) -> bool:
     if backend == 'xai':
         return bool(config.get('XAI_API_KEY'))
+    if backend == 'grok':
+        # Keyless relative to X: needs only an installed, signed-in grok CLI.
+        # Both surfaces are filesystem-only (PATH lookup + credential store),
+        # so local_only needs no separate branch.
+        from . import grok_x
+        return grok_x.has_stored_auth()
     if backend == 'bird':
         from . import bird_x
         return has_bird_creds and bird_x.is_bird_installed()
@@ -817,6 +2128,9 @@ def _x_backend_available(
         return xurl_x.is_available()
     if backend == 'xquik':
         return is_xquik_available(config)
+    if backend == 'xapi':
+        # Key presence only (no network); local_only needs no branch.
+        return bool(config.get('X_BEARER_TOKEN'))
     return False
 
 
@@ -828,30 +2142,50 @@ def x_backend_chain(config: dict[str, Any], local_only: bool = False) -> list[st
     exactly one X source — these are its backends, never fetched in parallel.
 
     A ``LAST30DAYS_X_BACKEND`` pin forces a single backend (no failover): the
-    user explicitly chose it. Browser-cookie probing is intentionally avoided
-    (automatic Keychain access causes popups); bird counts as available only
-    when AUTH_TOKEN and CT0 are present explicitly.
+    user explicitly chose it. Valid pin values are in ``_X_BACKEND_KNOWN``
+    (the auto chain plus opt-in backends like grok). Browser-cookie probing
+    is intentionally avoided (automatic Keychain access causes popups); bird
+    counts as available only when AUTH_TOKEN and CT0 are present explicitly.
+
+    Unpinned runs walk only ``_X_BACKEND_ORDER``: opt-in backends like grok
+    are never auto-selected. A leftover ~/.grok/auth.json must not steal the
+    X lane; pin ``LAST30DAYS_X_BACKEND=grok`` to enable it explicitly.
 
     ``local_only=True`` is the doctor/safe-diagnose flavor: availability is
     answered from local evidence only (no subprocess spawns that reach the
     network — xurl's live `whoami` check is replaced by its on-disk token
     store). Research-time callers keep the default live semantics.
+
+    The unpinned walk is ``x_policy(config).auto_chain``: the default order
+    above on every host, or ``_X_OFFICIAL`` (xapi -> xai -> xurl) on an
+    official-only host. The scraper is primed with cookies only when bird
+    ends up in the resulting chain (never on an official-only host unless
+    bird is pinned).
     """
-    from . import bird_x
     has_bird_creds = bool(config.get('AUTH_TOKEN') and config.get('CT0'))
-    if has_bird_creds:
-        bird_x.set_credentials(config.get('AUTH_TOKEN'), config.get('CT0'))
 
-    preferred = (config.get(X_BACKEND_PIN_VAR) or '').lower()
-    if preferred in _X_BACKEND_ORDER:
+    preferred = x_backend_pin(config)
+    # Pin accepted from _X_BACKEND_KNOWN (auto chain + opt-in like grok).
+    if preferred in _X_BACKEND_KNOWN:
         if _x_backend_available(preferred, config, has_bird_creds, local_only):
-            return [preferred]
-        return []
+            chain = [preferred]
+        else:
+            chain = []
+    else:
+        # Unpinned: walk the policy's auto chain. Opt-in backends (grok, and
+        # xapi off an official-only host) are never auto-selected.
+        chain = [
+            b for b in x_policy(config).auto_chain
+            if _x_backend_available(b, config, has_bird_creds, local_only)
+        ]
+        # An xAI lane served by the API-key proxy (lib/proxy.py) is paid per
+        # call, so every backend the user set up themselves goes first.
+        if 'xai' in chain and config.get('XAI_API_KEY') == PROXY_SENTINEL:
+            chain = [b for b in chain if b != 'xai'] + ['xai']
 
-    return [
-        b for b in _X_BACKEND_ORDER
-        if _x_backend_available(b, config, has_bird_creds, local_only)
-    ]
+    if 'bird' in chain:
+        _inject_bird_credentials(config)
+    return chain
 
 
 def get_x_source(config: dict[str, Any], local_only: bool = False) -> str | None:
@@ -874,10 +2208,15 @@ def x_pending_browser_auth(config: dict[str, Any], local_only: bool = False) -> 
     dropped from ``available_sources`` even though a normal run would extract the
     same cookies and authenticate X fine. This predicate reports that
     "available pending browser auth" state without reading a single cookie — it
-    keys only on the already-resolved browser list (``cookie_extraction_browsers``
-    derives it from ``FROM_BROWSER`` alone, no secrets), bird being installed, and
-    X having a cookie-domain mapping. Side-effect free, so the safe-inspection
-    contract of diagnose/preflight is preserved.
+    keys only on the resolved browser list (``cookie_extraction_browsers``
+    derives it from ``FROM_BROWSER`` alone, no secrets) OR — on extra hosts
+    only (``x_extras_enabled``) — the agentcookie sidecar having explicit consent
+    and being on PATH (a plain ``which`` lookup), bird being installed, and X
+    having a cookie-domain mapping. A plain MacBook must NOT predict bird from
+    an agentcookie binary on PATH (R18), so the sidecar leg is gated behind
+    ``x_extras_enabled``.
+    Side-effect free, so the safe-inspection contract of diagnose/preflight is
+    preserved.
 
     Returns False whenever X is already available outright (static AUTH_TOKEN/CT0,
     or xAI/xurl/xquik backend), and in ``read`` mode (a real run has already
@@ -888,16 +2227,36 @@ def x_pending_browser_auth(config: dict[str, Any], local_only: bool = False) -> 
     # store instead of the live `xurl whoami` network call.
     if get_x_source(config, local_only=local_only):
         return False
+    # An explicit pin to any backend other than bird forbids browser-cookie
+    # fallback: runtime x_backend_chain() will never select bird.
+    preferred = x_backend_pin(config)
+    if preferred in _X_BACKEND_KNOWN and preferred != 'bird':
+        return False
     # Only meaningful in inspection modes that skip extraction; a real ``read``
     # run has already attempted extraction and must report its true state.
-    if config.get('_BROWSER_COOKIE_MODE') == 'read':
+    if config.get('_BROWSER_COOKIE_MODE') in {'read', 'off'}:
+        return False
+    # Cookie-only predicate: on an official-only host no run-time cookie
+    # source exists unless bird is pinned (x_policy), so nothing is pending.
+    if not x_policy(config).cookie_discovery:
         return False
     if 'x' not in COOKIE_DOMAINS:
         return False
-    if not cookie_extraction_browsers(config):
-        return False
     from . import bird_x
-    return bird_x.is_bird_installed()
+    if not bird_x.is_bird_installed():
+        return False
+    # A FROM_BROWSER browser is a run-time cookie source on any host.
+    if cookie_extraction_browsers(config):
+        return True
+    # The agentcookie sidecar is a run-time cookie source ONLY on extra hosts
+    # (Linux / Mac mini / Darwin sink / AGENTCOOKIE=on). Gating this keeps a
+    # plain MacBook from predicting bird off a stray agentcookie binary (R18).
+    # Admission precedes host classification so a refused sidecar never reads
+    # its role file or probes the hardware model merely to predict availability.
+    from . import agentcookie
+    if agentcookie.is_available(config) and x_extras_enabled(config):
+        return True
+    return False
 
 
 def is_ytdlp_available() -> bool:
@@ -906,7 +2265,9 @@ def is_ytdlp_available() -> bool:
     return youtube_yt.is_ytdlp_installed()
 
 
-def is_youtube_comments_available(config: dict[str, Any]) -> bool:
+def is_youtube_comments_available(
+    config: dict[str, Any], *, ytdlp_installed: bool | None = None,
+) -> bool:
     """Check if YouTube comment enrichment is available.
 
     yt-dlp fetches YouTube comments free and keyless, so when it is installed
@@ -921,11 +2282,19 @@ def is_youtube_comments_available(config: dict[str, Any]) -> bool:
     """
     if 'youtube_comments' in _parse_exclude_sources(config):
         return False
-    if is_ytdlp_available():
+    if ytdlp_installed is None:
+        ytdlp_installed = is_ytdlp_available()
+    if ytdlp_installed:
         return True
-    if not config.get('SCRAPECREATORS_API_KEY'):
+    if not is_youtube_sc_available(config):
         return False
     return 'youtube_comments' in _parse_include_sources(config)
+
+
+def is_tiktok_public_comments_on(config: dict[str, Any]) -> bool:
+    """TikTok comments come from the free public endpoint unless switched off."""
+    raw = config.get('LAST30DAYS_TIKTOK_PUBLIC_COMMENTS') or os.environ.get('LAST30DAYS_TIKTOK_PUBLIC_COMMENTS') or 'on'
+    return str(raw).strip().lower() not in ('off', '0', 'false', 'no')
 
 
 def is_tiktok_comments_available(config: dict[str, Any]) -> bool:
@@ -954,11 +2323,23 @@ def is_instagram_comments_available(config: dict[str, Any]) -> bool:
     return 'instagram_comments' in _parse_include_sources(config)
 
 
-def is_youtube_sc_available(config: dict[str, Any]) -> bool:
-    """Check if ScrapeCreators YouTube search fallback is available.
+def youtube_backend_pin(config: dict[str, Any]) -> str:
+    """The normalized ``LAST30DAYS_YOUTUBE_BACKEND`` pin ("" when unset or unknown)."""
+    raw = (config.get(YOUTUBE_BACKEND_PIN_VAR) or '').strip().lower()
+    if raw == 'ytdlp':
+        raw = 'yt-dlp'
+    return raw if raw in YOUTUBE_BACKEND_PIN_VALUES else ''
 
-    Used when yt-dlp is not installed or fails.
+
+def is_youtube_sc_available(config: dict[str, Any]) -> bool:
+    """Check if the YouTube lane may spend ScrapeCreators credits.
+
+    Gates the SC search fallback, the per-video transcript rescue, and SC
+    comments. False without a key, or when ``LAST30DAYS_YOUTUBE_BACKEND=yt-dlp``
+    keeps YouTube keyless while the key still serves other sources.
     """
+    if youtube_backend_pin(config) == 'yt-dlp':
+        return False
     return bool(config.get('SCRAPECREATORS_API_KEY'))
 
 
@@ -1034,17 +2415,65 @@ def is_polymarket_available() -> bool:
     return True
 
 
-def is_tiktok_available(config: dict[str, Any]) -> bool:
-    """Check if TikTok source is available (ScrapeCreators or legacy Apify).
+def shortform_discovery_sources(
+    config: dict[str, Any] | None = None, kind: str = "tiktok",
+) -> list[str]:
+    """Discovery sources armed for the keyless TikTok / Instagram lane, in
+    the order the lane tries them.
 
-    Returns True if SCRAPECREATORS_API_KEY or APIFY_API_TOKEN is set.
+    Exa only counts for TikTok: its API returns 0 Instagram posts. A host
+    with native web search (LAST30DAYS_NATIVE_SEARCH) counts as "host search":
+    it hands the engine post URLs through --shortform-urls, and it is also
+    why the keyless floor is off there.
     """
-    return bool(config.get('SCRAPECREATORS_API_KEY') or config.get('APIFY_API_TOKEN'))
+    cfg = config or {}
+    armed: list[str] = []
+    if (cfg.get('LAST30DAYS_SEARXNG_URL') or '').strip():
+        armed.append("SearXNG")
+    if cfg.get('SERPER_API_KEY'):
+        armed.append("Serper")
+    if kind == 'tiktok' and cfg.get('EXA_API_KEY'):
+        armed.append("Exa")
+    if cfg.get('BRAVE_API_KEY'):
+        armed.append("Brave")
+    if keyless_web_allowed(cfg):
+        armed.append("keyless floor")
+    else:
+        armed.append("host search")
+    return armed
+
+
+def is_shortform_oss_available(
+    config: dict[str, Any] | None = None, kind: str = "tiktok",
+) -> bool:
+    """yt-dlp extract + a discovery source (see ``shortform_discovery_sources``).
+
+    kind is the short-form source ("tiktok" or "instagram"). yt-dlp presence
+    follows the YouTube source's routing: local binary, or
+    LAST30DAYS_YOUTUBE_SSH_HOST with yt-dlp on the remote end. Every host has
+    a discovery source: the keyless floor, or on a native-search host the
+    host's own search through --shortform-urls.
+    """
+    from . import youtube_yt
+    if not youtube_yt.is_ytdlp_installed():
+        return False
+    return bool(shortform_discovery_sources(config, kind))
+
+
+def is_tiktok_available(config: dict[str, Any]) -> bool:
+    """Check if TikTok source is available (ScrapeCreators or OSS fallback).
+
+    Returns True if SCRAPECREATORS_API_KEY is set, or if yt-dlp plus a
+    web-discovery backend can serve the keyless fallback. APIFY_API_TOKEN is
+    not a TikTok search backend (legacy alias only; it was never wired to an
+    Apify actor).
+    """
+    return bool(config.get('SCRAPECREATORS_API_KEY') or is_shortform_oss_available(config))
 
 
 def get_tiktok_token(config: dict[str, Any]) -> str:
-    """Get TikTok API token, preferring ScrapeCreators over legacy Apify."""
-    return config.get('SCRAPECREATORS_API_KEY') or config.get('APIFY_API_TOKEN') or ''
+    """ScrapeCreators key for TikTok. Empty means the OSS fallback may run."""
+    return config.get('SCRAPECREATORS_API_KEY') or ''
 
 
 def _parse_include_sources(config: dict[str, Any]) -> set[str]:
@@ -1053,10 +2482,44 @@ def _parse_include_sources(config: dict[str, Any]) -> set[str]:
     return {s.strip().lower() for s in raw.split(',') if s.strip()}
 
 
+_EXCLUDE_SOURCE_ALIASES: dict[str, tuple[str, ...]] = {
+    'web': ('grounding',),
+    'grounding': ('web',),
+}
+
+
 def _parse_exclude_sources(config: dict[str, Any]) -> set[str]:
     """Parse EXCLUDE_SOURCES config value into a set of lowercase source names."""
     raw = config.get('EXCLUDE_SOURCES') or ''
-    return {s.strip().lower() for s in raw.split(',') if s.strip()}
+    return {s.strip().lower() for s in str(raw).split(',') if s.strip()}
+
+
+def exclude_sources(config: dict[str, Any]) -> set[str]:
+    """Public view of EXCLUDE_SOURCES with canonical web/grounding alias parity."""
+    raw = _parse_exclude_sources(config)
+    expanded = set(raw)
+    for token in raw:
+        expanded.update(_EXCLUDE_SOURCE_ALIASES.get(token, ()))
+    return expanded
+
+
+def excluded_source_tokens(source: str, config: dict[str, Any]) -> list[str]:
+    """Return all configured EXCLUDE_SOURCES tokens matching ``source``."""
+    raw = _parse_exclude_sources(config)
+    key = (source or '').strip().lower()
+    tokens: list[str] = []
+    if key in raw:
+        tokens.append(key)
+    for alias in _EXCLUDE_SOURCE_ALIASES.get(key, ()):
+        if alias in raw and alias not in tokens:
+            tokens.append(alias)
+    return tokens
+
+
+def excluded_source_token(source: str, config: dict[str, Any]) -> str | None:
+    """Return the configured EXCLUDE_SOURCES token matching ``source``, or None."""
+    tokens = excluded_source_tokens(source, config)
+    return tokens[0] if tokens else None
 
 
 def include_sources(config: dict[str, Any]) -> set[str]:
@@ -1089,17 +2552,54 @@ def is_threads_available(config: dict[str, Any]) -> bool:
 
 
 def is_instagram_available(config: dict[str, Any]) -> bool:
-    """Check if Instagram source is available (ScrapeCreators).
+    """Check if Instagram source is available (ScrapeCreators or OSS fallback).
 
-    Returns True if SCRAPECREATORS_API_KEY is set.
-    Instagram uses the same key as TikTok.
+    Returns True if SCRAPECREATORS_API_KEY is set, or if yt-dlp plus a
+    web-discovery backend can serve the keyless fallback.
     """
-    return bool(config.get('SCRAPECREATORS_API_KEY'))
+    return bool(
+        config.get('SCRAPECREATORS_API_KEY')
+        or is_shortform_oss_available(config, "instagram")
+    )
 
 
 def get_instagram_token(config: dict[str, Any]) -> str:
     """Get Instagram API token (same ScrapeCreators key as TikTok)."""
     return config.get('SCRAPECREATORS_API_KEY') or ''
+
+
+DEFAULT_SCRAPECREATORS_BASE_URL = "https://api.scrapecreators.com"
+SCRAPECREATORS_BASE_URL = DEFAULT_SCRAPECREATORS_BASE_URL
+
+
+def get_scrapecreators_base_url(config: dict[str, Any] | None = None) -> str:
+    """Get ScrapeCreators API base URL.
+
+    Defaults to https://api.scrapecreators.com. Can be overridden via
+    SCRAPECREATORS_BASE_URL (or SCRAPE_CREATORS_BASE_URL) in environment
+    or config to point at a local mock server, caching proxy, or
+    compatible alternative provider.
+
+    Remote overrides must be https:// (http:// is allowed only on loopback)
+    to protect API keys from cleartext transmission. Trailing slashes are stripped.
+    """
+    raw = None
+    if config:
+        raw = config.get("SCRAPECREATORS_BASE_URL") or config.get("SCRAPE_CREATORS_BASE_URL")
+    if not raw:
+        raw = os.environ.get("SCRAPECREATORS_BASE_URL") or os.environ.get("SCRAPE_CREATORS_BASE_URL")
+    if raw and str(raw).strip():
+        val = str(raw).strip().rstrip("/")
+        from . import providers
+        if providers.allowed_base_url_override(val):
+            return val
+        sys.stderr.write(
+            f"[last30days] WARNING: ignoring SCRAPECREATORS_BASE_URL - a provider endpoint override "
+            "must be https:// (http:// is allowed only on localhost), otherwise the API "
+            f"key would be sent in cleartext. Using {DEFAULT_SCRAPECREATORS_BASE_URL} instead.\n"
+        )
+        sys.stderr.flush()
+    return DEFAULT_SCRAPECREATORS_BASE_URL
 
 
 def get_xiaohongshu_api_base(config: dict[str, Any]) -> str:
@@ -1136,8 +2636,15 @@ def _xiaohongshu_api_base_candidates(config: dict[str, Any]) -> list[str]:
 
 
 def _xiaohongshu_base_logged_in(base: str, http_module: Any) -> bool:
+    from . import xiaohongshu_api
+
+    try:
+        normalized, req_kwargs = xiaohongshu_api._request_options(base)
+    except ValueError:
+        return False
+
     # Keep the health probe snappy, but allow one retry for transient hiccups.
-    health = http_module.get(f"{base}/health", timeout=3, retries=2)
+    health = http_module.get(f"{normalized}/health", timeout=3, retries=2, **req_kwargs)
     if not isinstance(health, dict):
         return False
     if not health.get("success"):
@@ -1145,30 +2652,37 @@ def _xiaohongshu_base_logged_in(base: str, http_module: Any) -> bool:
 
     # Login checks can be slower because some services consult the browser
     # profile/session, so use a slightly longer timeout than the health probe.
-    login = http_module.get(f"{base}/api/v1/login/status", timeout=8, retries=2)
-    is_logged_in = (
-        login.get("data", {}).get("is_logged_in")
-        if isinstance(login, dict) else False
+    login = http_module.get(
+        f"{normalized}/api/v1/login/status", timeout=8, retries=2, **req_kwargs
     )
-    return bool(is_logged_in)
+    login_data = login.get("data") if isinstance(login, dict) else None
+    is_logged_in = (
+        bool(login_data.get("is_logged_in"))
+        if isinstance(login_data, dict) else False
+    )
+    return is_logged_in
 
 
 def is_xiaohongshu_available(config: dict[str, Any]) -> bool:
     """Check whether Xiaohongshu HTTP API is reachable and logged in."""
     # Import here to avoid heavy imports at module load.
-    from . import http
+    from . import http, xiaohongshu_api
 
     for base in _xiaohongshu_api_base_candidates(config):
         try:
-            if _xiaohongshu_base_logged_in(base, http):
-                config[XIAOHONGSHU_RESOLVED_API_BASE_KEY] = base
+            normalized, _ = xiaohongshu_api._validate_base_url(base)
+        except ValueError:
+            continue
+        try:
+            if _xiaohongshu_base_logged_in(normalized, http):
+                config[XIAOHONGSHU_RESOLVED_API_BASE_KEY] = normalized
                 return True
         except (OSError, http.HTTPError):
             continue
         except Exception as exc:
             sys.stderr.write(
                 f"[last30days] WARNING: unexpected error checking Xiaohongshu "
-                f"at {base}: {type(exc).__name__}: {exc}\n"
+                f"at {normalized}: {type(exc).__name__}: {exc}\n"
             )
             sys.stderr.flush()
     return False
@@ -1197,10 +2711,24 @@ def get_x_source_status(config: dict[str, Any], probe: bool = False) -> dict[str
     """
     from . import bird_x
 
-    if config.get('AUTH_TOKEN') and config.get('CT0'):
-        bird_x.set_credentials(config.get('AUTH_TOKEN'), config.get('CT0'))
-    bird_status = bird_x.get_bird_status()
+    # Backends this host may run: the policy's auto chain plus a known pin.
+    # Bird is primed/probed and xquik is probed only when they are in that
+    # set, so an official-only host never touches the scraper or the
+    # third-party API unless the backend is pinned.
+    policy = x_policy(config)
+    pin = x_backend_pin(config)
+    considered = set(policy.auto_chain)
+    if pin in _X_BACKEND_KNOWN:
+        considered.add(pin)
+
+    if 'bird' in considered and config.get('AUTH_TOKEN') and config.get('CT0'):
+        _inject_bird_credentials(config)
+    bird_status = dict(bird_x.get_bird_status())
+    if 'bird' not in considered:
+        # Never report the scraper as usable where the policy forbids it.
+        bird_status["authenticated"] = False
     xai_available = bool(config.get('XAI_API_KEY'))
+    xapi_available = bool(config.get('X_BEARER_TOKEN'))
 
     # Report the TRUE auth lane (browser / env / keychain) rather than the static
     # "env AUTH_TOKEN" label — tokens usually come from live browser cookies, and
@@ -1221,7 +2749,7 @@ def get_x_source_status(config: dict[str, Any], probe: bool = False) -> dict[str
     xquik_available = is_xquik_available(config)
     xquik_working: bool | None = None
     xquik_status = ""
-    if xquik_available:
+    if xquik_available and 'xquik' in considered:
         if probe:
             from . import xquik
             xquik_working = xquik.probe_works(get_xquik_token(config))
@@ -1236,20 +2764,33 @@ def get_x_source_status(config: dict[str, Any], probe: bool = False) -> dict[str
     from . import xurl_x as _xurl_x
     xurl_available = _xurl_x.is_available() if probe else _xurl_x.has_stored_auth()
 
-    # Determine active source. bird (browser cookies) and xAI win when present;
-    # when neither is available, xquik is the active X source. A probe that
-    # clearly failed (False) means xquik is not actually usable.
-    if bird_status["authenticated"]:
-        source = 'bird'
-    elif xai_available:
-        source = 'xai'
+    # Grok availability is filesystem-only on both paths (PATH lookup plus the
+    # credential store), so it is safe to compute here regardless of `probe`.
+    # Grok is opt-in only: it appears in grok_available but never wins the
+    # unpinned source selection.
+    from . import grok_x as _grok_x
+    grok_available = _grok_x.has_stored_auth()
+
+    # Determine active source. A pin forces a single backend (R4): ANY known
+    # pin is exclusive, mirroring x_backend_chain's [] semantics. Pinned
+    # backend available -> that source. Pinned backend unavailable -> None.
+    # Otherwise walk the policy's auto chain (default: bird first, cookies
+    # beat XAI_API_KEY when both are present, then xai, xurl, xquik;
+    # official-only: xapi, xai, xurl). Opt-in backends are never
+    # auto-selected; a leftover ~/.grok/auth.json must not steal the X lane.
+    usable = {
+        'bird': bird_status["authenticated"],
+        'xai': xai_available,
+        'xurl': xurl_available,
+        'xquik': xquik_available and xquik_working is not False,
+        'grok': grok_available,
+        'xapi': xapi_available,
+    }
+    if pin in _X_BACKEND_KNOWN:
+        # Pin is exclusive: pinned backend if available, else None (no fallback).
+        source = pin if usable.get(pin) else None
     else:
-        if xurl_available:
-            source = 'xurl'
-        elif xquik_available and xquik_working is not False:
-            source = 'xquik'
-        else:
-            source = None
+        source = next((b for b in policy.auto_chain if usable.get(b)), None)
 
     return {
         "source": source,
@@ -1257,6 +2798,8 @@ def get_x_source_status(config: dict[str, Any], probe: bool = False) -> dict[str
         "bird_authenticated": bird_status["authenticated"],
         "bird_username": bird_status["username"],
         "xai_available": xai_available,
+        "xapi_available": xapi_available,
+        "grok_available": grok_available,
         "xurl_available": xurl_available,
         "xquik_available": xquik_available,
         "xquik_working": xquik_working,

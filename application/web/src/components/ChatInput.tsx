@@ -247,6 +247,13 @@ export function ChatInput({
 
   async function onPaste(e: ClipboardEvent<HTMLTextAreaElement>) {
     if (disabled || isUploading()) return;
+
+    // Word/Office (and many rich editors) put text/html + text/plain + a
+    // bitmap on the clipboard together. Prefer plain text so the paste lands
+    // in the textarea; only treat as image when there is no text.
+    const plain = e.clipboardData?.getData("text/plain")?.trim() ?? "";
+    if (plain) return;
+
     const imageFiles = collectClipboardImages(e.clipboardData);
     if (imageFiles.length === 0) return;
 

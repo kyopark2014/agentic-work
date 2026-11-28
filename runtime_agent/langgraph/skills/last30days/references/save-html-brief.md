@@ -11,12 +11,16 @@ The contract has two modes:
 
 - For normal-report-plus-HTML mode: after you have already emitted the full chat response: badge, "What I learned:" (or comparison title), bold-lead-in paragraphs with citations, KEY PATTERNS list, engine footer pass-through, invitation block.
 - For HTML-as-deliverable mode: after you have drafted the synthesis that will go into the HTML, before emitting the final chat response.
-- BEFORE the WAIT FOR USER'S RESPONSE pause.
+- BEFORE the closing invitation and wait for the user's response.
 - ONLY if the user asked. Do NOT save HTML when the user didn't ask for it.
 
 ## How to fire it
 
 ```bash
+SYNTHESIS_FILE=$(mktemp "${TMPDIR:-/tmp}/last30days-synthesis.XXXXXXXX") || exit "$?"
+KEEP_SYNTHESIS=false
+trap 'if [ "$KEEP_SYNTHESIS" = false ]; then rm -f -- "$SYNTHESIS_FILE"; fi' EXIT
+
 # 1. Write your synthesis prose VERBATIM to a temp file. The synthesis is the
 #    "What I learned:" prose label, the bold-lead-in paragraphs with their
 #    inline citations, and the "KEY PATTERNS from the research:" numbered list.
@@ -28,10 +32,7 @@ The contract has two modes:
 #      wrote in chat.
 #    In both modes, do not paraphrase, summarize, or reorder. The HTML must read
 #    identically to the intended report in voice and citations.
-SYNTHESIS_FILE="/tmp/last30days-synthesis-${CLAUDE_SESSION_ID}.md"
-# >| not >: fixed path may already exist on a same-session re-run; a plain >
-# is refused under `set -o noclobber`.
-cat >| "$SYNTHESIS_FILE" <<'SYNTHESIS_EOF'
+cat >| "${SYNTHESIS_FILE}" << 'SYNTHESIS_EOF' || exit "$?"
 What I learned:
 
 **{First headline}** - {body with [name](url) inline citations}
@@ -47,39 +48,58 @@ KEY PATTERNS from the research:
 SYNTHESIS_EOF
 
 # 2. Convert the synthesis to a self-contained HTML file via the engine.
-#    REPLAY THE SAME SCOPE FLAGS as your original run (--plan, --hiring-signals,
-#    resolved --x-handle/--subreddits/etc). On a same-topic follow-up, the
-#    engine reuses the structured last-report cache at
+#    Use --cached-report with the same topic as your original run. The engine
+#    reuses the original scope and per-entity reports in the structured cache at
 #    ~/.config/last30days/last-report.json to build badge metadata and footer
 #    without re-running source fetchers. That cache is intentionally short-lived
 #    (default: one hour; tune with LAST30DAYS_REPORT_CACHE_TTL_SECONDS, or set
-#    it to 0 to disable reuse). If the cache is stale, missing, or for a
-#    different topic, stderr says "No matching cached report data" and the
-#    engine falls back to a fresh run; the same scope flags keep that fallback
-#    aligned with the synthesis body.
-SLUG=$(echo "$TOPIC" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//')
-HTML_PATH="${LAST30DAYS_MEMORY_DIR}/${SLUG}-brief.html"
-# Collision guard: the `> "$HTML_PATH"` redirect below OVERWRITES - the engine
-# does NOT auto-date the brief (its date-suffix logic applies only to --save-dir
-# raw files, not to this redirected --emit=html stream). So if the clean name
-# already exists, date-suffix it here to avoid clobbering a prior brief.
-if [ -f "$HTML_PATH" ]; then
-  HTML_PATH="${LAST30DAYS_MEMORY_DIR}/${SLUG}-brief-$(date +%F).html"
-fi
-"${LAST30DAYS_PYTHON}" "${SKILL_ROOT}/scripts/last30days.py" "${TOPIC}" \
-  --emit=html \
-  --synthesis-file "$SYNTHESIS_FILE" \
-  "${SCOPE_FLAGS[@]}" \
-  >| "$HTML_PATH"   # >| not >: noclobber-safe write to the collision-guarded path
-#    where SCOPE_FLAGS is the same array you passed the first time, e.g.
-#    SCOPE_FLAGS=(--hiring-signals --plan "$QUERY_PLAN_FILE" --x-handle=acme).
-#    For a scoped --hiring-signals brief, --hiring-signals MUST be here too so
-#    the footer reflects the jobs-scoped board, not a generic crawl.
+#    it to 0 to disable reuse). Do not replay --plan, --competitors-plan, or
+#    --x-posts: their temporary files can already be removed. If the cache is
+#    stale, missing, or for a different topic, stderr says
+#    "No matching cached report data" and the command exits without research. Recreate the original
+#    research plans, rerun research with the original scope, and update the
+#    synthesis before retrying this export.
+SLUG=$(printf '%s\n' "${TOPIC}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//')
+# Render beside the destination, then create a new name atomically. The hard
+# link refuses existing paths even when another exporter wins the same name.
+HTML_PATH=$(
+  HTML_TMP=$(mktemp "${LAST30DAYS_MEMORY_DIR}/.last30days-html.XXXXXXXX") || exit "$?"
+  trap 'rm -f -- "$HTML_TMP"' EXIT
+  "${LAST30DAYS_PYTHON}" "${SKILL_DIR}/scripts/last30days.py" "${TOPIC}" \
+    --emit=html \
+    --cached-report \
+    --synthesis-file "${SYNTHESIS_FILE}" \
+    >| "${HTML_TMP}" || exit "$?"
+  "${LAST30DAYS_PYTHON}" -I - "${HTML_TMP}" "${LAST30DAYS_MEMORY_DIR}" "${SLUG}" << 'HTML_PATH_PY'
+from datetime import date
+import os
+from pathlib import Path
+import sys
 
-# 3. Finish with the artifact handoff described below. Do not print the saved
-#    path from the shell block; the chat handoff is the single user-visible
-#    completion message.
+temporary, directory, slug = sys.argv[1:]
+base = Path(directory) / f"{slug}-brief"
+dated = f"{base}-{date.today().isoformat()}"
+candidate = Path(f"{base}.html")
+suffix = 1
+while True:
+    try:
+        os.link(temporary, candidate)
+    except FileExistsError:
+        candidate = Path(f"{dated}.html" if suffix == 1 else f"{dated}-{suffix}.html")
+        suffix += 1
+    else:
+        print(candidate)
+        break
+HTML_PATH_PY
+) || exit "$?"
+#    The cached report preserves hiring scope and comparison targeting.
+
+# Retain both assignments for the publishing decision, even across shell calls.
+printf 'HTML_PATH=%q\nSYNTHESIS_FILE=%q\n' "$HTML_PATH" "$SYNTHESIS_FILE" || exit "$?"
+KEEP_SYNTHESIS=true
 ```
+
+Show only the finished HTML path in the chat handoff. Keep the owner-only draft until the access decision so the publisher can use the exact synthesis. If the user opens the local file, chooses Done, cancels, or uses a publisher that reads the HTML directly, remove the draft with `rm -f -- "$SYNTHESIS_FILE"`. Use the exact path from the save command. The tool output carries the saved paths between shell calls, and the chat handoff is the single user-visible completion message.
 
 ## Optional hosted publishing
 
@@ -106,17 +126,21 @@ Before the `ht-ml.app` choice, tell the user that public pages may be crawled or
 
 Agents should discover the current publishing mechanics for the selected service when needed, including by visiting the service site, rather than hard-coding detailed service-specific instructions in chat. For the built-in `ht-ml.app` path, the engine supports `--publish-html`; on the password-protected branch, pass the shared password through `LAST30DAYS_PUBLISH_PASSWORD` rather than command-line arguments.
 
-When the user chooses the built-in `ht-ml.app` path, add `--publish-html` to the same `--emit=html` command. Use `--output "$HTML_PATH"` rather than shell redirection so the engine can write the `.publish.json` companion metadata next to the local HTML file. On the password-protected branch, set `LAST30DAYS_PUBLISH_PASSWORD` in the subprocess environment instead of passing `--publish-password` in the shell command.
+When the user chooses the built-in `ht-ml.app` path, restore the saved `HTML_PATH` and `SYNTHESIS_FILE` assignments if the shell changed. Pass the saved HTML path as `--output "$HTML_PATH"` so the engine can write the `.publish.json` companion metadata next to it. On the password-protected branch, set `LAST30DAYS_PUBLISH_PASSWORD` to a non-empty shared password in the subprocess environment; on the public branch, leave `LAST30DAYS_PUBLISH_PASSWORD` unset. If the draft is missing, stop before calling the engine and explain that the original synthesis is unavailable.
 
 ```bash
-LAST30DAYS_PUBLISH_PASSWORD="${PUBLISH_PASSWORD:-}" \
-"${LAST30DAYS_PYTHON}" "${SKILL_ROOT}/scripts/last30days.py" "${TOPIC}" \
-  --emit=html \
-  --synthesis-file "$SYNTHESIS_FILE" \
-  --output "$HTML_PATH" \
-  --publish-html \
-  "${SCOPE_FLAGS[@]}" \
-  >/dev/null
+(
+  [ -f "${SYNTHESIS_FILE:-}" ] || { printf '%s\n' 'The original synthesis draft is unavailable.' >&2; exit 1; }
+  trap 'rm -f -- "$SYNTHESIS_FILE"' EXIT
+  LAST30DAYS_PUBLISH_PASSWORD="${LAST30DAYS_PUBLISH_PASSWORD:-${PUBLISH_PASSWORD:-}}" \
+  "${LAST30DAYS_PYTHON}" "${SKILL_DIR}/scripts/last30days.py" "${TOPIC}" \
+    --emit=html \
+    --cached-report \
+    --synthesis-file "$SYNTHESIS_FILE" \
+    --output "$HTML_PATH" \
+    --publish-html \
+    >/dev/null
+)
 ```
 
 The hosted URL appears on stderr as `[last30days] Published HTML to https://...`. Confirm the result with the hosted URL. If the user chose password protection, also repeat the shared password they selected so they can send the URL and password together. The engine writes URL metadata to `<HTML_PATH>.publish.json`. The provider may return an `update_key`; treat it as secret. The engine deliberately does not write the update key to stdout, the HTML artifact, or `.publish.json` companion metadata.
@@ -132,7 +156,7 @@ When HTML is the requested deliverable - whether by `--emit=html`, `--emit:html`
 Respond with a concise handoff that includes the next-step choices:
 
 ```text
-🌐 last30days v{VERSION} · synced {YYYY-MM-DD}
+{the engine's first line, copied verbatim}
 
 📎 Shareable brief saved to <absolute HTML path>
 
@@ -163,7 +187,7 @@ If the user chooses open, open it when the host can safely open local files; oth
 
 The engine's `--emit=html` renderer combines:
 
-- The badge (`🌐 last30days vX.Y.Z · synced YYYY-MM-DD`) at the top
+- The engine's badge line at the top
 - A single inline metadata line (`{date range} · {active sources}`) below the badge
 - Your synthesis verbatim, with prose labels promoted to `<h2>` and bold lead-ins preserved
 - All `[name](url)` citations rendered as `<a>` tags
@@ -174,22 +198,22 @@ The renderer strips engine-internal noise that doesn't belong in a shareable art
 
 ## Comparison mode
 
-Same flow when the topic is `X vs Y` (or `X vs Y vs Z`). The engine routes through `render_for_html_comparison` internally; you don't need to do anything special. The synthesis temp file should still contain the comparison-shaped synthesis you wrote in chat (`## Quick Verdict`, `## {Entity}` per entity, `## Head-to-Head` table, `## The Bottom Line`, `## The emerging stack` per LAW 4 comparison exception).
+Same flow when the topic is `X vs Y` (or `X vs Y vs Z`). Use `--cached-report` without the deleted `--competitors-plan` and `--plan` files. The engine routes the stored entity reports through `render_for_html_comparison`. The synthesis temp file should still contain the comparison-shaped synthesis you wrote in chat (`## Quick Verdict`, `## {Entity}` per entity, `## Head-to-Head` table, `## The Bottom Line`, `## The emerging stack` per LAW 4 comparison exception).
 
 ## Follow-up turn
 
-If the user runs `/last30days OpenClaw` normally, sees the synthesis in chat, and THEN explicitly refers back to that visible synthesis ("save that as HTML", "make this shareable", "turn the above into HTML"), do the same save flow on the synthesis you wrote in the previous turn. Do not re-research; the synthesis is already in the conversation history. Just write it to the temp file and call the engine with `--emit=html --synthesis-file`, then use the normal-report-plus-HTML artifact block.
+If the user runs `/last30days OpenClaw` normally, sees the synthesis in chat, and THEN explicitly refers back to that visible synthesis ("save that as HTML", "make this shareable", "turn the above into HTML"), do the same save flow on the synthesis you wrote in the previous turn. Write the synthesis to the temp file. Call the engine with `--cached-report --emit=html --synthesis-file`. Use the normal-report-plus-HTML artifact block.
 
 If the follow-up instead asks for a new HTML deliverable ("give it to me in HTML", `--emit=html`, `--html`) rather than referring back to an already-visible report, treat it as HTML-as-deliverable mode.
 
-The engine will try to reuse `~/.config/last30days/last-report.json` for that second invocation when it is still within `LAST30DAYS_REPORT_CACHE_TTL_SECONDS` (default: one hour). If stderr says it is reusing cached report data, continue normally. If stderr says no matching cache exists, the cache may be stale; let the command finish only if you supplied the same scope flags as the original run. Otherwise stop and re-run with the original flags so the HTML footer does not describe a different dataset.
+The engine reuses `~/.config/last30days/last-report.json` when it is still within `LAST30DAYS_REPORT_CACHE_TTL_SECONDS` (default: one hour). If stderr says it is reusing cached report data, continue normally. If no matching cache exists, the command stops before research. Recreate the original plans, rerun the original research scope, and update the synthesis before exporting again.
 
 ## What NOT to do
 
 - Do NOT save HTML if the user didn't ask. The sparse mode (no synthesis) produces a thin file; not useful as a shareable.
 - Do NOT add content to the temp file beyond your synthesis prose. The badge / footer / colophon come from the engine.
 - Do NOT change the file path convention. `${LAST30DAYS_MEMORY_DIR}/${SLUG}-brief.html` is the canonical location.
-- Do NOT silently overwrite an existing file. The `--emit=html` output is written via a shell redirect (`>| "$HTML_PATH"`), which OVERWRITES the collision-guarded path — use `>|` not `>` because `set -o noclobber` refuses plain `>` when the file already exists. The collision guard in step 2 handles same-topic re-runs: if `{slug}-brief.html` already exists it date-suffixes to `{slug}-brief-YYYY-MM-DD.html`. Always report whichever path the redirect actually used in the chat handoff.
+- Do NOT overwrite an existing file. Step 2 renders to a private temporary file and links the completed output to a new name. If `{slug}-brief.html` exists, try `{slug}-brief-YYYY-MM-DD.html`, then `{slug}-brief-YYYY-MM-DD-2.html`, incrementing until a name is available. This also handles concurrent exporters without replacing files, directories, or symlinks. The temporary file is removed on success or failure. If rendering or linking fails, report the error instead of a successful save. Always report the path stored in `HTML_PATH` in the chat handoff.
 - Do NOT include the data quality warning text in the temp file or in your final chat line. Warnings are an engine-stderr concern, not an artifact concern.
 - Do NOT publish, upload, or send the HTML to a third-party service as part of the local save flow.
 - Do NOT publish to any service merely because HTML was requested. Show the saved path and next-step choices first; publishing requires the user to choose a publish option.
@@ -198,7 +222,7 @@ The engine will try to reuse `~/.config/last30days/last-report.json` for that se
 
 ## Edge cases
 
-- **Topic with shell-special characters** (quotes, ampersands): the temp filename uses a slugified version, but the engine receives the raw topic. The `cat <<'SYNTHESIS_EOF'` quoted heredoc form handles arbitrary content without expansion. Your synthesis text can include any character.
+- **Topic with shell-special characters** (quotes, ampersands): the file name for the finished brief uses a slug, and the engine receives the raw topic. The quoted `SYNTHESIS_EOF` heredoc preserves synthesis text without expanding it. Pick a delimiter that does not occur on a line by itself in the synthesis.
 - **Very long synthesis**: no upper bound. The engine handles long markdown bodies. Just paste verbatim.
 - **Synthesis with images or non-ASCII**: emoji and Unicode pass through. Image tags pass through as raw HTML; the renderer doesn't transform them. If you didn't include images in chat, don't add them here.
-- **No `${LAST30DAYS_MEMORY_DIR}` set**: defaults to `~/Documents/Last30Days/` per the SKILL.md `Configuration` section.
+- **No `${LAST30DAYS_MEMORY_DIR}` set**: defaults to `~/Documents/Last30Days/` per the `Configuration` section of `references/runtime.md`.

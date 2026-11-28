@@ -21,32 +21,37 @@ Two resolution modes:
   results fall below the configured thinness floor (see the gating in
   ``lib/pipeline.py``). No probe can pick one winner, so resolution renders
   honest conditional wording instead of an ``active_backend``. Reddit's
-  internal keyless lanes (rss/listing/arctic/shreddit) are sub-probe detail
-  inside the public composite, never chain entries.
+  internal keyless paths (web rungs, arctic, site search, listings) are
+  sub-probe detail inside the public composite, never chain entries; doctor
+  shows them as per-path rows.
 
 ``active_backend`` semantics: a PREDICTION — "the first backend the probes
 say the next run will try" — rendered as "will use". It is not an
 observation of what served a past run, and runtime failover can still
 diverge mid-run (a present-but-expired paid key passes a presence probe).
 
-Paid lanes (xai, xquik, serper, and every other API-key backend, including
-ScrapeCreators) probe KEY PRESENCE ONLY: a dict lookup, never a network
-call or credential spend. Binary-backed lanes reuse the U1 dependency
+Paid lanes (xai, xapi, xquik, serper, and every other API-key backend,
+including ScrapeCreators) probe KEY PRESENCE ONLY: a dict lookup, never a
+network call or credential spend. Binary-backed lanes reuse the U1 dependency
 probe layer (``health.probe_dependency``) so a stale shim reads as BROKEN,
 not available (#692).
 
 This module observes and predicts only. It must never alter which backend
 the pipeline actually uses; parity with the pipeline's pre-failover
-selection is asserted in ``tests/test_backend_descriptors.py``.
+selection is asserted in ``tests/test_backend_descriptors.py``. The X chain
+is shaped by ``env.x_policy``: on an official-only host the findings and
+the chain carry only the policy's backends (plus a pinned one), so doctor
+JSON never names a non-official backend there unless it is pinned.
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from shutil import which
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from . import env, health, prescriptions
+from . import env, health, prescriptions, proxy
 
 # Resolution modes.
 MODE_ALTERNATIVE = "alternative"  # probe-ordered chain, first-usable wins
@@ -59,9 +64,8 @@ TIER_ERROR = "error"
 
 # Web search backend order. grounding.web_search's auto branch owns the
 # runtime behavior (brave -> exa -> serper -> parallel -> keyless floor);
-# there is no importable constant there, so this declaration is guarded by
-# the grounding-auto parity test rather than an import.
-WEB_BACKEND_ORDER: Tuple[str, ...] = ("brave", "exa", "serper", "parallel", "keyless")
+# parallel-mcp is opt-in only (--web-backend parallel-mcp) and never auto-selected.
+WEB_BACKEND_ORDER: Tuple[str, ...] = ("brave", "exa", "serper", "parallel", "keyless", "parallel-mcp")
 
 # YouTube backend order (pipeline: yt-dlp first, ScrapeCreators search
 # fallback when yt-dlp is absent or fails — see lib/pipeline.py).
@@ -74,10 +78,20 @@ _SC_PRESCRIPTION = (
     "set SCRAPECREATORS_API_KEY (free 10,000-call signup: "
     f"{prescriptions.get('scrapecreators', 'key_missing').fix_cli})"
 )
-_X_COOKIES_PRESCRIPTION = (
-    "run setup with browser-cookie consent: "
-    f"{prescriptions.get('x', 'cookies_missing').fix_cli}"
-)
+
+
+def _x_cookies_prescription(config: Dict[str, Any]) -> str:
+    """Bird's unconfigured fix, routed through the X policy.
+
+    Off an official-only host this is the cookie-consent command; on one
+    the same lookup yields the official-path entry (connector lane, bearer,
+    xAI key), so a pinned-but-unconfigured scraper never prescribes a
+    cookie read there.
+    """
+    entry = prescriptions.for_x(config, "cookies_missing")
+    if entry.failure == "cookies_missing":
+        return f"run setup with browser-cookie consent: {entry.fix_cli}"
+    return f"{entry.fix_nl} (cli: {entry.fix_cli})"
 
 
 @dataclass
@@ -107,12 +121,15 @@ class BackendSpec:
 
     ``probe`` must be side-effect-free. When ``paid`` is True the probe is
     key-presence only: no subprocess, no network, no credential spend.
+    ``opt_in`` marks backends that are never auto-selected and require an
+    explicit pin (grok).
     """
 
     name: str
     requires: str
     probe: Callable[[Dict[str, Any]], "BackendFinding"]
     paid: bool = False
+    opt_in: bool = False
 
 
 @dataclass(frozen=True)
@@ -122,8 +139,10 @@ class ChainDescriptor:
     source: str
     mode: str
     backends: Tuple[BackendSpec, ...]
-    pin_var: Optional[str] = None   # env var pin (X, Reddit)
+    pin_var: Optional[str] = None   # env var pin (X, Reddit, YouTube)
     pin_flag: Optional[str] = None  # CLI flag pin (web: --web-backend)
+    # Env pin values the runtime honors; None means any backend name.
+    pin_values: Optional[Tuple[str, ...]] = None
 
 
 @dataclass
@@ -180,7 +199,7 @@ def _key_probe(name: str, key_var: str, requires: str, note: str = "") -> Callab
             return BackendFinding(
                 name=name,
                 status=health.OK,
-                detail=f"{key_var} present",
+                detail="via API key" if proxy.is_sentinel(config.get(key_var)) else f"{key_var} present",
                 requires=requires,
             )
         prescription = note or f"set {key_var} in ~/.config/last30days/.env"
@@ -212,7 +231,7 @@ def _probe_bird(config: Dict[str, Any]) -> BackendFinding:
             name="bird",
             status=health.MISSING,
             detail="X browser cookies (AUTH_TOKEN/CT0) not configured",
-            prescription=_X_COOKIES_PRESCRIPTION,
+            prescription=_x_cookies_prescription(config),
             requires=requires,
         )
     if not bird_x.is_bird_installed():
@@ -251,25 +270,149 @@ def _probe_bird(config: Dict[str, Any]) -> BackendFinding:
     )
 
 
+def _probe_grok(config: Dict[str, Any]) -> BackendFinding:
+    """grok CLI = keyless X. LOCAL-ONLY probe, like _probe_xurl.
+
+    Deliberately does NOT call ``health.probe_dependency``: that helper runs
+    ``subprocess.run([name, "--version"])``, and the whole-doctor-path test
+    patches ``subprocess.run`` to raise.
+
+    Consequence to be honest about: a grok binary that resolves on PATH but
+    will not execute (the stale-shim class) reports OK here and fails only when
+    a real run shells out. ``grok_x.is_available`` does not close that gap
+    either -- it is also filesystem-only. ``health.probe_dependency("grok")``
+    is the executing probe, and it runs in doctor's CLI-health block rather
+    than on this no-subprocess path.
+    """
+    from . import grok_x
+
+    requires = "grok CLI installed + signed in (no X credential)"
+    if which("grok") is None:
+        off_path = health._off_path_binary("grok")
+        if off_path is not None:
+            return BackendFinding(
+                name="grok",
+                status=health.MISSING,
+                requires=requires,
+                detail=f"grok is installed at {off_path} but that directory is not on this process's PATH",
+                prescription=health.path_edit_prescription(str(off_path.parent), "grok"),
+            )
+        return BackendFinding(
+            name="grok",
+            status=health.MISSING,
+            requires=requires,
+            detail="grok CLI not found on PATH",
+            prescription=(
+                "install the Grok CLI: npm install -g @xai-official/grok (or the installer at https://x.ai/cli/install.sh), "
+                "then run `grok login`"
+            ),
+        )
+    from . import grok_audit
+
+    audit = grok_audit.cached_status(os.path.realpath(which("grok")))
+    if audit and audit["verdict"] == grok_audit.FAIL:
+        return BackendFinding(
+            name="grok",
+            status=health.ERROR,
+            requires=requires,
+            detail=f"{audit['version']} failed the grok tool-boundary audit ({audit['check']})",
+            prescription=(
+                "update the grok CLI or use another X backend; "
+                "running `doctor` again clears this result so the next run re-audits"
+            ),
+        )
+    if audit:
+        audit_note = f"; {audit['version']} passed the tool-boundary audit"
+    else:
+        audit_note = "; this grok build is audited on its first run (local, no credits)"
+    store_status, store_detail, expires_at = grok_x.stored_auth_status()
+    if store_status == grok_x.AUTH_OK:
+        return BackendFinding(
+            name="grok",
+            status=health.OK,
+            requires=requires,
+            detail=f"{store_detail} (not live-verified until a run){audit_note}",
+        )
+    if store_status == grok_x.AUTH_EXPIRED:
+        expiry_str = expires_at.isoformat() if expires_at else "unknown"
+        return BackendFinding(
+            name="grok",
+            status=health.DEGRADED,
+            requires=requires,
+            detail=(
+                f"Grok session expired at {expiry_str}; "
+                "refresh happens at run time (if revoked, run `grok login --device-auth`)"
+            ),
+            prescription="grok login --device-auth",
+        )
+    if store_status == grok_x.AUTH_ERROR:
+        return BackendFinding(
+            name="grok",
+            status=health.ERROR,
+            requires=requires,
+            detail=store_detail,
+            prescription="grok login",
+        )
+    return BackendFinding(
+        name="grok",
+        status=health.MISSING,
+        requires=requires,
+        detail="grok CLI installed but not signed in",
+        prescription="grok login",
+    )
+
+
+def _probe_xapi(config: Dict[str, Any]) -> BackendFinding:
+    """xapi = direct X API v2 with an app-only bearer. KEY PRESENCE ONLY.
+
+    Never a network call. The unconfigured fix is the official-path
+    prescription on an official-only host (connector lane, bearer, xAI key,
+    with the about-a-week caveat); elsewhere the plain key hint,
+    since xapi runs there only under an explicit pin.
+    """
+    requires = "X_BEARER_TOKEN (X API v2)"
+    if config.get("X_BEARER_TOKEN"):
+        return BackendFinding(
+            name="xapi",
+            status=health.OK,
+            detail="X_BEARER_TOKEN present",
+            requires=requires,
+        )
+    if env.x_policy(config).official_only:
+        entry = prescriptions.get("x", "bearer_missing")
+        prescription = f"{entry.fix_nl} (cli: {entry.fix_cli})"
+    else:
+        prescription = "set X_BEARER_TOKEN in ~/.config/last30days/.env"
+    return BackendFinding(
+        name="xapi",
+        status=health.MISSING,
+        detail="X_BEARER_TOKEN not set",
+        prescription=prescription,
+        requires=requires,
+    )
+
+
 def _probe_xurl(config: Dict[str, Any]) -> BackendFinding:
-    """xurl = official X API v2 CLI (OAuth2). Free lane; LOCAL-ONLY probe.
+    """xurl = official X API v2 CLI (app-only bearer). Free lane; LOCAL-ONLY probe.
 
     Doctor's no-network guarantee forbids the live ``xurl whoami`` check
-    (``xurl_x.is_available()`` — an authenticated X API call, reserved for
-    research time). This probe keys on local evidence instead: the binary
-    on PATH plus xurl's on-disk token store (~/.xurl). Stored credentials
-    read as OK with an explicit "not live-verified" caveat; an unreadable
+    (``xurl_x.is_available()`` — reserved for research time). This probe keys
+    on local evidence instead: the binary on PATH plus xurl's on-disk token
+    store (~/.xurl/auth.yml or legacy ~/.xurl). Stored app-only bearer
+    credentials read as OK with an explicit "not live-verified" caveat; a store
+    holding only OAuth user tokens without ``bearer_token`` is reported as
+    MISSING because ``xurl_x.search_x`` pins ``--auth app``; an unreadable
     token store is a typed ERROR (broken, not unconfigured).
     """
     from . import xurl_x
 
-    requires = "xurl CLI installed + OAuth2 login"
+    requires = "xurl CLI installed + app-only bearer auth"
     if which("xurl") is None:
         return BackendFinding(
             name="xurl",
             status=health.MISSING,
             detail="xurl CLI not found on PATH",
-            prescription="npm install -g xurl && xurl auth oauth2 login",
+            prescription="npm install -g @xdevplatform/xurl && xurl auth app-only <bearer-token>",
             requires=requires,
         )
     store_status, store_detail = xurl_x.stored_auth_status()
@@ -278,7 +421,7 @@ def _probe_xurl(config: Dict[str, Any]) -> BackendFinding:
             name="xurl",
             status=health.OK,
             detail=(
-                "installed; stored OAuth2 credentials present; "
+                "installed; stored app-only bearer credentials present; "
                 "auth not live-verified (no network)"
             ),
             requires=requires,
@@ -288,14 +431,25 @@ def _probe_xurl(config: Dict[str, Any]) -> BackendFinding:
             name="xurl",
             status=health.ERROR,
             detail=store_detail,
-            prescription="xurl auth oauth2 login",
+            prescription="xurl auth app-only <bearer-token>",
+            requires=requires,
+        )
+    if "oauth user tokens only" in str(store_detail).lower():
+        return BackendFinding(
+            name="xurl",
+            status=health.MISSING,
+            detail=(
+                "xurl token store has OAuth user tokens only; "
+                "search requires app-only bearer auth"
+            ),
+            prescription="xurl auth app-only <bearer-token>",
             requires=requires,
         )
     return BackendFinding(
         name="xurl",
         status=health.MISSING,
         detail="xurl installed but not authenticated",
-        prescription="xurl auth oauth2 login",
+        prescription="xurl auth app-only <bearer-token>",
         requires=requires,
     )
 
@@ -331,13 +485,50 @@ def _probe_web_keyless(config: Dict[str, Any]) -> BackendFinding:
     )
 
 
+def _probe_web_parallel_mcp(config: Dict[str, Any]) -> BackendFinding:
+    """Opt-in Parallel Search MCP: anonymous hosted endpoint, optional bearer auth."""
+    requires = "opt-in only (--web-backend parallel-mcp; PARALLEL_API_KEY optional)"
+    real_key = proxy.real_key(config.get("PARALLEL_API_KEY"))
+    detail = (
+        "hosted Parallel Search MCP (opt-in; PARALLEL_API_KEY present)"
+        if real_key
+        else "hosted Parallel Search MCP (opt-in; anonymous, no key required)"
+    )
+    return BackendFinding(
+        name="parallel-mcp",
+        status=health.OK,
+        detail=detail,
+        requires=requires,
+    )
+
+
 def _probe_reddit_public(config: Dict[str, Any]) -> BackendFinding:
-    """Public keyless Reddit composite; internal lanes are sub-probe detail."""
+    """Reddit's keyless floor: Brave web search finds threads, Arctic Shift
+    ``/posts/ids`` hydrates them.
+
+    Side-effect-free like every probe here: it reads the persisted path health
+    (``reddit_health``) that runs and doctor's live probe write, never the
+    network and never a cookie. The floor is degraded when every web rung, or
+    the archive, is inside a recorded skip.
+    """
+    from . import reddit_health
+
+    requires = "none (keyless web search + Arctic Shift)"
+    detail = "keyless floor (paths: brave, ddg, startpage web search; arctic /posts/ids)"
+    try:
+        skipped = [p for p in (*reddit_health.WEB_RUNGS, "arctic") if reddit_health.skip_until(p)]
+    except Exception:
+        skipped = []
+    if not skipped:
+        return BackendFinding(name="public", status=health.OK, detail=detail, requires=requires)
+    web_down = all(rung in skipped for rung in reddit_health.WEB_RUNGS)
+    status = health.DEGRADED if web_down or "arctic" in skipped else health.OK
     return BackendFinding(
         name="public",
-        status=health.OK,
-        detail="public keyless composite (lanes: rss, listing, arctic, shreddit)",
-        requires="none (public endpoints)",
+        status=status,
+        detail=f"{detail}; skipped after a refusal: {', '.join(skipped)}",
+        prescription="run doctor to clear the skips and re-probe" if status != health.OK else "",
+        requires=requires,
     )
 
 
@@ -347,11 +538,16 @@ def _probe_reddit_public(config: Dict[str, Any]) -> BackendFinding:
 
 _X_PROBES: Dict[str, Callable[[Dict[str, Any]], BackendFinding]] = {
     "xai": _key_probe("xai", "XAI_API_KEY", "XAI_API_KEY (xAI/Grok live search)"),
+    "grok": _probe_grok,
     "bird": _probe_bird,
     "xurl": _probe_xurl,
     "xquik": _key_probe("xquik", "XQUIK_API_KEY", "XQUIK_API_KEY (xquik.com)"),
+    # Direct X API v2 with an app-only bearer: key presence only, no network.
+    "xapi": _probe_xapi,
 }
-_X_PAID = {"xai", "xquik"}
+_X_PAID = {"xai", "xquik", "xapi"}
+# Opt-in backends: never auto-selected; require explicit pin.
+_X_OPT_IN = set(env.X_BACKEND_OPT_IN)
 
 _WEB_PROBES: Dict[str, Callable[[Dict[str, Any]], BackendFinding]] = {
     "brave": _key_probe("brave", "BRAVE_API_KEY", "BRAVE_API_KEY"),
@@ -359,8 +555,18 @@ _WEB_PROBES: Dict[str, Callable[[Dict[str, Any]], BackendFinding]] = {
     "serper": _key_probe("serper", "SERPER_API_KEY", "SERPER_API_KEY"),
     "parallel": _key_probe("parallel", "PARALLEL_API_KEY", "PARALLEL_API_KEY"),
     "keyless": _probe_web_keyless,
+    "parallel-mcp": _probe_web_parallel_mcp,
 }
 _WEB_KEYED = {"brave", "exa", "serper", "parallel"}
+_WEB_OPT_IN = {"parallel-mcp"}
+_WEB_REQUIRES: Dict[str, str] = {
+    "brave": "BRAVE_API_KEY",
+    "exa": "EXA_API_KEY",
+    "serper": "SERPER_API_KEY",
+    "parallel": "PARALLEL_API_KEY",
+    "keyless": "no key; suppressed on native-search hosts",
+    "parallel-mcp": "opt-in only (--web-backend parallel-mcp; PARALLEL_API_KEY optional)",
+}
 
 _SC_SPEC = BackendSpec(
     name="scrapecreators",
@@ -372,24 +578,33 @@ _SC_SPEC = BackendSpec(
     paid=True,
 )
 
+# X backend requirements, keyed by name.
+_X_REQUIRES: Dict[str, str] = {
+    "xai": "XAI_API_KEY (xAI/Grok live search)",
+    "grok": "grok CLI installed + signed in (opt-in only; pin to enable)",
+    "bird": "X browser cookies (AUTH_TOKEN/CT0) + node",
+    "xurl": "xurl CLI installed + app-only bearer auth",
+    "xquik": "XQUIK_API_KEY (xquik.com)",
+    "xapi": "X_BEARER_TOKEN (X API v2)",
+}
+
 DESCRIPTORS: Dict[str, ChainDescriptor] = {
     # X: chain order and pin var imported from env.py (single source of truth).
+    # Backends include the auto chain (X_BACKEND_ORDER) plus opt-in entries
+    # (X_BACKEND_OPT_IN) for doctor visibility. Opt-in backends like grok
+    # appear in findings but are never auto-selected; pin to enable.
     "x": ChainDescriptor(
         source="x",
         mode=MODE_ALTERNATIVE,
         backends=tuple(
             BackendSpec(
                 name=name,
-                requires={
-                    "xai": "XAI_API_KEY (xAI/Grok live search)",
-                    "bird": "X browser cookies (AUTH_TOKEN/CT0) + node",
-                    "xurl": "xurl CLI installed + OAuth2 login",
-                    "xquik": "XQUIK_API_KEY (xquik.com)",
-                }[name],
+                requires=_X_REQUIRES[name],
                 probe=_X_PROBES[name],
                 paid=name in _X_PAID,
+                opt_in=name in _X_OPT_IN,
             )
-            for name in env.X_BACKEND_ORDER
+            for name in env.X_BACKEND_ORDER + env.X_BACKEND_OPT_IN
         ),
         pin_var=env.X_BACKEND_PIN_VAR,
     ),
@@ -404,7 +619,8 @@ DESCRIPTORS: Dict[str, ChainDescriptor] = {
             ),
             _SC_SPEC,
         ),
-        pin_var=None,  # no YouTube pin knob exists
+        pin_var=env.YOUTUBE_BACKEND_PIN_VAR,
+        pin_values=env.YOUTUBE_BACKEND_PIN_VALUES,
     ),
     "web": ChainDescriptor(
         source="web",
@@ -412,10 +628,10 @@ DESCRIPTORS: Dict[str, ChainDescriptor] = {
         backends=tuple(
             BackendSpec(
                 name=name,
-                requires=(f"{name.upper()}_API_KEY" if name in _WEB_KEYED
-                          else "no key; suppressed on native-search hosts"),
+                requires=_WEB_REQUIRES[name],
                 probe=_WEB_PROBES[name],
                 paid=name in _WEB_KEYED,
+                opt_in=name in _WEB_OPT_IN,
             )
             for name in WEB_BACKEND_ORDER
         ),
@@ -428,7 +644,7 @@ DESCRIPTORS: Dict[str, ChainDescriptor] = {
         backends=(
             BackendSpec(
                 name="public",
-                requires="none (public endpoints)",
+                requires="none (keyless web search + Arctic Shift)",
                 probe=_probe_reddit_public,
             ),
             _SC_SPEC,
@@ -467,12 +683,48 @@ def resolve(
     multiple binaries are simultaneously hung.
     """
     descriptor = get_descriptor(source)
-    findings = [
-        _run_probe(spec, config) for spec in descriptor.backends
-    ]
+    normalized_pin = pin.strip().lower() if isinstance(pin, str) and pin.strip() else None
+    specs, auto_names = _specs_for_policy(descriptor, config, pin=normalized_pin)
+    findings = [_run_probe(spec, config) for spec in specs]
     if descriptor.mode == MODE_CONDITIONAL:
-        return _resolve_conditional(descriptor, config, findings)
-    return _resolve_alternative(descriptor, config, findings, pin)
+        return _resolve_conditional(descriptor, config, findings, pin=normalized_pin)
+    return _resolve_alternative(descriptor, config, findings, normalized_pin, auto_names)
+
+
+def _specs_for_policy(
+    descriptor: ChainDescriptor,
+    config: Dict[str, Any],
+    pin: Optional[str] = None,
+) -> Tuple[List[BackendSpec], set]:
+    """The backends to probe for this host, and which of them auto-select.
+
+    Every source except X keeps its declared backends; auto-selection is the
+    non-opt-in set. For X the answer comes from ``env.x_policy``: on a
+    default host the declared chain (auto order plus opt-in entries for
+    doctor visibility) is unchanged; on an official-only host the findings
+    are the policy's chain in its order, plus the pinned backend when the
+    pin names something outside it, so neither doctor JSON nor the chain
+    string carries a non-official backend unless it is pinned. Observation
+    only: this mirrors ``env.x_backend_chain``, it never alters it.
+    """
+    specs = list(descriptor.backends)
+    if descriptor.source != "x":
+        return specs, {spec.name for spec in specs if not spec.opt_in}
+    policy = env.x_policy(config)
+    auto_names = set(policy.auto_chain)
+    if not policy.official_only:
+        return specs, auto_names
+    by_name = {spec.name: spec for spec in specs}
+    ordered = [by_name[name] for name in policy.auto_chain if name in by_name]
+    norm_pin = pin.strip().lower() if isinstance(pin, str) and pin.strip() else ""
+    effective_pin = (
+        norm_pin
+        if norm_pin and norm_pin not in ("auto", "none")
+        else env.x_backend_pin(config)
+    )
+    if effective_pin in by_name and effective_pin not in auto_names:
+        ordered.append(by_name[effective_pin])
+    return ordered, auto_names
 
 
 def _run_probe(spec: BackendSpec, config: Dict[str, Any]) -> BackendFinding:
@@ -491,14 +743,52 @@ def _run_probe(spec: BackendSpec, config: Dict[str, Any]) -> BackendFinding:
     return finding
 
 
+# Key behind each backend the API-key proxy can serve (lib/proxy.py).
+_PROXY_KEY_VARS = {
+    "xai": "XAI_API_KEY",
+    "serper": "SERPER_API_KEY",
+    "parallel": "PARALLEL_API_KEY",
+    "scrapecreators": "SCRAPECREATORS_API_KEY",
+}
+
+
+def _demote_proxied(
+    source: str, findings: List[BackendFinding], config: Dict[str, Any],
+) -> List[BackendFinding]:
+    """Order findings the way the runtime ranks proxy-served backends.
+
+    A backend served by the API-key proxy ranks after every backend the user
+    holds a key for: last in the X chain (env.x_backend_chain), and after the
+    keyed web backends but ahead of the keyless floor
+    (grounding.configured_backend). Without proxy lanes the order is unchanged.
+    """
+    proxied = [
+        f for f in findings
+        if proxy.is_sentinel(config.get(_PROXY_KEY_VARS.get(f.name, "")))
+    ]
+    if not proxied:
+        return findings
+    proxied_ids = {id(f) for f in proxied}
+    rest = [f for f in findings if id(f) not in proxied_ids]
+    if source == "web":
+        cut = next((i for i, f in enumerate(rest) if f.name not in _WEB_KEYED), len(rest))
+        return rest[:cut] + proxied + rest[cut:]
+    return rest + proxied
+
+
 def _resolve_alternative(
     descriptor: ChainDescriptor,
     config: Dict[str, Any],
     findings: List[BackendFinding],
     pin: Optional[str],
+    auto_names: Optional[set] = None,
 ) -> BackendResolution:
-    names = [spec.name for spec in descriptor.backends]
+    names = [f.name for f in findings]
     by_name = {f.name: f for f in findings}
+    if auto_names is None:
+        auto_names = {spec.name for spec in descriptor.backends if not spec.opt_in}
+    # Backends outside the auto set are opt-in here (never auto-selected).
+    opt_in_names = {name for name in names if name not in auto_names}
     res = BackendResolution(
         source=descriptor.source,
         mode=MODE_ALTERNATIVE,
@@ -507,11 +797,20 @@ def _resolve_alternative(
     )
 
     pin_name: Optional[str] = None
-    if pin and pin not in ("auto", "none") and pin in by_name:
-        pin_name = pin
+    norm_pin = pin.strip().lower() if isinstance(pin, str) else ""
+    if norm_pin and norm_pin not in ("auto", "none") and norm_pin in by_name:
+        pin_name = norm_pin
     elif descriptor.pin_var:
-        raw = (config.get(descriptor.pin_var) or "").lower()
-        if raw in by_name:
+        if descriptor.pin_var == env.YOUTUBE_BACKEND_PIN_VAR:
+            # Same spelling rules as the runtime gate (strip, "ytdlp" alias).
+            raw = env.youtube_backend_pin(config)
+        elif descriptor.pin_var == env.X_BACKEND_PIN_VAR:
+            raw = env.x_backend_pin(config)
+        else:
+            raw = (config.get(descriptor.pin_var) or "").strip().lower()
+        if raw in by_name and (
+            descriptor.pin_values is None or raw in descriptor.pin_values
+        ):
             pin_name = raw
 
     if pin_name:
@@ -535,34 +834,32 @@ def _resolve_alternative(
 
     # Collect-then-pick: first fully-usable wins; else best degraded; else
     # error carrying the highest-priority backend's prescription.
-    for finding in findings:
+    # Opt-in backends are NEVER auto-selected; skip them entirely.
+    auto_findings = _demote_proxied(
+        descriptor.source, [f for f in findings if f.name not in opt_in_names], config,
+    )
+    res.chain = [f.name for f in _demote_proxied(descriptor.source, findings, config)]
+    for finding in auto_findings:
         if finding.status == health.OK:
             res.active_backend = finding.name
             res.tier = TIER_OK
             return res
-    for finding in findings:
+    for finding in auto_findings:
         if finding.status == health.DEGRADED:
             res.active_backend = finding.name
             res.tier = TIER_WARN
             return res
     res.tier = TIER_ERROR
-    res.prescription = findings[0].prescription if findings else ""
+    # Prescription comes from the first auto-chain backend, not opt-in.
+    res.prescription = auto_findings[0].prescription if auto_findings else ""
     return res
-
-
-def _reddit_sc_min_items(config: Dict[str, Any]) -> int:
-    """The thinness floor, parsed exactly as the pipeline parses it
-    (lib/pipeline.py reddit fetch: int(... or 0), malformed -> 0)."""
-    try:
-        return int(config.get(env.REDDIT_SC_MIN_ITEMS_VAR) or 0)
-    except (TypeError, ValueError):
-        return 0
 
 
 def _resolve_conditional(
     descriptor: ChainDescriptor,
     config: Dict[str, Any],
     findings: List[BackendFinding],
+    pin: Optional[str] = None,
 ) -> BackendResolution:
     """Reddit: render the real per-query semantics, never a computed winner."""
     res = BackendResolution(
@@ -574,9 +871,13 @@ def _resolve_conditional(
         tier=TIER_OK,  # the public keyless composite is always reachable
     )
     has_key = bool(config.get("SCRAPECREATORS_API_KEY"))
-    raw_pin = (config.get(descriptor.pin_var) or "").lower() if descriptor.pin_var else ""
+    norm_pin = pin.strip().lower() if isinstance(pin, str) else ""
+    if norm_pin and norm_pin not in ("auto", "none"):
+        raw_pin = norm_pin
+    else:
+        raw_pin = (config.get(descriptor.pin_var) or "").strip().lower() if descriptor.pin_var else ""
     pinned_sc = has_key and raw_pin == "scrapecreators"
-    floor = _reddit_sc_min_items(config)
+    floor = env.reddit_sc_min_items(config)
 
     if pinned_sc:
         res.pinned = True
