@@ -53,6 +53,30 @@ Claude / Claude Code에 퍼블릭 베타로 노출되었고, Pro/Max/Ultra는 �
 
 서버는 `resources`와 skills 확장을 반드시 선언합니다(MUST). use-vault는 `directoryRead: false`입니다.
 
+`directoryRead: false`는 스킬 파일 목록을 **「디렉터리 실시간 조회」로 열어 주지 않는다**는 뜻으로 Skill 파일은 list에 실린 URI만 읽고, 폴더를 열어서 추가로 읽지 않습니다.
+
+**Skills 확장에서의 의미**
+
+Skills 확장은 파일 제공을 두 갈래로 나눕니다.
+
+| 방식 | 조건 | 동작 |
+| --- | --- | --- |
+| 정적 매니페스트 | 기본 (`directoryRead: false` 또는 생략/`{}`) | `skills/list` entry의 `resources: [{ uri, digest, size }, …]`에 목록이 이미 있음. 호스트는 **그 URI만** `resources/read` |
+| 디렉터리 읽기 | `directoryRead: true` | 선택 API `resources/directory/read`로 스킬 루트를 **실시간 리스팅**. 서버가 파일을 동적으로 노출할 때 |
+
+스펙 기본값이 `false`인 이유: 대부분의 skill은 배포 시점에 파일이 고정된 **번들**이고, digest/size 검증·승인 바인딩이 매니페스트에 의존합니다. 디렉터리 탐색을 켜면 실시간 결과를 보유 manifest의 확장으로 취급하거나 새 파일을 그 스킬 일부로 노출하면 안 됩니다(MUST NOT). 그래서 옵션이며 기본은 끔입니다.
+
+**use-vault에서 `false`인 이유**
+
+- 게시 대상이 `skills/use-vault/SKILL.md` **한 패키지**(현재는 SKILL.md 단일 파일)뿐
+- 서버 기동 시 디렉터리를 읽어 메모리 카탈로그·SHA-256 digest/size를 고정 (`vault_skills.load_skill_catalog`)
+- list entry가 complete라 호스트가 추가 파일 탐색을 할 일이 없음
+- 내용이 바뀌면 **이미지 재배포·프로세스 재시작**으로 매니페스트가 갱신됨 → `resources/directory/read` 불필요
+
+정리: Skills 확장은 “실시간 폴더 열기”를 기본으로 두지 않고, use-vault도 정적 번들이라 `settings()`에 `directoryRead: False`를 명시합니다.
+
+스펙상 최소 형태:
+
 ```json
 {
   "capabilities": {
@@ -69,6 +93,40 @@ Claude / Claude Code에 퍼블릭 베타로 노출되었고, Pro/Max/Ultra는 �
 - 선언 시 `skills/list` · `skills/get` 구현과 `resources/read`로 스킬 파일 제공이 필수
 - `directoryRead`(기본 `false`): `resources/directory/read` 지원 여부. 빈 객체 `{}`도 “디렉터리 읽기 없이 지원”
 - 클라이언트는 capability 확인 후에만 skills 메서드를 호출
+
+다음에서는 [use-vault MCP server](https://github.com/kyopark2014/ob-note/tree/main/MCP/use-vault)에서 정의하고 있는 capability의 예입니다.
+
+`capabilities` 딕셔너리를 직접 쓰지 않습니다. `MCPServer(extensions=[apps, skills])`에 Extension을 넘기면 SDK가 `initialize` 응답에 자동으로 넣습니다.
+
+| Extension | `identifier` | `settings()` | 광고 위치 |
+| --- | --- | --- | --- |
+| `Skills` (`vault_skills.py`) | `io.modelcontextprotocol/skills` | `{"directoryRead": False}` | `capabilities.extensions[…]` |
+| `Apps` (`vault_apps.py`) | `io.modelcontextprotocol/ui` | `{}` | 동일 |
+
+SDK `_apply_extension`이 각 Extension의 tools / resources / methods를 등록하고  
+`ServerCapabilities.extensions[identifier] = settings()` 로 광고합니다.  
+`initialize` 시 `get_capabilities()`가 핸들러 유무 + extension map을 합칩니다.
+
+use-vault가 실제로 광고하는 형태(요약):
+
+```json
+{
+  "capabilities": {
+    "tools": { "listChanged": false },
+    "resources": { "subscribe": false, "listChanged": false },
+    "extensions": {
+      "io.modelcontextprotocol/ui": {},
+      "io.modelcontextprotocol/skills": { "directoryRead": false }
+    }
+  }
+}
+```
+
+- `tools` — `@mcp.tool()` 등록으로 생김
+- `resources` — Skills/Apps `TextResource` 등록으로 `resources/list`·`read` 핸들러가 생겨 생김
+- `extensions` — 각 Extension의 `identifier` + `settings()`
+
+호스트(`mcp_skills.server_supports_skills`)는 `extensions`에 `io.modelcontextprotocol/skills` 키가 있는지만 보고 skills API를 호출합니다.
 
 #### 프로토콜 메시지
 
@@ -387,24 +445,51 @@ use-vault MCP (ob-note AgentCore)
 | 클라이언트 | Prompt Injector | description → 검증 후 본문 | `chat.create_agent` |
 | 클라이언트 | Approval | URI+digest 바인딩 (스펙 MUST) | **미구현** (MCP 선택으로 암묵 허용) |
 
-### 3.3 서버
+#### 메서드별 구현 위치
 
-`vault_skills.py`:
+역할이 **서버(핸들러 제공)** / **클라이언트(호출·검증)** 로 나뉩니다.  
+`resources/road`는 오타이며 스펙·코드 모두 **`resources/read`** 입니다.
 
-- `Extension.identifier = "io.modelcontextprotocol/skills"`
-- `skills/list`, `skills/get` MethodBinding
-- `TextResource`로 `skill://use-vault/...` 제공
-- 디렉터리 바이트로 SHA-256 digest / size 매니페스트 계산
+| MCP 메서드 | 서버 (제공) | 클라이언트 (호출) | 비고 |
+| --- | --- | --- | --- |
+| `skills/list` | `ob-note/MCP/use-vault/vault_skills.py` — `MethodBinding` → `_handle_list` | `runtime_agent/langgraph/mcp_skills.py` — `ListSkillsRequest` · `_list_skills` → `discover_mcp_skills` | discover 시 메타만. 본문 pre-fetch 금지 |
+| `skills/get` | 동 파일 — `MethodBinding` → `_handle_get` (`GetSkillRequestParams.uri`) | **호출 코드 없음** | 서버는 스펙대로 구현. 호스트는 list entry가 complete라 get을 쓰지 않음 |
+| `resources/read` | 동 파일 — `TextResource` / `ResourceBinding` (`skill://use-vault/…`) | `mcp_skills._read_resource_bytes` → `load_verified_skill_md` (+ `verify_skill_md_bytes`) | lazy load. size·SHA-256·frontmatter 검증 후 본문 사용 |
 
-`mcp_server_use_vault.py`:
+호출 체인 (agentic-work):
+
+```text
+chat.create_agent
+  → mcp_skills.discover_mcp_skills(server_params)   # skills/list 만
+  → skill.py 레지스트리에 메타 등록 (instructions="")
+
+모델이 필요 시
+  → get_skill_instructions (skill.py 도구)
+  → load_verified_skill_md_sync                     # resources/read + 검증
+```
+
+서버 등록 (`mcp_server_use_vault.py`):
 
 ```python
 mcp = MCPServer(
     name="use-vault",
     instructions=INSTRUCTIONS,  # 짧게 유지
-    extensions=[apps, skills],
+    extensions=[apps, skills],  # skills = vault_skills.SkillsExtension
 )
 ```
+
+요약: **핸들러는 use-vault (`vault_skills.py`)**, **호스트 discovery·lazy load·검증은 `mcp_skills.py` + `skill.py`**.
+
+### 3.3 서버
+
+`vault_skills.py`:
+
+- `Extension.identifier = "io.modelcontextprotocol/skills"`
+- `skills/list`, `skills/get` MethodBinding (`methods()`)
+- `TextResource`로 `skill://use-vault/...` 제공 (`resources()` → `resources/read`)
+- 디렉터리 바이트로 SHA-256 digest / size 매니페스트 계산
+- `settings()` → `{"directoryRead": false}`  
+  — 스킬 파일 목록을 디렉터리 실시간 조회로 열지 않음. Skills 확장 기본이 정적 매니페스트이고, use-vault는 기동 시 번들을 메모리에 고정하므로 `resources/directory/read`가 필요 없음
 
 `skills/list` 응답 예 (본문 없음):
 
@@ -564,6 +649,7 @@ use-vault MCP
 | **P0** | digest/size/frontmatter 미검증 | 사용 전 SHA-256·size·frontmatter 필드 단위 검증 | **수정함** — `verify_skill_md_bytes` |
 | **P1** | registry를 `name`만으로 덮어씀 | identity = **server + URI** | **부분** — `{server}:{name}` 분리 + `SKILL_IDENTITY`; 승인 UI 없음 |
 | **P1** | 사용자 승인·manifest 바인딩 | URI+digest 세트 묶고 변경 시 재승인 | **미구현** (MCP 선택으로 암묵 허용) |
+| **P2** | 클라이언트가 `skills/get` 미호출 | URI 단건 조회·갱신 | **의도적** — list entry complete; 서버 `_handle_get`만 존재 |
 | **P2** | `nextCursor` 무시 | pagination | **미구현** (skill 1개라 실질 영향 없음) |
 | **P2** | `directoryRead` / `"dynamic"` | 옵션 | **불필요** (정적 번들; `"dynamic"`은 검증 경로만 준비) |
 | **P2** | supporting files | manifest URI만 읽고 digest 검증 | **부분** — SKILL.md만 로드 |
