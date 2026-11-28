@@ -646,8 +646,8 @@ def _project_secret_resource_arns(config) -> list:
     signing keys are never granted.
 
     ``{project}/vault-agent-token``, ``ob-note/vault-agent-token``, and legacy
-    ``ob-docs/vault-agent-token`` are allowed so my-vaults can call standalone
-    ob-note without reading
+    ``ob-docs/vault-agent-token`` are allowed so use-vault MCP (and any remaining
+    vault HTTP clients) can call standalone ob-note without reading
     session-signing-key (still denied below).
 
     ``{project}/schedule-agent-token`` is allowed so my-schedule can call the

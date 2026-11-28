@@ -100,6 +100,11 @@ class Skill:
     description: str
     instructions: str
     path: str
+    # "local" (filesystem) or "mcp:<server>" (Skills over MCP)
+    origin: str = "local"
+    uri: str | None = None
+    server: str | None = None
+
 
 class SkillManager:
     """Discovers, loads and selects Agent Skills following the Anthropic spec."""
@@ -190,13 +195,45 @@ def format_skill_instructions(skill: Skill) -> str:
     last30days and similar skills require SKILL_DIR = the directory containing
     SKILL.md. Do not set a process-global SKILL_DIR (skills may run in parallel);
     prefix each bash engine call with SKILL_DIR=... instead.
+
+    MCP-served skills (origin mcp:*) have no local scripts directory; return the
+    body with an origin header so the agent uses MCP tools instead.
     """
+    origin = getattr(skill, "origin", "local") or "local"
+    if origin.startswith("mcp:"):
+        server = getattr(skill, "server", None) or origin.split(":", 1)[-1]
+        uri = getattr(skill, "uri", None) or ""
+        return (
+            f"SKILL_ORIGIN=mcp\n"
+            f"SKILL_NAME={skill.name}\n"
+            f"MCP_SERVER={server}\n"
+            f"SKILL_URI={uri}\n"
+            f"This skill was loaded via Skills over MCP from server '{server}'.\n"
+            f"Follow the instructions below using that server's MCP tools "
+            f"(not local scripts under $SKILLS_DIR).\n\n"
+            f"{skill.instructions}"
+        )
+
     register_skill_path(skill.name, skill.path)
     builtin_hint = (
         f"$SKILLS_DIR/{skill.name}"
         if skill.path.startswith(SKILLS_DIR + os.sep) or skill.path == SKILLS_DIR
         else skill.path
     )
+    refs_dir = os.path.join(skill.path, "references")
+    progressive_hint = ""
+    if os.path.isdir(refs_dir):
+        progressive_hint = (
+            f"Progressive disclosure (IMPORTANT):\n"
+            f"- This skill uses a thin root SKILL.md plus on-demand files under "
+            f"{refs_dir}/.\n"
+            f"- Do NOT summarize, paraphrase, or page the skill guide to the user "
+            f"(no '스킬 가이드 요약 1/N').\n"
+            f"- Follow the root's reference-routing table: read_file only the "
+            f"required reference(s) for the current phase, then run the engine.\n"
+            f"- User-facing output is the research result (engine + synthesis), "
+            f"not a walkthrough of SKILL.md.\n\n"
+        )
     return (
         f"SKILL_DIR={skill.path}\n"
         f"SKILL_NAME={skill.name}\n"
@@ -210,8 +247,42 @@ def format_skill_instructions(skill: Skill) -> str:
         f"- execute_code: SKILL_DIRS[{skill.name!r}] == {skill.path!r}\n"
         f"- Builtin engines live under SKILLS_DIR={SKILLS_DIR}; "
         f"do not search USER_SKILLS_DIR for them.\n\n"
+        f"{progressive_hint}"
         f"{skill.instructions}"
     )
+
+
+def register_mcp_skills(entries: list[dict]) -> list[str]:
+    """Register Skills-over-MCP entries into the base SkillManager registry.
+
+    Returns the list of registered skill names.
+    """
+    if not entries:
+        return []
+    skill_manager = skill_managers.get("base")
+    if skill_manager is None:
+        skill_manager = SkillManager(SKILLS_DIR)
+        skill_managers["base"] = skill_manager
+        skill_manager.discover_plugin_skills(SKILLS_DIR)
+
+    names: list[str] = []
+    for item in entries:
+        name = (item.get("name") or "").strip()
+        if not name:
+            continue
+        skill = Skill(
+            name=name,
+            description=str(item.get("description") or ""),
+            instructions=str(item.get("instructions") or ""),
+            path=str(item.get("path") or f"mcp://{item.get('server')}/{name}"),
+            origin=str(item.get("origin") or f"mcp:{item.get('server') or 'unknown'}"),
+            uri=item.get("uri"),
+            server=item.get("server"),
+        )
+        skill_manager.registry[name] = skill
+        names.append(name)
+        logger.info("Registered MCP skill: %s (from %s)", name, skill.origin)
+    return names
 
 def get_skills_xml(skill_info: list) -> str:
     lines = ["<available_skills>"]
@@ -238,7 +309,7 @@ def register_plugin_skills(plugin_name: str):
     skill_manager.discover_plugin_skills(skills_dir)
 
 
-def get_skill_info(skill_list: list) -> list:
+def get_skill_info(skill_list: list, mcp_skill_names: list | None = None) -> list:
     skill_manager = skill_managers.get('base')
     if skill_manager is None:
         skill_manager = SkillManager(SKILLS_DIR)
@@ -254,10 +325,15 @@ def get_skill_info(skill_list: list) -> list:
     
     if not registry:
         return []
+
+    selected = set(skill_list or [])
+    mcp_names = set(mcp_skill_names or [])
     
     skill_info = []
     for s in registry.values():
-        if s.name in skill_list:
+        origin = getattr(s, "origin", "local") or "local"
+        include = s.name in selected or s.name in mcp_names or origin.startswith("mcp:")
+        if include:
             skill_info.append({"name": s.name, "description": s.description})
         
     return skill_info
@@ -353,7 +429,10 @@ SKILL_USAGE_GUIDE = (
     "3. **중요: 지침을 읽기 전에 어떤 작업을 할지 단정짓지 마세요.** "
     "skill의 description에 서브커맨드(query, path, explain 등)가 있다면, "
     "사용자 명령의 서브커맨드를 정확히 파악한 후 그에 맞는 동작을 설명하세요.\n"
-    "4. 지침에 포함된 코드 패턴을 execute_code 또는 bash 도구로 실행하세요.\n"
+    "4. skill에 references/ 라우팅이 있으면 root 지침만 따른 뒤, 필요한 "
+    "reference만 read_file로 읽고 엔진을 실행하세요. SKILL.md/가이드를 "
+    "사용자에게 요약·분할 출력하지 마세요.\n"
+    "5. 지침에 포함된 코드 패턴을 execute_code 또는 bash 도구로 실행하세요.\n"
 )
 
 def build_skill_prompt(skill_info: list) -> str:

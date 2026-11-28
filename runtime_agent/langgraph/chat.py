@@ -2405,6 +2405,8 @@ def append_tool_guidance_to_prompt(system_prompt: str, mcp_servers: list) -> str
             extras.append(
                 "ob-note vault 작업은 use-vault MCP 도구(vault_read, vault_search, "
                 "vault_write, vault_append 등)를 사용하세요. "
+                "상세 워크플로(폴더 규약·합니다체·deep link·이미지)는 Skills over MCP로 "
+                "제공되는 use-vault skill을 get_skill_instructions로 로드한 뒤 따르세요. "
                 f'모든 도구 호출에 actor_id="{uid}" 를 반드시 전달하세요 '
                 "(계정 로그인 email). 닉네임·표시 이름을 쓰지 마세요. "
                 "최근/목록/문서 리스트 요청에는 vault_list(또는 vault_search)를 우선 사용하세요. "
@@ -2593,7 +2595,19 @@ async def create_agent(
 
     tools.extend(skill.get_skill_tools())
 
-    skill_info = skill.get_skill_info(skill_list)
+    # Skills over MCP: discover skills advertised by connected servers (e.g. use-vault).
+    mcp_skill_names: list[str] = []
+    try:
+        import mcp_skills
+
+        mcp_entries = await mcp_skills.discover_mcp_skills(server_params)
+        mcp_skill_names = skill.register_mcp_skills(mcp_entries)
+        if mcp_skill_names:
+            logger.info(f"MCP skills registered: {mcp_skill_names}")
+    except Exception as mcp_skill_exc:
+        logger.warning(f"MCP skills discovery skipped: {mcp_skill_exc}")
+
+    skill_info = skill.get_skill_info(skill_list, mcp_skill_names=mcp_skill_names)
     logger.info(f"skill_info: {skill_info}")
 
     system_prompt = skill.build_skill_prompt(skill_info)
