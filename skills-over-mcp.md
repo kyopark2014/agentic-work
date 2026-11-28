@@ -56,10 +56,10 @@ Skill 파일 형식은 [Agent Skills](https://agentskills.io/specification)와 �
 ```mermaid
 sequenceDiagram
     participant UI as Web UI
-    participant Host as agentic-work Runtime
-    participant MCP as use-vault MCP
+    participant Host as Runtime
+    participant MCP as MCP
 
-    UI->>Host: use-vault MCP 선택 후 세션 시작
+    UI->>Host: MCP 선택 후 세션 시작
     Host->>MCP: initialize (extensions: skills)
     Host->>MCP: skills/list
     MCP-->>Host: uri, frontmatter, resources(digest/size)
@@ -67,16 +67,16 @@ sequenceDiagram
     Host-->>UI: available_skills에 name/description 노출
 
     UI->>Host: 사용자 요청 (예: vault 노트 조회)
-    Host->>Host: get_skill_instructions(use-vault)
-    Host->>MCP: resources/read(skill://use-vault/SKILL.md)
+    Host->>Host: get_skill_instructions(skill name)
+    Host->>MCP: resources/read(skill://[skill name]/SKILL.md)
     MCP-->>Host: SKILL.md bytes
     Host->>Host: size + SHA-256 + frontmatter 검증
     alt 검증 실패
         Host-->>Host: 본문 폐기, 오류 반환
     else 검증 성공
         Host->>Host: 지침을 모델 컨텍스트에 삽입
-        Host->>MCP: vault_* tools 호출
-        MCP-->>Host: vault API 결과
+        Host->>MCP: tools 호출
+        MCP-->>Host: tools 결과
     end
 ```
 
@@ -93,6 +93,89 @@ sequenceDiagram
 | 7. 실행 | 모델 → MCP | skill 지침에 따라 `vault_*` 등 도구 호출 |
 
 identity는 skill **이름만**이 아니라 **(MCP 서버 + skill URI)** 입니다. 같은 `name`이 다른 서버에서 와도 서로 다른 skill로 취급합니다.
+
+#### 도구 호출과 응답 (use-vault)
+
+Skill 지침은 vault를 직접 치지 않습니다. 모델이 지침을 읽은 뒤, 이미 바인딩된 MCP `vault_*` LangChain 도구를 일반 function-call로 호출합니다.
+
+```text
+모델
+  → get_skill_instructions("base", "use-vault")   # skill 본문만
+  → vault_read / vault_search / …                 # 실제 작업
+       │
+       ▼
+LangGraph ToolNode
+  → langchain MCPAdapter (Streamable HTTP + SigV4)
+       │  tools/call
+       ▼
+use-vault MCP
+  → vault_client.api_request → vault HTTP API
+```
+
+`create_agent`는 use-vault MCP를 `MCPAdapter`로 붙이고, system prompt에 `actor_id`(계정 email)를 박아 둡니다. skill의 “모든 호출에 `actor_id`” 규칙을 모델이 인자로 넣습니다.
+
+모델이 내는 도구 호출 예:
+
+```json
+{
+  "name": "vault_read",
+  "arguments": {
+    "actor_id": "kyopark2014@gmail.com",
+    "path": "Meeting/Weekly-Sync.md"
+  }
+}
+```
+
+쓰기 예:
+
+```json
+{
+  "name": "vault_write",
+  "arguments": {
+    "actor_id": "kyopark2014@gmail.com",
+    "path": "Meeting/Weekly-Sync.md",
+    "content": "# Weekly Sync\n\n본문입니다.\n"
+  }
+}
+```
+
+내부는 MCP `tools/call`이고, 서버가 `GET`/`PUT` … `/api/files/...`로 변환합니다.
+
+**읽기 6개** (`vault_tree` / `list` / `read` / `search` / `graph` / `backlinks`)는 `CallToolResult`입니다.
+
+- `content[0].text` — 모델이 읽는 JSON 문자열
+- `structuredContent` — MCP App UI(`ui://vault/viewer.html`)용 동일 페이로드
+
+```json
+{
+  "ok": true,
+  "kind": "note",
+  "path": "Meeting/Weekly-Sync.md",
+  "url": "https://vault.my-agentic-ai.click/?note=Meeting%2FWeekly-Sync.md",
+  "content": "# Weekly Sync\n\n...",
+  "backlinks": []
+}
+```
+
+**쓰기 도구** (`vault_write` 등)는 JSON 문자열을 반환합니다 (`url` 부착):
+
+```json
+{
+  "ok": true,
+  "path": "Meeting/Weekly-Sync.md",
+  "url": "https://vault.my-agentic-ai.click/?note=Meeting%2FWeekly-Sync.md"
+}
+```
+
+실패 시:
+
+```json
+{ "ok": false, "error": "actor_id is required (account login id / email)" }
+```
+
+ToolMessage로 JSON을 받은 뒤, 모델은 skill/guidance대로 본문 덤프 대신 요약 + `[제목](url)` 링크를 사용자에게 씁니다. 읽기 결과는 MCP App UI로도 뜰 수 있지만, 채팅 쪽 링크는 모델이 넣습니다.
+
+정리: **skill = 언제/어떻게 쓸지 규칙**, **실제 I/O = MCP `vault_*` `tools/call` ↔ JSON(+선택적 App UI)**.
 
 ### 1.4 왜 필요한가
 
