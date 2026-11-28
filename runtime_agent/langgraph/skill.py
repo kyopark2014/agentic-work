@@ -104,6 +104,10 @@ class Skill:
     origin: str = "local"
     uri: str | None = None
     server: str | None = None
+    # Retained skills/list entry for lazy verified load (SEP-2640).
+    connection: dict | None = None
+    frontmatter: dict | None = None
+    resources: list | str | None = None
 
 
 class SkillManager:
@@ -189,6 +193,34 @@ class SkillManager:
 skill_managers: dict[str, SkillManager] = {}
 
 
+def _ensure_mcp_skill_body(skill: Skill) -> None:
+    """Lazy ``resources/read`` + digest/frontmatter verify (SEP-2640 host MUST)."""
+    origin = getattr(skill, "origin", "local") or "local"
+    if not origin.startswith("mcp:"):
+        return
+    if (skill.instructions or "").strip():
+        return
+    uri = (getattr(skill, "uri", None) or "").strip()
+    connection = getattr(skill, "connection", None)
+    if not uri or not isinstance(connection, dict):
+        raise ValueError(f"MCP skill {skill.name!r} missing uri/connection for lazy load")
+    import mcp_skills
+
+    body = mcp_skills.load_verified_skill_md_sync(
+        connection,
+        uri=uri,
+        resources=getattr(skill, "resources", None),
+        expected_frontmatter=dict(getattr(skill, "frontmatter", None) or {}),
+    )
+    skill.instructions = body
+    logger.info(
+        "Lazy-loaded MCP skill %s from %s (%s bytes, verified)",
+        skill.name,
+        skill.server,
+        len(body.encode("utf-8")),
+    )
+
+
 def format_skill_instructions(skill: Skill) -> str:
     """Prefix skill body with absolute SKILL_DIR for command-local use.
 
@@ -201,6 +233,7 @@ def format_skill_instructions(skill: Skill) -> str:
     """
     origin = getattr(skill, "origin", "local") or "local"
     if origin.startswith("mcp:"):
+        _ensure_mcp_skill_body(skill)
         server = getattr(skill, "server", None) or origin.split(":", 1)[-1]
         uri = getattr(skill, "uri", None) or ""
         return (
@@ -208,6 +241,7 @@ def format_skill_instructions(skill: Skill) -> str:
             f"SKILL_NAME={skill.name}\n"
             f"MCP_SERVER={server}\n"
             f"SKILL_URI={uri}\n"
+            f"SKILL_IDENTITY={server}+{uri}\n"
             f"This skill was loaded via Skills over MCP from server '{server}'.\n"
             f"Follow the instructions below using that server's MCP tools "
             f"(not local scripts under $SKILLS_DIR).\n\n"
@@ -252,10 +286,40 @@ def format_skill_instructions(skill: Skill) -> str:
     )
 
 
-def register_mcp_skills(entries: list[dict]) -> list[str]:
-    """Register Skills-over-MCP entries into the base SkillManager registry.
+def _mcp_registry_key(
+    name: str,
+    *,
+    origin: str,
+    uri: str | None,
+    server: str | None,
+    registry: dict[str, Skill],
+) -> str:
+    """Avoid silent same-name replacement across origins (SEP-2640 identity)."""
+    existing = registry.get(name)
+    if existing is None:
+        return name
+    old_origin = getattr(existing, "origin", "local") or "local"
+    old_uri = getattr(existing, "uri", None)
+    if old_origin == origin and old_uri == uri:
+        return name
+    qualified = f"{server}:{name}" if server else f"{origin}:{name}"
+    logger.warning(
+        "Skill name collision for %r (existing origin=%s uri=%s; new origin=%s uri=%s). "
+        "Registering new skill as %r",
+        name,
+        old_origin,
+        old_uri,
+        origin,
+        uri,
+        qualified,
+    )
+    return qualified
 
-    Returns the list of registered skill names.
+
+def register_mcp_skills(entries: list[dict]) -> list[str]:
+    """Register Skills-over-MCP metadata into the base SkillManager registry.
+
+    Bodies are not loaded here (no pre-fetch). Returns registered lookup names.
     """
     if not entries:
         return []
@@ -270,18 +334,37 @@ def register_mcp_skills(entries: list[dict]) -> list[str]:
         name = (item.get("name") or "").strip()
         if not name:
             continue
+        origin = str(item.get("origin") or f"mcp:{item.get('server') or 'unknown'}")
+        uri = item.get("uri")
+        server = item.get("server")
+        key = _mcp_registry_key(
+            name,
+            origin=origin,
+            uri=uri,
+            server=server,
+            registry=skill_manager.registry,
+        )
         skill = Skill(
             name=name,
             description=str(item.get("description") or ""),
             instructions=str(item.get("instructions") or ""),
-            path=str(item.get("path") or f"mcp://{item.get('server')}/{name}"),
-            origin=str(item.get("origin") or f"mcp:{item.get('server') or 'unknown'}"),
-            uri=item.get("uri"),
-            server=item.get("server"),
+            path=str(item.get("path") or f"mcp://{server}/{name}"),
+            origin=origin,
+            uri=uri,
+            server=server,
+            connection=item.get("connection") if isinstance(item.get("connection"), dict) else None,
+            frontmatter=item.get("frontmatter") if isinstance(item.get("frontmatter"), dict) else None,
+            resources=item.get("resources"),
         )
-        skill_manager.registry[name] = skill
-        names.append(name)
-        logger.info("Registered MCP skill: %s (from %s)", name, skill.origin)
+        skill_manager.registry[key] = skill
+        names.append(key)
+        logger.info(
+            "Registered MCP skill key=%s name=%s origin=%s uri=%s (body deferred)",
+            key,
+            name,
+            skill.origin,
+            uri,
+        )
     return names
 
 def get_skills_xml(skill_info: list) -> str:
@@ -328,14 +411,22 @@ def get_skill_info(skill_list: list, mcp_skill_names: list | None = None) -> lis
 
     selected = set(skill_list or [])
     mcp_names = set(mcp_skill_names or [])
-    
+
     skill_info = []
-    for s in registry.values():
+    for key, s in registry.items():
         origin = getattr(s, "origin", "local") or "local"
-        include = s.name in selected or s.name in mcp_names or origin.startswith("mcp:")
+        include = (
+            s.name in selected
+            or key in selected
+            or key in mcp_names
+            or s.name in mcp_names
+            or origin.startswith("mcp:")
+        )
         if include:
-            skill_info.append({"name": s.name, "description": s.description})
-        
+            # Registry key is the lookup name for get_skill_instructions
+            # (may be qualified as server:name on collision; identity is server+uri).
+            skill_info.append({"name": key, "description": s.description})
+
     return skill_info
 
 
@@ -574,28 +665,35 @@ def get_skill_instructions(plugin_name: str, skill_name: str) -> str:
         skill_manager = SkillManager(skills_dir)
         skill_managers[plugin_name] = skill_manager
 
-    instructions = skill_manager.get_skill_instructions(skill_name)
-    if instructions:
-        return instructions
-
-    # Also search per-user skills when base manager misses the name.
-    if plugin_name == "base" and USER_SKILLS_DIR and os.path.isdir(USER_SKILLS_DIR):
-        skill_manager.discover_plugin_skills(USER_SKILLS_DIR)
+    try:
         instructions = skill_manager.get_skill_instructions(skill_name)
         if instructions:
             return instructions
 
-    # fallback to base skills
-    skill_manager = skill_managers.get("base")
-    if skill_manager is None:
-        skills_dir = SKILLS_DIR
-        skill_manager = SkillManager(skills_dir)
-        skill_managers["base"] = skill_manager
-    if USER_SKILLS_DIR and os.path.isdir(USER_SKILLS_DIR):
-        skill_manager.discover_plugin_skills(USER_SKILLS_DIR)
-    instructions = skill_manager.get_skill_instructions(skill_name)
-    if instructions:
-        return instructions
+        # Also search per-user skills when base manager misses the name.
+        if plugin_name == "base" and USER_SKILLS_DIR and os.path.isdir(USER_SKILLS_DIR):
+            skill_manager.discover_plugin_skills(USER_SKILLS_DIR)
+            instructions = skill_manager.get_skill_instructions(skill_name)
+            if instructions:
+                return instructions
+
+        # fallback to base skills
+        skill_manager = skill_managers.get("base")
+        if skill_manager is None:
+            skills_dir = SKILLS_DIR
+            skill_manager = SkillManager(skills_dir)
+            skill_managers["base"] = skill_manager
+        if USER_SKILLS_DIR and os.path.isdir(USER_SKILLS_DIR):
+            skill_manager.discover_plugin_skills(USER_SKILLS_DIR)
+        instructions = skill_manager.get_skill_instructions(skill_name)
+        if instructions:
+            return instructions
+    except ValueError as exc:
+        logger.warning("Skill load/verify failed for %s: %s", skill_name, exc)
+        return (
+            f"Skill '{skill_name}' failed integrity verification or lazy load: {exc}. "
+            "Refresh skills/list (reconnect MCP) and retry."
+        )
 
     available = ", ".join(skill_manager.registry.keys())
     return f"Skill '{skill_name}' not found. Available skills: {available}"

@@ -49,7 +49,52 @@ MCP 서버가 도구와 함께 **Agent Skill**(`SKILL.md` + 지원 파일)을 �
 
 Skill 파일 형식은 [Agent Skills](https://agentskills.io/specification)와 동일합니다. MCP는 **전송·발견·무결성**만 정의합니다.
 
-### 1.3 왜 필요한가
+### 1.3 동작 flow
+
+핵심은 **progressive disclosure**: 연결·목록 단계에서는 메타(이름·설명·digest)만 주고, 본문(`SKILL.md`)은 에이전트가 그 skill이 필요할 때만 읽습니다. 호스트는 읽은 바이트를 listing에 있던 digest/size/frontmatter와 대조한 뒤에야 모델 컨텍스트에 넣습니다.
+
+```mermaid
+sequenceDiagram
+    participant UI as Web UI
+    participant Host as agentic-work Runtime
+    participant MCP as use-vault MCP
+
+    UI->>Host: use-vault MCP 선택 후 세션 시작
+    Host->>MCP: initialize (extensions: skills)
+    Host->>MCP: skills/list
+    MCP-->>Host: uri, frontmatter, resources(digest/size)
+    Note over Host: 메타만 등록 (본문 pre-fetch 금지)
+    Host-->>UI: available_skills에 name/description 노출
+
+    UI->>Host: 사용자 요청 (예: vault 노트 조회)
+    Host->>Host: get_skill_instructions(use-vault)
+    Host->>MCP: resources/read(skill://use-vault/SKILL.md)
+    MCP-->>Host: SKILL.md bytes
+    Host->>Host: size + SHA-256 + frontmatter 검증
+    alt 검증 실패
+        Host-->>Host: 본문 폐기, 오류 반환
+    else 검증 성공
+        Host->>Host: 지침을 모델 컨텍스트에 삽입
+        Host->>MCP: vault_* tools 호출
+        MCP-->>Host: vault API 결과
+    end
+```
+
+단계 요약:
+
+| 단계 | 누가 | 무엇을 |
+| --- | --- | --- |
+| 1. 연결 | Host ↔ MCP | `initialize`로 skills extension 확인 |
+| 2. 발견 | Host → MCP | `skills/list` — 카탈로그·매니페스트만 |
+| 3. 노출 | Host → 모델 | system prompt에 **description**만 (`<available_skills>`) |
+| 4. 필요 시 로드 | 모델 → Host | `get_skill_instructions` |
+| 5. 본문 조회 | Host → MCP | `resources/read(uri)` |
+| 6. 검증 | Host | size · digest · frontmatter 일치 시에만 사용 |
+| 7. 실행 | 모델 → MCP | skill 지침에 따라 `vault_*` 등 도구 호출 |
+
+identity는 skill **이름만**이 아니라 **(MCP 서버 + skill URI)** 입니다. 같은 `name`이 다른 서버에서 와도 서로 다른 skill로 취급합니다.
+
+### 1.4 왜 필요한가
 
 도구 이름/설명만으로는 multi-step 워크플로(폴더 규약, 문체, deep link, 이미지 규칙 등)를 담기 어렵습니다. Skill을 서버에 두면:
 
@@ -57,7 +102,7 @@ Skill 파일 형식은 [Agent Skills](https://agentskills.io/specification)와 �
 - 호스트는 description만 먼저 보고, 필요할 때 `SKILL.md`를 로드합니다 (progressive disclosure)
 - 사용자/에이전트마다 로컬 skill 복사본을 유지하지 않아도 됩니다
 
-### 1.4 SDK / 호스트 지원 (조사 시점)
+### 1.5 SDK / 호스트 지원 (조사 시점)
 
 | 구현 | 상태 |
 | --- | --- |
@@ -76,7 +121,7 @@ Skill 파일 형식은 [Agent Skills](https://agentskills.io/specification)와 �
 - [Claude Code MCP skills](https://code.claude.com/docs/en/mcp#use-skills-from-mcp-servers)
 - [implementations.md](https://github.com/modelcontextprotocol/ext-skills/blob/main/docs/implementations.md)
 
-### 1.5 이 레포의 선택
+### 1.6 이 레포의 선택
 
 use-vault는 이미 공식 SDK의 `MCPServer` + `Apps` Extension을 씁니다. Prefect FastMCP로 이전하지 않고, `mcp.server.extension.Extension` + `MethodBinding`으로 SEP-2640을 **직접 구현**합니다 (`vault_skills.py`). Python SDK에 Skills가 출시되면 그 헬퍼로 교체할 수 있습니다.
 
@@ -224,31 +269,112 @@ mcp = MCPServer(
 )
 ```
 
+`skills/list` 실제 응답 예 (로컬 카탈로그 기준, 본문 없음):
+
+```json
+{
+  "resultType": "complete",
+  "ttlMs": 300000,
+  "cacheScope": "public",
+  "skills": [
+    {
+      "uri": "skill://use-vault/SKILL.md",
+      "frontmatter": {
+        "name": "use-vault",
+        "description": "ob-note(Obsidian형 vault)에 저장된 마크다운 노트를 조회·검색·생성·수정합니다. 사용자가 \"vault\", \"내 노트\", \"ob-note\", \"위키링크\", \"백링크\", \"노트 찾아줘\", \"메모 저장\", \"vault에 적어줘\", \"지식베이스\" 등을 요청할 때 사용합니다."
+      },
+      "resources": [
+        {
+          "uri": "skill://use-vault/SKILL.md",
+          "digest": "sha256:4428922db82bc113bbce567b7a6e39e7e69ba24a9726e9d7386af0b8c00ba989",
+          "size": 8705
+        }
+      ]
+    }
+  ]
+}
+```
+
+- envelope: `resultType` / `ttlMs`(5분) / `cacheScope`
+- skill entry: `uri` + YAML `frontmatter` 전체 + `resources` 매니페스트(URI·digest·size)
+- 현재 번들은 `SKILL.md` 한 파일이라 `resources` 항목도 1개. `nextCursor` 없음
+- `digest`/`size`는 파일 바이트가 바뀌면 함께 바뀜
+
 ### 3.3 클라이언트 (agentic-work)
 
-`mcp_skills.py`:
+`mcp_skills.py` (SEP-2640 host MUST):
 
 1. 선택된 서버 connection으로 streamable HTTP(+SigV4) 세션 오픈
-2. `server_capabilities.extensions`에 skills가 있으면 `skills/list`
-3. `Skill(origin="mcp:<server>", uri=..., instructions="")` 등록
-4. `get_skill_instructions` 시 `resources/read(uri)`로 본문 로드
+2. `server_capabilities.extensions`에 skills가 있으면 `skills/list`만 호출 (**파일 pre-fetch 금지**)
+3. 메타만 등록: `name` / `description` / `uri` / `frontmatter` / `resources`(digest·size) / `connection`
+4. `get_skill_instructions` 시 `resources/read(uri)` → **size·SHA-256 digest·frontmatter 필드 단위 검증** 후 본문 사용
+5. 검증 실패 시 본문을 쓰지 않음 (`ValueError` → 도구 오류 메시지)
+
+`skill.py`:
+
+- `Skill.origin = mcp:<server>`, `uri`, `connection`, `frontmatter`, `resources` 보관
+- 동명 충돌 시 silent replace 금지 → registry 키를 `{server}:{name}`으로 분리
+- 로드 헤더에 `SKILL_IDENTITY={server}+{uri}` 표기
 
 `chat.create_agent`:
 
-- MCP 도구 로딩 직후 `discover_mcp_skills(server_params)`
-- `get_skill_info(skill_list, mcp_servers=...)`에 MCP skill 병합
+- MCP 도구 로딩 직후 `discover_mcp_skills(server_params)` (메타만)
+- `get_skill_info(..., mcp_skill_names=...)`에 MCP skill 병합 → description만 system prompt에 노출
 
 ### 3.4 Skill 본문 방침
 
 MCP-served `use-vault` skill은 **실행 경로를 MCP tools**로 적습니다 (`vault_read`, `vault_write` …).  
-스크립트 CLI는 agentic-work Runtime 경로에서 더 이상 1순위가 아닙니다. my-vaults에 있던 합니다체·폴더·deep link·이미지 규칙은 그대로 옮깁니다.
+스크립트 CLI는 agentic-work Runtime 경로에서 더 이상 1순위가 아닙니다. my-vaults에 있던 한글체·폴더·deep link·이미지 규칙은 그대로 옮깁니다.
 
 ---
 
-## 4. 검증 체크리스트
+## 4. SEP-2640 대비 갭 검토
+
+참조: [vault 공유 노트 — Skills over MCP 요약](https://vault.my-agentic-ai.click/s/uSe3Cs_Q5drQUICrc9e0Bb5f) 및 [SEP-2640](https://modelcontextprotocol.io/seps/2640-skills-extension).
+
+### 4.1 맞는 부분 (서버 / 기본 배선)
+
+- capability `io.modelcontextprotocol/skills` + `resources`
+- `skills/list` / `skills/get` + `skill://…` `resources/read`
+- list entry에 `uri` / `frontmatter` / digest·size manifest, `resultType`·`ttlMs`·`cacheScope`
+- `directoryRead: false` (옵션 미구현은 정상)
+- frontmatter `name`/`description`, 폴더명=`use-vault` 일치
+
+### 4.2 갭과 대응
+
+| 우선 | 갭 | 스펙 | 상태 |
+| --- | --- | --- | --- |
+| **P0** | 연결·listing 시 SKILL.md **eager fetch** | Hosts MUST NOT retrieve files ahead of need | **수정함** — discover는 메타만, 본문은 `get_skill_instructions` |
+| **P0** | digest/size/frontmatter 미검증 | 사용 전 SHA-256·size·frontmatter 필드 단위 검증 | **수정함** — `verify_skill_md_bytes` / `load_verified_skill_md(_sync)` |
+| **P1** | registry를 `name`만으로 덮어씀 | identity = **server + URI** | **부분** — 충돌 시 `{server}:{name}` 분리 + `SKILL_IDENTITY` 헤더; 승인 UI는 없음 |
+| **P1** | 사용자 승인·manifest 바인딩 | 승인(또는 정책)을 URI+digest 세트에 묶고 변경 시 재승인 | **미구현** (Runtime은 MCP 선택으로 암묵 허용) |
+| **P2** | `nextCursor` 무시 | pagination | **미구현** (skill 1개라 실질 영향 없음) |
+| **P2** | `directoryRead` / `"dynamic"` | 옵션 | **불필요** (현재 정적 번들; `"dynamic"`은 검증 경로만 준비) |
+| **P2** | supporting files | manifest 내 URI만 읽고 digest 검증 | **부분** — SKILL.md만 로드; 부속 파일이 생기면 동일 verify 경로 확장 |
+
+### 4.3 핵심 스펙 문장
+
+> Hosts MUST NOT retrieve files ahead of need, including on connection, listing, or approval.
+
+권장(및 현재) 흐름:
+
+1. discover = `skills/list` 메타만 등록
+2. `get_skill_instructions` → `resources/read` + digest/size/frontmatter 검증
+3. 레지스트리에서 동명 silent replace 금지; identity는 server+URI
+
+### 4.4 범위 밖
+
+- Claude 승인 UX, 조직 on/off
+- 스킬 간 precedence/거버넌스
+- Enterprise 정책
+
+---
+
+## 5. 검증 체크리스트
 
 1. 로컬/배포 use-vault: `skills/list`에 `use-vault` 엔트리, digest 일치하는 `resources/read`
-2. agentic-work: use-vault만 선택 → `<available_skills>`에 use-vault 등장
-3. `get_skill_instructions(plugin_name="base", skill_name="use-vault")` → MCP에서 본문 로드
-4. vault 요청 시 `vault_*` + actor_id, 합니다체·카테고리 폴더 규칙 준수
-5. `skills.list` / `skills/my-vaults/` 없음 (디렉터리 삭제 확인)
+2. agentic-work: use-vault만 선택 → `<available_skills>`에 use-vault 등장 (**본문 미포함**)
+3. `get_skill_instructions(plugin_name="base", skill_name="use-vault")` → lazy `resources/read` + digest 검증 후 본문
+4. digest 변조 시 로드 거부 (본문 미사용)
+5. vault 요청 시 `vault_*` + actor_id, 한글체·카테고리 폴더 규칙 준수
+6. `skills.list` / `skills/my-vaults/` 없음 (디렉터리 삭제 확인)
