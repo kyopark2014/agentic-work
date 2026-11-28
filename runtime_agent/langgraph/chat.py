@@ -2404,7 +2404,7 @@ def append_tool_guidance_to_prompt(system_prompt: str, mcp_servers: list) -> str
         if "use-vault" in selected:
             extras.append(
                 "ob-note vault 작업은 use-vault MCP 도구(vault_read, vault_search, "
-                "vault_write, vault_append 등)를 사용하세요. "
+                "vault_write, vault_append, vault_str_replace, vault_upload 등)를 사용하세요. "
                 "상세 워크플로(폴더 규약·합니다체·deep link·이미지)는 Skills over MCP로 "
                 "제공되는 use-vault skill을 get_skill_instructions로 로드한 뒤 따르세요. "
                 f'모든 도구 호출에 actor_id="{uid}" 를 반드시 전달하세요 '
@@ -2421,7 +2421,9 @@ def append_tool_guidance_to_prompt(system_prompt: str, mcp_servers: list) -> str
                 "쓰기 성공 시 path·url·ok를 짧게 확인하세요. "
                 "긴 노트는 하나의 .md에 모으고 제목 아래 ## 목차를 두며, "
                 "다른 vault 노트 참조는 [제목](url)을 쓰세요. "
-                "이미지는 vault 상대경로만 사용하세요."
+                "이미지는 CloudFront/외부 URL을 노트에 넣지 말고, "
+                "vault_upload로 노트와 같은 폴더에 올린 뒤 vault 상대경로만 사용하세요. "
+                "이미지 업로드 API를 vault_search로 찾지 마세요."
             )
         if "search-note" in selected:
             extras.append(

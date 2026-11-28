@@ -5,6 +5,8 @@ export const VAULT_MUTATED_EVENT = "mcp-vault-mutated";
 export const VAULT_MUTATION_TOOLS = new Set([
   "vault_write",
   "vault_append",
+  "vault_str_replace",
+  "vault_upload",
   "vault_delete",
   "vault_mkdir",
   "vault_rename",

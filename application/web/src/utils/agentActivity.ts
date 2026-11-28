@@ -21,6 +21,8 @@ const TOOL_PROGRESS: Record<string, string> = {
   vault_backlinks: "백링크 확인 중",
   vault_write: "노트 저장 중",
   vault_append: "노트에 내용 추가 중",
+  vault_str_replace: "노트 부분 수정 중",
+  vault_upload: "이미지 업로드 중",
   vault_delete: "노트 삭제 중",
   vault_mkdir: "폴더 생성 중",
   vault_move: "노트 이동 중",
